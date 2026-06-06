@@ -1,0 +1,13 @@
+# Secrets & runtime state — never commit
+.env
+registry.json
+registry.json.tmp
+inbox/
+discord-state/
+
+# Dependencies
+node_modules/
+
+# Editor / OS
+.DS_Store
+*.log
