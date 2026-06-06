@@ -23,7 +23,7 @@ import {
   type SettingSource,
 } from '@anthropic-ai/claude-agent-sdk'
 import { Bot, InlineKeyboard, type Context } from 'grammy'
-import { readFileSync, writeFileSync, mkdirSync, renameSync, existsSync, statSync } from 'fs'
+import { readFileSync, writeFileSync, mkdirSync, renameSync, existsSync, statSync, chmodSync } from 'fs'
 import { homedir } from 'os'
 import { join } from 'path'
 
@@ -34,8 +34,10 @@ const STATE_DIR = process.env.TG_CLAUDE_STATE_DIR || import.meta.dir
 const REGISTRY_FILE = join(STATE_DIR, 'registry.json')
 
 function loadEnv(): void {
+  const envFile = join(STATE_DIR, '.env')
   try {
-    for (const line of readFileSync(join(STATE_DIR, '.env'), 'utf8').split('\n')) {
+    chmodSync(envFile, 0o600) // it holds the bot token — lock to owner
+    for (const line of readFileSync(envFile, 'utf8').split('\n')) {
       const m = line.match(/^\s*(\w+)\s*=\s*(.*)$/)
       if (m && process.env[m[1]] === undefined) process.env[m[1]] = m[2].trim()
     }
@@ -320,10 +322,19 @@ async function pump(l: Live): Promise<void> {
 }
 
 // ── Session lifecycle ────────────────────────────────────────────────────────
+// Child sessions must NOT see the bot token — a prompt-injected session (via
+// fetched web/file content) could otherwise read it from env and exfiltrate it.
+const CHILD_ENV: Record<string, string | undefined> = (() => {
+  const e = { ...process.env }
+  delete e.TELEGRAM_BOT_TOKEN
+  return e
+})()
+
 function sessionOptions(cwd: string, model: string, topicId: string) {
   return {
     model,
     cwd,
+    env: CHILD_ENV,
     pathToClaudeCodeExecutable: CLAUDE_BIN,
     settingSources: SETTING_SOURCES,
     permissionMode: 'default' as const,

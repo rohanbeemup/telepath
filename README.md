@@ -75,16 +75,36 @@ The daemon (`daemon.ts`) holds the bot token and routes by `message_thread_id`. 
 
 Usage runs on your Claude **subscription**, metered like any Claude Code usage — **Opus ≈ 5× Sonnet**, so the default is Sonnet and you opt into Opus per topic. Heavy use can hit your plan's rate limits (you'll see throttling). Note: from **June 15, 2026**, Agent SDK / `claude -p` usage on subscription plans draws from a separate monthly Agent SDK credit — see [Anthropic's docs](https://code.claude.com/docs/en/agent-sdk).
 
+## How is this different from Claude Code's Remote Control?
+
+Claude Code ships a built-in [**Remote Control**](https://code.claude.com/docs/en/remote-control) feature (`claude remote-control`) that lets you drive your local sessions from **claude.ai / the Claude mobile app**, and its *server mode* even supports multiple concurrent sessions. It overlaps with telepath — so use the right tool:
+
+| | **telepath** | **Remote Control** |
+|---|---|---|
+| Client | **Telegram** (any Telegram app) | claude.ai web + Claude mobile/desktop app only |
+| Multi-session | One forum **topic** per session | Server mode: multiple sessions |
+| Approvals | Custom **Allow/Deny buttons in the topic** | Native Claude UI |
+| Switching one convo across devices | Hand-off only (don't co-drive the same session in two places) | **Real-time sync** across devices — purpose-built for this |
+| Maintenance | A small daemon you run | **Built-in, Anthropic-maintained** |
+| Billing | Subscription (Agent SDK) | Subscription (interactive) |
+
+**Rule of thumb:** if you just want to drive one conversation from your phone *and* laptop interchangeably, **Remote Control is the better, zero-maintenance choice.** Reach for telepath when you specifically want it **in Telegram** — multiple independent topic-threads, in the same app as your other bots/chats, with approval buttons inline and full control over the behavior. The two can coexist (use Remote Control for a session you're actively co-driving; telepath for the rest) — just never drive the *same* session from both at once.
+
 ## Security
 
-- **Single-user:** every inbound message and button tap is checked against `ALLOWED_USER_ID`. Keep your group private.
-- **Auto mode runs tools without asking** — anyone who can post to your group (i.e. you) can make an auto topic run arbitrary commands. It's per-topic and off by default.
+This bot can run shell commands and edit files on your machine, so treat it accordingly.
+
+- **Single-user gate.** Every inbound message *and* every Allow/Deny tap is checked against `ALLOWED_USER_ID`; everything else is dropped. Only `message:text` and button callbacks are processed.
+- **Keep the group private / solo.** Anyone *in* the forum group can read the bot's output (session content, tool results) even though only you can drive it. Don't add others.
+- **Auto mode = remote code execution.** A topic in `/auto` runs tools with no prompt. That's the point, but it means a single Telegram message can run arbitrary commands. It's per-topic, off by default — enable it only for topics/work you trust, and be aware that untrusted content a session fetches (web pages, files) could attempt prompt-injection.
+- **Bot token isolation.** The `TELEGRAM_BOT_TOKEN` is scrubbed from the environment passed to child sessions, so a compromised/injected session can't read or exfiltrate it. `.env` is force-chmod'd to `600` on load.
+- **Auth.** Runs on your `claude login` (subscription). No API key is stored or used.
+- **Your responsibility:** keep `.env` private (it's gitignored), keep the bot token secret, and don't expose the group.
 
 ## Caveats
 
 - Built on the SDK's **`unstable_v2_*` (@alpha)** API — pinned to a specific version; it may change between SDK releases.
 - **One bot = one instance = one user.** Each teammate runs their own (own bot, own group, own `claude login`).
-- For tightly **co-driving a single conversation** between laptop and phone, Anthropic's built-in [Remote Control](https://code.claude.com/docs/en/remote-control) (`claude remote-control`) is purpose-built and conflict-free — this project is for a Telegram-native, multi-topic workflow.
 
 ## License
 
