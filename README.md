@@ -1,6 +1,6 @@
-# telegram-claude-sessions
+# telepath
 
-Run and steer **multiple Claude Code sessions from Telegram** — one forum **topic per resident session**, with **per-command approval** delivered as Allow/Deny buttons right in the chat. Claude runs on *your* machine (your files, your tools, your `claude login`); Telegram is just the remote control.
+**Telegram ⇄ your machine's mind.** Run and steer **multiple Claude Code sessions from Telegram** — one forum **topic per resident session**, with **per-command approval** delivered as Allow/Deny buttons right in the chat. Claude runs on *your* machine (your files, your tools, your `claude login`); Telegram is just the remote control.
 
 ```
 Telegram forum supergroup ("Claude")          one bot, one poller
@@ -37,8 +37,8 @@ Telegram allows exactly **one poller per bot token**, and the Claude Agent SDK i
 ## Quick start
 
 ```bash
-git clone <this-repo> telegram-claude-sessions
-cd telegram-claude-sessions
+git clone https://github.com/rohanbeemup/telepath.git
+cd telepath
 ./install.sh            # installs deps, creates .env, optional systemd service
 ```
 
@@ -47,7 +47,7 @@ Then, on the Telegram side:
 1. **Create a bot:** message [@BotFather](https://t.me/BotFather) → `/newbot` → copy the token.
 2. **Create a forum group:** new group → Settings → enable **Topics** → add your bot as **admin** with the **Manage Topics** permission.
 3. **Fill `.env`:** put the bot token in `TELEGRAM_BOT_TOKEN`. For the other two ids, the easiest path: run the daemon (`bun run daemon.ts`), send any message in the group, and read your `ALLOWED_USER_ID` and `FORUM_CHAT_ID` from the log. (Or use [@userinfobot](https://t.me/userinfobot).)
-4. **Run it:** `bun run daemon.ts` — or, if you installed the service, it's already running (`journalctl --user -u claude-telegram-sessions -f`).
+4. **Run it:** `bun run daemon.ts` — or, if you installed the service, it's already running (`journalctl --user -u telepath -f`).
 
 ## Usage
 

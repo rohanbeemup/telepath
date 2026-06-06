@@ -1,5 +1,5 @@
 [Unit]
-Description=telegram-claude-sessions (Telegram forum topic ⇄ resident Claude session)
+Description=telepath (Telegram forum topic ⇄ resident Claude session)
 StartLimitIntervalSec=300
 StartLimitBurst=5
 

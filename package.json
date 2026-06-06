@@ -1,5 +1,5 @@
 {
-  "name": "telegram-claude-sessions",
+  "name": "telepath",
   "version": "0.1.0",
   "description": "Run and steer multiple Claude Code sessions from Telegram — one forum topic per resident session, with per-command approval. Powered by Claude.",
   "type": "module",

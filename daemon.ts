@@ -79,7 +79,7 @@ const AUTO_ALLOW = new Set(['Read', 'Glob', 'Grep', 'LS', 'NotebookRead', 'TodoW
 function req(name: string): string {
   const v = process.env[name]
   if (!v) {
-    process.stderr.write(`telegram-claude-sessions: ${name} is required (set in ${STATE_DIR}/.env)\n`)
+    process.stderr.write(`telepath: ${name} is required (set in ${STATE_DIR}/.env)\n`)
     process.exit(1)
   }
   return v
@@ -652,7 +652,7 @@ await bot.api.setMyCommands([
   { command: 'help', description: 'Show help' },
 ])
 process.stderr.write(
-  `telegram-claude-sessions up — chat ${FORUM_CHAT_ID}, user ${ALLOWED_USER_ID}, ` +
+  `telepath up — chat ${FORUM_CHAT_ID}, user ${ALLOWED_USER_ID}, ` +
     `default ${DEFAULT_MODEL}, cap ${MAX_LIVE_SESSIONS}, idle ${IDLE_MINUTES}m\n` +
     `  claude binary: ${CLAUDE_BIN}\n`,
 )

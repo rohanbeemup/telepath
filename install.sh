@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Set up telegram-claude-sessions: install deps, create .env, and (optionally)
+# Set up telepath: install deps, create .env, and (optionally)
 # install a systemd --user service for 24/7 running. Safe to re-run.
 set -euo pipefail
 
@@ -27,10 +27,10 @@ if [[ "${ans:-N}" =~ ^[Yy]$ ]]; then
   UNIT_DIR="$HOME/.config/systemd/user"
   mkdir -p "$UNIT_DIR"
   sed -e "s#__REPO_DIR__#$REPO_DIR#g" -e "s#__BUN__#$BUN_BIN#g" \
-    claude-telegram-sessions.service.template > "$UNIT_DIR/claude-telegram-sessions.service"
+    telepath.service.template > "$UNIT_DIR/telepath.service"
   systemctl --user daemon-reload
-  systemctl --user enable --now claude-telegram-sessions.service
-  echo "==> Service installed. Logs: journalctl --user -u claude-telegram-sessions -f"
+  systemctl --user enable --now telepath.service
+  echo "==> Service installed. Logs: journalctl --user -u telepath -f"
   echo "    (For it to survive logout/reboot, run once: sudo loginctl enable-linger \"$USER\")"
 else
   echo "==> Skipped systemd. Run manually with: bun run daemon.ts"
