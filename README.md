@@ -25,6 +25,7 @@ Telegram allows exactly **one poller per bot token**, and the Claude Agent SDK i
 - ⚡ **Auto mode** — `/auto` per topic to run tools without prompts (opt-in, per topic).
 - ❓ **Clarifying questions & plan mode** — `AskUserQuestion` renders as tappable option buttons; plan mode shows the full plan then asks to approve.
 - 💸 **Cost controls** — Sonnet by default (`use opus` per topic), idle-eviction, and a concurrent-session cap.
+- 🖼️ **Images** — send a photo to a topic and the session reads it.
 - 🆔 **Resumable** — each new topic prints its session id + a `claude --resume …` command so you can pick it up on your laptop.
 - 🔒 **Single-user** — only your Telegram user id can talk to it or approve anything.
 

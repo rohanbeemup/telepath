@@ -32,6 +32,7 @@ import { join } from 'path'
 // clone runs in place; override with TG_CLAUDE_STATE_DIR.
 const STATE_DIR = process.env.TG_CLAUDE_STATE_DIR || import.meta.dir
 const REGISTRY_FILE = join(STATE_DIR, 'registry.json')
+const INBOX_DIR = join(STATE_DIR, 'inbox') // downloaded images land here
 
 function loadEnv(): void {
   const envFile = join(STATE_DIR, '.env')
@@ -599,6 +600,26 @@ async function handleText(ctx: Context, text: string): Promise<void> {
 bot.on('message:text', async ctx => {
   if (!allowed(ctx)) return
   await handleText(ctx, ctx.message.text)
+})
+
+bot.on('message:photo', async ctx => {
+  if (!allowed(ctx)) return
+  const topicId = ctx.message.message_thread_id ? String(ctx.message.message_thread_id) : undefined
+  if (!topicId) return void sayTopic(undefined, 'Send images inside a session topic.')
+  try {
+    const best = ctx.message.photo[ctx.message.photo.length - 1] // largest size
+    const file = await ctx.api.getFile(best.file_id)
+    const url = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`
+    const buf = Buffer.from(await (await fetch(url)).arrayBuffer())
+    mkdirSync(INBOX_DIR, { recursive: true })
+    const path = join(INBOX_DIR, `${Date.now()}-${best.file_unique_id}.jpg`)
+    writeFileSync(path, buf)
+    const caption = ctx.message.caption?.trim()
+    await sayTopic(topicId, '🖼️ image received')
+    await sendToTopic(topicId, `The user sent an image, saved at ${path} — Read it to see it.${caption ? `\nCaption: ${caption}` : ''}`)
+  } catch (e) {
+    await sayTopic(topicId, `image handling failed: ${e}`)
+  }
 })
 
 bot.on('callback_query:data', async ctx => {
