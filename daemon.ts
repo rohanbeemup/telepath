@@ -622,6 +622,31 @@ bot.on('message:photo', async ctx => {
   }
 })
 
+bot.on('message:document', async ctx => {
+  if (!allowed(ctx)) return
+  const topicId = ctx.message.message_thread_id ? String(ctx.message.message_thread_id) : undefined
+  if (!topicId) return void sayTopic(undefined, 'Send files inside a session topic.')
+  const doc = ctx.message.document
+  try {
+    if (doc.file_size && doc.file_size > 20 * 1024 * 1024) {
+      await sayTopic(topicId, `File too large (${(doc.file_size / 1048576).toFixed(1)} MB) — Telegram caps bot downloads at 20 MB.`)
+      return
+    }
+    const file = await ctx.api.getFile(doc.file_id)
+    const url = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`
+    const buf = Buffer.from(await (await fetch(url)).arrayBuffer())
+    mkdirSync(INBOX_DIR, { recursive: true })
+    const safeName = (doc.file_name || `${Date.now()}.bin`).replace(/[^\w.\-]/g, '_')
+    const path = join(INBOX_DIR, `${Date.now()}-${safeName}`)
+    writeFileSync(path, buf)
+    const caption = ctx.message.caption?.trim()
+    await sayTopic(topicId, `📎 file received: ${doc.file_name ?? safeName}`)
+    await sendToTopic(topicId, `The user sent a file "${doc.file_name ?? safeName}" (${doc.mime_type ?? 'unknown type'}), saved at ${path} — Read it.${caption ? `\nCaption: ${caption}` : ''}`)
+  } catch (e) {
+    await sayTopic(topicId, `file handling failed: ${e}`)
+  }
+})
+
 bot.on('callback_query:data', async ctx => {
   const data = ctx.callbackQuery.data || ''
   if (String(ctx.from.id) !== ALLOWED_USER_ID) {
