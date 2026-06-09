@@ -52,6 +52,8 @@ const FORUM_CHAT_ID = req('FORUM_CHAT_ID')
 const DEFAULT_CWD = process.env.DEFAULT_CWD || homedir()
 const SONNET_MODEL = process.env.SONNET_MODEL || 'claude-sonnet-4-6'
 const OPUS_MODEL = process.env.OPUS_MODEL || 'claude-opus-4-8'
+const FABLE_MODEL = process.env.FABLE_MODEL || 'claude-fable-5'
+const MODELS: Record<string, string> = { sonnet: SONNET_MODEL, opus: OPUS_MODEL, fable: FABLE_MODEL }
 const DEFAULT_MODEL = process.env.DEFAULT_MODEL || SONNET_MODEL
 const IDLE_MINUTES = Number(process.env.IDLE_MINUTES || 15)
 const MAX_LIVE_SESSIONS = Number(process.env.MAX_LIVE_SESSIONS || 3)
@@ -464,7 +466,7 @@ async function cmdNew(args: string, fromTopic: string | undefined): Promise<void
   registry[topicId] = { cwd, model: DEFAULT_MODEL, title: name, lastActive: Date.now(), auto }
   saveRegistry()
   await ensureLive(topicId)
-  await sayTopic(topicId, `🆕 "${name}" · ${DEFAULT_MODEL}${auto ? ' · ⚡auto' : ''} · cwd ${cwd}\nSend a message to start. "use opus"/"use sonnet" switches model; /auto toggles approvals.`)
+  await sayTopic(topicId, `🆕 "${name}" · ${DEFAULT_MODEL}${auto ? ' · ⚡auto' : ''} · cwd ${cwd}\nSend a message to start. "use fable"/"use opus"/"use sonnet" switches model; /auto toggles approvals.`)
 }
 
 async function cmdAuto(args: string, topicId: string | undefined): Promise<void> {
@@ -542,13 +544,13 @@ async function cmdAttach(args: string, fromTopic: string | undefined): Promise<v
   await sayTopic(topicId, `📎 Attached session \`${match.sessionId.slice(0, 8)}\`. Send a message to continue it.`)
 }
 
-async function setModel(topicId: string, which: 'opus' | 'sonnet'): Promise<void> {
+async function setModel(topicId: string, which: keyof typeof MODELS): Promise<void> {
   const b = registry[topicId]
   if (!b) {
     await sayTopic(topicId, 'No session bound here.')
     return
   }
-  b.model = which === 'opus' ? OPUS_MODEL : SONNET_MODEL
+  b.model = MODELS[which]
   saveRegistry()
   closeLive(topicId, 'model switch') // next message resumes with new model
   await sayTopic(topicId, `Model set to ${b.model}. (applies on next message)`)
@@ -561,7 +563,7 @@ const HELP = `Commands (use in the General topic):
 /auto [on|off] — toggle auto mode for the current topic (no Allow/Deny prompts)
 /help
 
-In a session topic: just type. "use opus" / "use sonnet" switches model.
+In a session topic: just type. "use fable" / "use opus" / "use sonnet" switches model.
 Clarifying questions show as option buttons — tap one, or type your own reply.
 Risky tools (Bash/Write/Edit/Web) ask for Allow/Deny unless the topic is in /auto.`
 
@@ -592,8 +594,8 @@ async function handleText(ctx: Context, text: string): Promise<void> {
   // free-text answer (the documented AskUserQuestion `response` path).
   const ft = askFreeText.get(topicId)
   if (ft) return void ft(text)
-  if (/^use opus$/i.test(text)) return setModel(topicId, 'opus')
-  if (/^use sonnet$/i.test(text)) return setModel(topicId, 'sonnet')
+  const useModel = /^use (opus|sonnet|fable)$/i.exec(text)
+  if (useModel) return setModel(topicId, useModel[1].toLowerCase() as keyof typeof MODELS)
   await sendToTopic(topicId, text)
 }
 
