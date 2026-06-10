@@ -278,11 +278,14 @@ async function pump(l: Live): Promise<void> {
   l.pumping = true
   try {
     for await (const msg of l.session.stream() as AsyncGenerator<SDKMessage>) {
-      // Capture sessionId from the STREAM (reliable — every message carries it,
-      // and the init message arrives first). Reading session.sessionId directly
-      // in sendToTopic throws if accessed before init, so it silently failed and
-      // the topic kept spawning fresh, context-less sessions after each eviction.
-      const sid = (msg as any).session_id as string | undefined
+      // Capture sessionId only once a turn has produced output (assistant/result)
+      // — that guarantees a transcript exists on disk. Capturing from the bare
+      // init message saved an id for sessions closed before their first turn
+      // (e.g. /new then immediately "use opus"), leaving a dead id that errors on
+      // every later resume. (Reading session.sessionId directly throws pre-init.)
+      const sid = (msg.type === 'assistant' || msg.type === 'result')
+        ? ((msg as any).session_id as string | undefined)
+        : undefined
       if (sid) {
         const rb = registry[l.topicId]
         if (rb && !rb.sessionId) {
