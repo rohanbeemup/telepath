@@ -30,8 +30,23 @@ if [[ "${ans:-N}" =~ ^[Yy]$ ]]; then
     telepath.service.template > "$UNIT_DIR/telepath.service"
   systemctl --user daemon-reload
   systemctl --user enable --now telepath.service
-  echo "==> Service installed. Logs: journalctl --user -u telepath -f"
-  echo "    (For it to survive logout/reboot, run once: sudo loginctl enable-linger \"$USER\")"
+
+  # Without linger, a --user service stops on logout and won't start at boot
+  # until you log in — the #1 reason "it only runs while my terminal is open".
+  if loginctl show-user "$USER" 2>/dev/null | grep -q '^Linger=yes'; then
+    echo "==> Linger already enabled (survives logout/reboot)."
+  else
+    echo "==> Enabling linger so it survives logout/reboot (needs sudo)..."
+    sudo loginctl enable-linger "$USER" \
+      || echo "WARNING: couldn't enable linger — run manually: sudo loginctl enable-linger $USER"
+  fi
+
+  echo "==> Service installed:"
+  echo "    active : $(systemctl --user is-active telepath.service)"
+  echo "    enabled: $(systemctl --user is-enabled telepath.service)"
+  echo "    linger : $(loginctl show-user "$USER" 2>/dev/null | grep -i linger | cut -d= -f2)"
+  echo "    Logs   : journalctl --user -u telepath -f"
 else
   echo "==> Skipped systemd. Run manually with: bun run daemon.ts"
+  echo "    (manual runs stop when the terminal closes — re-run and choose 'y' for 24/7.)"
 fi

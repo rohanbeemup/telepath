@@ -64,6 +64,35 @@ In the **General** topic:
 
 In a **session topic**: just type. `use opus` / `use sonnet` switches that topic's model. Clarifying questions appear as buttons — tap one, or type your own reply.
 
+## Run as a service (24/7)
+
+`./install.sh` offers to install a **systemd `--user` service** from [`telepath.service.template`](telepath.service.template) (the placeholders `__REPO_DIR__` / `__BUN__` are filled in automatically). That gives you:
+
+- **auto-start** at boot/login (`systemctl --user enable`),
+- **auto-restart** on crash (`Restart=always`),
+- **survives logout/reboot** via `loginctl enable-linger` — the installer runs this for you.
+
+> ⚠️ **The linger step is what keeps it alive when you're not logged in.** Without it, a `--user` service stops the moment you log out and won't start at boot until you log back in — the most common reason telepath "only runs while my terminal is open." `install.sh` enables it automatically (needs `sudo` once).
+
+Manage / debug it:
+
+```bash
+systemctl --user status telepath        # is it running?
+systemctl --user restart telepath        # after editing daemon.ts or .env
+journalctl --user -u telepath -f         # live logs
+loginctl show-user "$USER" | grep Linger # should say Linger=yes
+```
+
+To set it up by hand instead of via `install.sh`:
+
+```bash
+sed -e "s#__REPO_DIR__#$PWD#g" -e "s#__BUN__#$(command -v bun)#g" \
+  telepath.service.template > ~/.config/systemd/user/telepath.service
+systemctl --user daemon-reload
+systemctl --user enable --now telepath.service
+sudo loginctl enable-linger "$USER"      # <-- don't skip this
+```
+
 ## Configuration
 
 All via `.env` (see [`.env.example`](.env.example)). Key options: `DEFAULT_MODEL`, `SONNET_MODEL`, `OPUS_MODEL`, `IDLE_MINUTES`, `MAX_LIVE_SESSIONS`, `DEFAULT_CWD`, `TG_CLAUDE_STATE_DIR`, `CLAUDE_BINARY`.
@@ -74,7 +103,9 @@ The daemon (`daemon.ts`) holds the bot token and routes by `message_thread_id`. 
 
 ## Cost & billing
 
-Usage runs on your Claude **subscription**, metered like any Claude Code usage — **Opus ≈ 5× Sonnet**, so the default is Sonnet and you opt into Opus per topic. Heavy use can hit your plan's rate limits (you'll see throttling). Note: from **June 15, 2026**, Agent SDK / `claude -p` usage on subscription plans draws from a separate monthly Agent SDK credit — see [Anthropic's docs](https://code.claude.com/docs/en/agent-sdk).
+Usage runs on your Claude **subscription**, metered like any Claude Code usage — **Opus ≈ 5× Sonnet**, so the default is Sonnet and you opt into Opus per topic. Heavy use can hit your plan's rate limits (you'll see throttling).
+
+> **Heads-up — billing change from June 15, 2026.** Agent SDK / `claude -p` usage on subscription plans (which is *all* of telepath, and any `claude -p` cron jobs you run) no longer counts toward your interactive limits — it draws from a **separate monthly Agent SDK credit**, metered at standard API rates: **$20 Pro · $100 Max 5x / Team Premium · $200 Max 20x · $20 Team/Enterprise base**, per user, no rollover. **When that credit is exhausted, Agent SDK requests stop until it refreshes — unless you enable "usage credits" (overflow billing)**, which then bills pay-as-you-go. You claim the credit once (Anthropic emails instructions before June 15). For unattended/high-frequency setups, keep cheap models as the default and watch the first cycle. An **API key** bypasses the credit entirely (plain pay-as-you-go, never hard-stops). Details: [Use the Agent SDK with your Claude plan](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan) · [Agent SDK docs](https://code.claude.com/docs/en/agent-sdk).
 
 ## How is this different from Claude Code's Remote Control?
 
