@@ -129,10 +129,11 @@ Claude Code ships a built-in [**Remote Control**](https://code.claude.com/docs/e
 
 This bot can run shell commands and edit files on your machine, so treat it accordingly.
 
-- **Single-user gate.** Every inbound message *and* every Allow/Deny tap is checked against `ALLOWED_USER_ID`; everything else is dropped. Only `message:text` and button callbacks are processed.
+- **Single-user gate.** Every inbound message *and* every Allow/Deny tap is checked against **both** your `ALLOWED_USER_ID` and the `FORUM_CHAT_ID`; everything else is dropped.
 - **Keep the group private / solo.** Anyone *in* the forum group can read the bot's output (session content, tool results) even though only you can drive it. Don't add others.
 - **Auto mode = remote code execution.** A topic in `/auto` runs tools with no prompt. That's the point, but it means a single Telegram message can run arbitrary commands. It's per-topic, off by default — enable it only for topics/work you trust, and be aware that untrusted content a session fetches (web pages, files) could attempt prompt-injection.
-- **Bot token isolation.** The `TELEGRAM_BOT_TOKEN` is scrubbed from the environment passed to child sessions, so a compromised/injected session can't read or exfiltrate it. `.env` is force-chmod'd to `600` on load.
+- **Bot token handling.** The `TELEGRAM_BOT_TOKEN` is scrubbed from the environment passed to child sessions (so a prompt-injected session can't read it from *its env*), and `.env` is force-chmod'd to `600` on load. This is **not** a sandbox, though: a session running tools (`Bash`/`Read`) — especially in `/auto` — can still read the `.env` file on disk like any other local file. The real protections are the single-user gate and keeping auto-mode off for untrusted work.
+- **Child sessions inherit your environment** (minus the bot token). If you export other secrets (e.g. `ANTHROPIC_API_KEY`, cloud credentials) in the shell that launches the daemon, child sessions can see them — run the daemon from a clean environment if that matters.
 - **Auth.** Runs on your `claude login` (subscription). No API key is stored or used.
 - **Your responsibility:** keep `.env` private (it's gitignored), keep the bot token secret, and don't expose the group.
 
