@@ -654,7 +654,9 @@ bot.on('message:document', async ctx => {
 
 bot.on('callback_query:data', async ctx => {
   const data = ctx.callbackQuery.data || ''
-  if (String(ctx.from.id) !== ALLOWED_USER_ID) {
+  // Same gate as inbound messages: right user AND right chat (defense-in-depth —
+  // buttons are only ever posted into FORUM_CHAT_ID).
+  if (String(ctx.from.id) !== ALLOWED_USER_ID || String(ctx.chat?.id) !== FORUM_CHAT_ID) {
     return void ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
   }
 
