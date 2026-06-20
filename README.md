@@ -64,6 +64,35 @@ In the **General** topic:
 
 In a **session topic**: just type. `use opus` / `use sonnet` switches that topic's model. Clarifying questions appear as buttons — tap one, or type your own reply.
 
+## Run as a service (24/7)
+
+`./install.sh` offers to install a **systemd `--user` service** from [`telepath.service.template`](telepath.service.template) (the placeholders `__REPO_DIR__` / `__BUN__` are filled in automatically). That gives you:
+
+- **auto-start** at boot/login (`systemctl --user enable`),
+- **auto-restart** on crash (`Restart=always`),
+- **survives logout/reboot** via `loginctl enable-linger` — the installer runs this for you.
+
+> ⚠️ **The linger step is what keeps it alive when you're not logged in.** Without it, a `--user` service stops the moment you log out and won't start at boot until you log back in — the most common reason telepath "only runs while my terminal is open." `install.sh` enables it automatically (needs `sudo` once).
+
+Manage / debug it:
+
+```bash
+systemctl --user status telepath        # is it running?
+systemctl --user restart telepath        # after editing daemon.ts or .env
+journalctl --user -u telepath -f         # live logs
+loginctl show-user "$USER" | grep Linger # should say Linger=yes
+```
+
+To set it up by hand instead of via `install.sh`:
+
+```bash
+sed -e "s#__REPO_DIR__#$PWD#g" -e "s#__BUN__#$(command -v bun)#g" \
+  telepath.service.template > ~/.config/systemd/user/telepath.service
+systemctl --user daemon-reload
+systemctl --user enable --now telepath.service
+sudo loginctl enable-linger "$USER"      # <-- don't skip this
+```
+
 ## Configuration
 
 All via `.env` (see [`.env.example`](.env.example)). Key options: `DEFAULT_MODEL`, `SONNET_MODEL`, `OPUS_MODEL`, `IDLE_MINUTES`, `MAX_LIVE_SESSIONS`, `DEFAULT_CWD`, `TG_CLAUDE_STATE_DIR`, `CLAUDE_BINARY`.
@@ -74,7 +103,11 @@ The daemon (`daemon.ts`) holds the bot token and routes by `message_thread_id`. 
 
 ## Cost & billing
 
-Usage runs on your Claude **subscription**, metered like any Claude Code usage — **Opus ≈ 5× Sonnet**, so the default is Sonnet and you opt into Opus per topic. Heavy use can hit your plan's rate limits (you'll see throttling). Note: from **June 15, 2026**, Agent SDK / `claude -p` usage on subscription plans draws from a separate monthly Agent SDK credit — see [Anthropic's docs](https://code.claude.com/docs/en/agent-sdk).
+Usage runs on your Claude **subscription**, metered like any Claude Code usage — **Opus ≈ 5× Sonnet**, so the default is Sonnet and you opt into Opus per topic. Heavy use can hit your plan's rate limits (you'll see throttling).
+
+> **Agent SDK billing — status (as of June 2026).** Anthropic announced a change (slated for **June 15, 2026**) that would move Agent SDK / `claude -p` usage on subscription plans to a **separate monthly Agent SDK credit** — then **paused it**. As of now **nothing has changed**: Agent SDK / `claude -p` usage (which is *all* of telepath, plus any `claude -p` cron jobs) draws from your **normal subscription rate limits exactly as before** — no separate credit, nothing to claim, limits unchanged. Anthropic has said they'll give **advance notice** before any future change.
+>
+> Why it still matters for telepath: telepath is **built on the Agent SDK**, so *if* that split returns, telepath's usage would fall under the Agent-SDK credit — whereas Claude Code **Remote Control** is **interactive-billed** (see the comparison below). If you ever need to decouple, an **API key** stays on plain pay-as-you-go and never hard-stops. Details: [Use the Agent SDK with your Claude plan](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan) · [Agent SDK docs](https://code.claude.com/docs/en/agent-sdk).
 
 ## How is this different from Claude Code's Remote Control?
 
@@ -86,10 +119,11 @@ Claude Code ships a built-in [**Remote Control**](https://code.claude.com/docs/e
 | Multi-session | One forum **topic** per session | Server mode: multiple sessions |
 | Approvals | Custom **Allow/Deny buttons in the topic** | Native Claude UI |
 | Switching one convo across devices | Hand-off only (don't co-drive the same session in two places) | **Real-time sync** across devices — purpose-built for this |
+| **Survives reboot / restart** | ✅ topic↔session bindings persist (`registry.json`) — message the topic and it **resumes from the saved transcript** | ❌ a session ends when its process stops; the restarted server does **not** re-host it (you relaunch/resume by hand) |
 | Maintenance | A small daemon you run | **Built-in, Anthropic-maintained** |
-| Billing | Subscription (Agent SDK) | Subscription (interactive) |
+| Billing | Subscription (Agent SDK) | Subscription (interactive) — see billing note above |
 
-**Rule of thumb:** if you just want to drive one conversation from your phone *and* laptop interchangeably, **Remote Control is the better, zero-maintenance choice.** Reach for telepath when you specifically want it **in Telegram** — multiple independent topic-threads, in the same app as your other bots/chats, with approval buttons inline and full control over the behavior. The two can coexist (use Remote Control for a session you're actively co-driving; telepath for the rest) — just never drive the *same* session from both at once.
+**Rule of thumb:** if you just want to drive one conversation from your phone *and* laptop interchangeably, **Remote Control is the better, zero-maintenance choice.** Reach for telepath when you specifically want it **in Telegram** — multiple independent topic-threads, in the same app as your other bots/chats, with approval buttons inline and full control over the behavior. It's also the better pick for **long-running work you reboot through**: telepath resumes the topic's session after a restart (bindings persist on disk), whereas a Remote Control session ends with its process and has to be re-hosted by hand. The two can coexist (use Remote Control for a session you're actively co-driving; telepath for the rest) — just never drive the *same* session from both at once.
 
 ## Security
 
