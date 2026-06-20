@@ -105,7 +105,9 @@ The daemon (`daemon.ts`) holds the bot token and routes by `message_thread_id`. 
 
 Usage runs on your Claude **subscription**, metered like any Claude Code usage — **Opus ≈ 5× Sonnet**, so the default is Sonnet and you opt into Opus per topic. Heavy use can hit your plan's rate limits (you'll see throttling).
 
-> **Heads-up — billing change from June 15, 2026.** Agent SDK / `claude -p` usage on subscription plans (which is *all* of telepath, and any `claude -p` cron jobs you run) no longer counts toward your interactive limits — it draws from a **separate monthly Agent SDK credit**, metered at standard API rates: **$20 Pro · $100 Max 5x / Team Premium · $200 Max 20x · $20 Team/Enterprise base**, per user, no rollover. **When that credit is exhausted, Agent SDK requests stop until it refreshes — unless you enable "usage credits" (overflow billing)**, which then bills pay-as-you-go. You claim the credit once (Anthropic emails instructions before June 15). For unattended/high-frequency setups, keep cheap models as the default and watch the first cycle. An **API key** bypasses the credit entirely (plain pay-as-you-go, never hard-stops). Details: [Use the Agent SDK with your Claude plan](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan) · [Agent SDK docs](https://code.claude.com/docs/en/agent-sdk).
+> **Agent SDK billing — status (as of June 2026).** Anthropic announced a change (slated for **June 15, 2026**) that would move Agent SDK / `claude -p` usage on subscription plans to a **separate monthly Agent SDK credit** — then **paused it**. As of now **nothing has changed**: Agent SDK / `claude -p` usage (which is *all* of telepath, plus any `claude -p` cron jobs) draws from your **normal subscription rate limits exactly as before** — no separate credit, nothing to claim, limits unchanged. Anthropic has said they'll give **advance notice** before any future change.
+>
+> Why it still matters for telepath: telepath is **built on the Agent SDK**, so *if* that split returns, telepath's usage would fall under the Agent-SDK credit — whereas Claude Code **Remote Control** is **interactive-billed** (see the comparison below). If you ever need to decouple, an **API key** stays on plain pay-as-you-go and never hard-stops. Details: [Use the Agent SDK with your Claude plan](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan) · [Agent SDK docs](https://code.claude.com/docs/en/agent-sdk).
 
 ## How is this different from Claude Code's Remote Control?
 
@@ -117,10 +119,11 @@ Claude Code ships a built-in [**Remote Control**](https://code.claude.com/docs/e
 | Multi-session | One forum **topic** per session | Server mode: multiple sessions |
 | Approvals | Custom **Allow/Deny buttons in the topic** | Native Claude UI |
 | Switching one convo across devices | Hand-off only (don't co-drive the same session in two places) | **Real-time sync** across devices — purpose-built for this |
+| **Survives reboot / restart** | ✅ topic↔session bindings persist (`registry.json`) — message the topic and it **resumes from the saved transcript** | ❌ a session ends when its process stops; the restarted server does **not** re-host it (you relaunch/resume by hand) |
 | Maintenance | A small daemon you run | **Built-in, Anthropic-maintained** |
-| Billing | Subscription (Agent SDK) | Subscription (interactive) |
+| Billing | Subscription (Agent SDK) | Subscription (interactive) — see billing note above |
 
-**Rule of thumb:** if you just want to drive one conversation from your phone *and* laptop interchangeably, **Remote Control is the better, zero-maintenance choice.** Reach for telepath when you specifically want it **in Telegram** — multiple independent topic-threads, in the same app as your other bots/chats, with approval buttons inline and full control over the behavior. The two can coexist (use Remote Control for a session you're actively co-driving; telepath for the rest) — just never drive the *same* session from both at once.
+**Rule of thumb:** if you just want to drive one conversation from your phone *and* laptop interchangeably, **Remote Control is the better, zero-maintenance choice.** Reach for telepath when you specifically want it **in Telegram** — multiple independent topic-threads, in the same app as your other bots/chats, with approval buttons inline and full control over the behavior. It's also the better pick for **long-running work you reboot through**: telepath resumes the topic's session after a restart (bindings persist on disk), whereas a Remote Control session ends with its process and has to be re-hosted by hand. The two can coexist (use Remote Control for a session you're actively co-driving; telepath for the rest) — just never drive the *same* session from both at once.
 
 ## Security
 
