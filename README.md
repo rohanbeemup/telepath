@@ -6,7 +6,7 @@
 Telegram forum supergroup ("Claude")          one bot, one poller
   ├─ Topic "fix login bug"  ⇄  resident Claude session A
   ├─ Topic "infra audit"    ⇄  resident Claude session B   ← each topic = its own
-  └─ Topic (General)        ── /new /list /attach /auto       conversation, on your box
+  └─ Topic (General)        ── menu: new / list / resume       conversation, on your box
             │
             ▼
    daemon.ts  (Bun + grammy + @anthropic-ai/claude-agent-sdk)
@@ -53,7 +53,14 @@ Then, on the Telegram side:
 
 1. **Create a bot:** message [@BotFather](https://t.me/BotFather) → `/newbot` → copy the token.
 2. **Create a forum group:** new group → Settings → enable **Topics** → add your bot as **admin** with the **Manage Topics** permission.
-3. **Fill `.env`:** put the bot token in `TELEGRAM_BOT_TOKEN`. For the other two ids, the easiest path: run the daemon (`bun run daemon.ts`), send any message in the group, and read your `ALLOWED_USER_ID` and `FORUM_CHAT_ID` from the log. (Or use [@userinfobot](https://t.me/userinfobot).)
+3. **Fill `.env`:** put the bot token in `TELEGRAM_BOT_TOKEN`. The daemon *requires* `ALLOWED_USER_ID` and `FORUM_CHAT_ID` at startup and exits without them, so get them from Telegram first: send `/start` in the group (with the daemon stopped, so it isn't eating the updates), then
+
+   ```bash
+   curl -s "https://api.telegram.org/bot<TOKEN>/getUpdates" |
+     jq '.result[-1].message | {ALLOWED_USER_ID: .from.id, FORUM_CHAT_ID: .chat.id}'
+   ```
+
+   On Windows: `.\get-ids.ps1` does the same. (For just the user id, [@userinfobot](https://t.me/userinfobot) also works.)
 4. **Run it:** `bun run daemon.ts` — or, if you installed the service, it's already running (`journalctl --user -u telepath -f`).
 
 ## Usage

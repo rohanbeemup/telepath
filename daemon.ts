@@ -129,6 +129,14 @@ function loadPrefs(): Prefs {
   }
 }
 const prefs = loadPrefs()
+// The saved default folder can be deleted or moved between runs, so every
+// consumer resolves it through here rather than handing a dead path to the SDK.
+function defaultCwd(): string {
+  try {
+    if (statSync(prefs.defaultCwd).isDirectory()) return prefs.defaultCwd
+  } catch {}
+  return DEFAULT_CWD
+}
 function savePrefs(): void {
   try {
     mkdirSync(STATE_DIR, { recursive: true })
@@ -792,14 +800,15 @@ function expandHome(p: string): string {
 // `/new <name…>` — the whole arg is the topic name. Optional `cwd=<path>` token
 // (anywhere) sets the working dir; it's validated and ignored if it's not a real dir.
 function parseNew(args: string, notify: (s: string) => void): { name: string; cwd: string; auto: boolean } {
-  let cwd = prefs.defaultCwd
+  const fallback = defaultCwd()
+  let cwd = fallback
   let auto = false
   const kept: string[] = []
   for (const t of args.trim().split(/\s+/).filter(Boolean)) {
     if (t.startsWith('cwd=')) {
       const cand = expandHome(t.slice(4))
       if (existsSync(cand) && statSync(cand).isDirectory()) cwd = cand
-      else notify(`(ignoring cwd="${cand}" — not a directory; using ${prefs.defaultCwd})`)
+      else notify(`(ignoring cwd="${cand}" — not a directory; using ${fallback})`)
     } else if (t.toLowerCase() === 'auto') {
       auto = true
     } else {
@@ -872,7 +881,7 @@ async function cmdAttach(args: string, fromTopic: string | undefined): Promise<s
   registry[topicId] = {
     sessionId: match.sessionId,
     cwd: (match as any).cwd || DEFAULT_CWD,
-    model: DEFAULT_MODEL,
+    model: prefs.defaultModel,
     title: name,
     lastActive: Date.now(),
   }
@@ -939,13 +948,7 @@ if (migrated) saveRegistry()
 // EVERY repo/project folder under REPOS_DIR — git repos sort first,
 // then other project dirs — then Home. Pagination handles long lists.
 function listRepoFolders(): string[] {
-  // Fall back if the saved default folder was deleted/moved.
-  let def = prefs.defaultCwd
-  try {
-    if (!statSync(def).isDirectory()) def = DEFAULT_CWD
-  } catch {
-    def = DEFAULT_CWD
-  }
+  const def = defaultCwd()
   const entries: { path: string; mtime: number; git: boolean }[] = []
   try {
     for (const name of readdirSync(REPOS_DIR)) {
@@ -985,7 +988,7 @@ const openLinkKb = (topicId: string) =>
 
 // One-tap session in the default folder + default model (no wizard).
 async function quickNew(intoTopic: string | undefined): Promise<void> {
-  const cwd = prefs.defaultCwd
+  const cwd = defaultCwd()
   const model = prefs.defaultModel
   const name = basename(cwd)
   try {
@@ -1029,7 +1032,7 @@ function settingsKb(): InlineKeyboard {
   return kb.text('📁 Default folder', 'm:sdf').row().text('⬅️ Back', 'm:menu')
 }
 async function showSettings(intoTopic: string | undefined): Promise<void> {
-  await paint(intoTopic, `⚙️ Settings — defaults for 🆕/⚡ new sessions:\nModel: ${modelLabel(prefs.defaultModel)}\nFolder: ${prefs.defaultCwd}`, settingsKb())
+  await paint(intoTopic, `⚙️ Settings — defaults for 🆕/⚡ new sessions:\nModel: ${modelLabel(prefs.defaultModel)}\nFolder: ${defaultCwd()}`, settingsKb())
 }
 
 // Default-folder picker (own callback namespace so it doesn't touch the wizard).
@@ -1213,7 +1216,7 @@ async function finishWizard(uid: string, auto: boolean): Promise<void> {
   if (!w || !w.cwd) return
   wizard.delete(uid)
   const name = basename(w.cwd)
-  const model = w.model || DEFAULT_MODEL
+  const model = w.model || prefs.defaultModel
   let topicId = w.bindTopic
   if (!topicId) {
     try {
@@ -1336,6 +1339,9 @@ async function handleMenu(ctx: Context, data: string): Promise<void> {
   // (resumable). The pinned panel becomes a Reopen button.
   if (data === 'm:tclose') {
     const b = registry[topicId]
+    // Without this the pending nudge would resume the session — and post into
+    // the topic the user just closed.
+    cancelRateLimitResume(topicId)
     closeLive(topicId, 'closed & kept by user')
     if (b?.controlMsgId) await bot.api.unpinChatMessage(FORUM_CHAT_ID, b.controlMsgId).catch(() => {})
     await ack('💾 Closed')
@@ -1360,6 +1366,7 @@ async function handleMenu(ctx: Context, data: string): Promise<void> {
     return paint(topicId, '🗑 Delete this topic and its session permanently?\nThis cannot be undone.', new InlineKeyboard().text('🗑 Yes, delete', 'm:tdelyes').text('↩️ Cancel', 'm:ctl'))
   }
   if (data === 'm:tdelyes') {
+    cancelRateLimitResume(topicId)
     closeLive(topicId, 'deleted by user')
     delete registry[topicId]
     saveRegistry()
@@ -1374,6 +1381,7 @@ async function handleMenu(ctx: Context, data: string): Promise<void> {
   }
   if (data === 'm:twipeyes') {
     const sid = registry[topicId]?.sessionId
+    cancelRateLimitResume(topicId)
     closeLive(topicId, 'wiped by user')
     delete registry[topicId]
     saveRegistry()

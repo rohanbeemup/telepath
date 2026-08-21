@@ -19,6 +19,9 @@ if (-not (Test-Path .env)) {
   Copy-Item .env.example .env
   # Lock .env to the current user only (Windows equivalent of chmod 600 — it holds the bot token).
   icacls .env /inheritance:r /grant:r "$($env:USERNAME):F" | Out-Null
+  if ($LASTEXITCODE -ne 0) {
+    Write-Error "icacls failed - .env may still be readable by other users. Restrict it manually before putting a bot token in it."
+  }
   Write-Host "==> Created .env (locked to $($env:USERNAME)). Edit it now: set TELEGRAM_BOT_TOKEN, ALLOWED_USER_ID, FORUM_CHAT_ID."
 } else {
   Write-Host "==> .env already exists - leaving it."
@@ -27,6 +30,7 @@ if (-not (Test-Path .env)) {
 Write-Host ""
 Write-Host "==> Done. Next:"
 Write-Host "    1. Fill TELEGRAM_BOT_TOKEN in .env (from @BotFather)."
-Write-Host "    2. Run .\start.ps1 (or double-click start.bat), send a message in your forum group,"
-Write-Host "       and read ALLOWED_USER_ID + FORUM_CHAT_ID from the log; put them in .env."
-Write-Host "    3. Run .\start.ps1 again - you're live. See WINDOWS.md for the full walkthrough."
+Write-Host "    2. Send /start in your forum group, then read the two ids with:"
+Write-Host "         .\get-ids.ps1"
+Write-Host "       Put them in .env as ALLOWED_USER_ID and FORUM_CHAT_ID."
+Write-Host "    3. Run .\start.ps1 - you're live. See WINDOWS.md for the full walkthrough."

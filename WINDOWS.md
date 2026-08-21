@@ -40,9 +40,16 @@ the bot token).
 Open `.env` and set the three required values:
 
 - `TELEGRAM_BOT_TOKEN` — from @BotFather.
-- `ALLOWED_USER_ID` and `FORUM_CHAT_ID` — easiest path: leave them blank for now,
-  run the daemon once (next step), send any message in your forum group, and read
-  both ids from the log line `[in] recv ...` / the boot log. Then paste them in.
+- `ALLOWED_USER_ID` and `FORUM_CHAT_ID` — the daemon **requires** both at startup
+  (it exits if either is missing), so it can't be the thing that shows them. Send
+  `/start` in your forum group, then ask Telegram directly:
+
+  ```powershell
+  powershell -ExecutionPolicy Bypass -File .\get-ids.ps1
+  ```
+
+  It prints both lines ready to paste. (Do this while the daemon is **not**
+  running — a running poller consumes the updates it reads.)
 
 ## Run
 
