@@ -22,11 +22,15 @@ Telegram allows exactly **one poller per bot token**, and the Claude Agent SDK i
 
 - 🧵 **Topic per session** — talk in a topic, it continues that conversation; sessions persist to `~/.claude/projects` (so you can also resume them in your terminal).
 - ✅ **Per-command approval** — Bash/Write/Edit/Web post an Allow/Deny button into the topic and the session blocks until you tap.
-- ⚡ **Auto mode** — `/auto` per topic to run tools without prompts (opt-in, per topic).
+- 🔘 **Buttons for everything** — a menu in General (new / list / resume / settings) and a **pinned control panel** in every session topic (model, approvals, close, delete, wipe). Commands still work; you rarely need them from a phone.
+- ⚡ **Auto mode** — per topic, run tools without prompts (opt-in, one tap or `/auto`).
 - ❓ **Clarifying questions & plan mode** — `AskUserQuestion` renders as tappable option buttons; plan mode shows the full plan then asks to approve.
 - 💸 **Cost controls** — Sonnet by default (`use opus` per topic), idle-eviction, and a concurrent-session cap.
-- 🖼️ **Images** — send a photo to a topic and the session reads it.
+- ⏳ **Rate-limit auto-resume** — a turn cut off by a hard rate limit is picked up again automatically when the window resets, instead of stalling until you notice.
+- 🖼️ **Files both ways** — send a photo or document into a topic and the session reads it; anything the session drops in its `TELEPATH_OUTBOX` folder is delivered back to the topic (images as photos, the rest as documents).
+- ✍️ **Formatted replies** — Claude's Markdown is rendered as Telegram HTML (bold, headings, lists, code, links, tables), with a plain-text fallback so a message is never dropped.
 - 🆔 **Resumable** — each new topic prints its session id + a `claude --resume …` command so you can pick it up on your laptop.
+- 🪟 **Linux, macOS and Windows** — Bun everywhere; `install.sh` + systemd on Linux, `install.ps1` / `start.bat` on Windows (see [`WINDOWS.md`](WINDOWS.md)).
 - 🔒 **Single-user** — only your Telegram user id can talk to it or approve anything.
 
 ## Prerequisites
@@ -43,6 +47,8 @@ cd telepath
 ./install.sh            # installs deps, creates .env, optional systemd service
 ```
 
+> **On Windows?** Skip `install.sh` and use `install.ps1` + `start.ps1` (or `start.bat`) instead — see [`WINDOWS.md`](WINDOWS.md) for the full walkthrough.
+
 Then, on the Telegram side:
 
 1. **Create a bot:** message [@BotFather](https://t.me/BotFather) → `/newbot` → copy the token.
@@ -52,17 +58,45 @@ Then, on the Telegram side:
 
 ## Usage
 
-In the **General** topic:
+In the **General** topic, send anything (or `/menu`) to get the menu:
+
+| Button | What it does |
+|---|---|
+| 🆕 **New session** | Three taps: pick a project folder (scanned from `REPOS_DIR`, git repos first), a model, then approvals-vs-auto. |
+| ⚡ **Quick new** | One tap: a session in your default folder + default model. |
+| 📋 **My sessions** | Past sessions as buttons (📌 bound, 🟢 live) — including ones started in your terminal. Tap one to reopen it. |
+| ▶️ **Resume last** | Jump straight into the most recently active session. |
+| ⚙️ **Settings** | Default model + default folder for new sessions (persisted in `prefs.json`). |
+
+In a **session topic**: just type. A 📌 **pinned control panel** sits at the top of every session topic:
+
+| Button | What it does |
+|---|---|
+| ⚡ Sonnet / 🧠 Opus | Switch this topic's model (applies on the next message). |
+| 🔐 Approvals ↔ ⚡ Auto | Toggle whether risky tools ask before running. |
+| 💾 Close & keep | Stop the session and close the topic; context is kept and a ♻️ **Reopen** button resumes it. |
+| 🗑 Close & delete | Remove the topic + binding. The transcript stays on disk (still `claude --resume`-able). |
+| 🧹 Close, delete & remove all | Full wipe: topic, binding, delivered files **and** the transcript — no longer resumable. Asks to confirm first. |
+
+Clarifying questions appear as buttons — tap one, or type your own reply. Typing still works for everything: `use opus` / `use sonnet` switches model, and the commands below are unchanged.
+
+<details>
+<summary>Typed commands</summary>
 
 | Command | What it does |
 |---|---|
+| `/menu` | Menu in General, control panel in a session topic. |
 | `/new <name> [cwd=/path] [auto]` | Create a topic + session. `cwd=` sets the working dir; `auto` skips approvals. |
-| `/list` | Recent sessions (📌 bound to a topic, 🟢 live) — includes ones started in your terminal. |
+| `/list` | Your sessions as buttons. |
 | `/attach <short-id> [name]` | Bind an existing session to a new topic and resume it. |
 | `/auto [on\|off]` | Toggle auto mode for the current topic. |
 | `/help` | Show help. |
 
-In a **session topic**: just type. `use opus` / `use sonnet` switches that topic's model. Clarifying questions appear as buttons — tap one, or type your own reply.
+</details>
+
+### Getting files out
+
+Each session gets a `TELEPATH_OUTBOX` directory in its environment, and is told once — at the start of the conversation — that anything it writes there is delivered to you in the topic. So "screenshot that", "chart it", "export the report" arrive as a photo or document instead of a description. Delivered files are removed from the outbox after Telegram accepts them; a failed send stays put and is retried after the next turn.
 
 ## Run as a service (24/7)
 
@@ -95,7 +129,11 @@ sudo loginctl enable-linger "$USER"      # <-- don't skip this
 
 ## Configuration
 
-All via `.env` (see [`.env.example`](.env.example)). Key options: `DEFAULT_MODEL`, `SONNET_MODEL`, `OPUS_MODEL`, `IDLE_MINUTES`, `MAX_LIVE_SESSIONS`, `DEFAULT_CWD`, `TG_CLAUDE_STATE_DIR`, `CLAUDE_BINARY`.
+All via `.env` (see [`.env.example`](.env.example)). Key options: `DEFAULT_MODEL`, `SONNET_MODEL`, `OPUS_MODEL`, `FABLE_MODEL`, `ENABLED_MODELS`, `REPOS_DIR`, `IDLE_MINUTES`, `MAX_LIVE_SESSIONS`, `DEFAULT_CWD`, `TG_CLAUDE_STATE_DIR`, `CLAUDE_BINARY`.
+
+- **`ENABLED_MODELS`** (default `sonnet,opus`) decides which models the menus offer — list only what your auth can actually use. Fable 5 is **not** on the Claude subscription, so it is off by default; add `fable` only if your auth has it. Topics still pinned to a now-disabled model are migrated to the default on boot, so a session can't get stuck failing on a model you can't reach.
+- **`REPOS_DIR`** (default: the parent of `DEFAULT_CWD`) is the root the folder picker scans. Git repos sort first, then other project folders by recency.
+- Runtime state lives next to the daemon (or in `TG_CLAUDE_STATE_DIR`): `registry.json` (topic → session), `prefs.json` (menu defaults), `outbox/<topic>/` (files awaiting delivery). All gitignored.
 
 ## How it works
 

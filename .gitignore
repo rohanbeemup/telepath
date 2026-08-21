@@ -2,7 +2,10 @@
 .env
 registry.json
 registry.json.tmp
+prefs.json
+prefs.json.tmp
 inbox/
+outbox/
 discord-state/
 
 # Dependencies

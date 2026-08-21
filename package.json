@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "0.2.117",
-    "grammy": "^1.30.0"
+    "grammy": "^1.30.0",
+    "marked": "^18.0.5"
   }
 }
