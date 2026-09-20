@@ -28,7 +28,7 @@ Telegram allows exactly **one poller per bot token**, and the Claude Agent SDK i
 - 💸 **Cost controls** — Sonnet by default (`use opus` per topic), idle-eviction, and a concurrent-session cap.
 - ⏳ **Rate-limit auto-resume** — a turn cut off by a hard rate limit is picked up again automatically when the window resets, instead of stalling until you notice.
 - 🖼️ **Files both ways** — send a photo or document into a topic and the session reads it; anything the session drops in its `TELEPATH_OUTBOX` folder is delivered back to the topic (images as photos, the rest as documents).
-- ✍️ **Formatted replies** — Claude's Markdown is rendered as Telegram HTML (bold, headings, lists, code, links, tables), with a plain-text fallback so a message is never dropped.
+- ✍️ **Formatted replies** — Claude's Markdown is rendered as Telegram HTML (bold, headings, lists, code, links), with a plain-text fallback so a message is never dropped. Tables become one labelled block per row, because Telegram never wraps a `<pre>` grid and a phone shows you a sliver of it.
 - 🆔 **Resumable** — each new topic prints its session id + a `claude --resume …` command so you can pick it up on your laptop.
 - 🪟 **Linux, macOS and Windows** — Bun everywhere; `install.sh` + systemd on Linux, `install.ps1` / `start.bat` on Windows (see [`WINDOWS.md`](WINDOWS.md)).
 - 🔒 **Single-user** — only your Telegram user id can talk to it or approve anything.
