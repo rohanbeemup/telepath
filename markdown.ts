@@ -157,8 +157,17 @@ function closeFor(stack: string[]): string {
   return stack.map(t => `</${tagName(t)}>`).reverse().join('')
 }
 
-/** The largest index <= budget at which cutting lands outside every tag and entity. */
-function safeCut(s: string, budget: number): number {
+/**
+ * The largest index <= budget at which cutting lands outside every tag and entity.
+ *
+ * Only a window around the budget is examined. Scanning the whole remainder made
+ * the cost of splitting grow with its square, and the caller runs synchronously
+ * on the daemon's only thread. The window covers any tag or entity that starts
+ * before the budget, since oversized tags are degraded to text before this runs.
+ */
+function safeCut(s: string, budget: number, window = 4096): number {
+  if (budget >= s.length) budget = s.length
+  if (s.length > budget + window) s = s.slice(0, budget + window)
   const unsafe = new Array(s.length + 1).fill(false)
   const mark = (re: RegExp) => {
     for (const m of s.matchAll(re)) {
@@ -223,9 +232,14 @@ export function chunkHtml(html: string, limit = 3500): string[] {
    * tags the piece itself opens are the ones an earlier version missed, which is
    * how a chunk could overshoot and how the loop could stop making progress.
    */
-  const fits = (piece: string, sep: boolean) =>
-    cur.length + (sep && filled ? 1 : 0) + piece.length +
-    closeFor(applyTags(stack, piece)).length <= limit
+  const fits = (piece: string, sep: boolean) => {
+    const base = cur.length + (sep && filled ? 1 : 0) + piece.length
+    // Decide the hopeless case without walking the piece for tags: the remainder
+    // is passed here first, and scanning it every time is what made this
+    // quadratic.
+    if (base > limit) return false
+    return base + closeFor(applyTags(stack, piece)).length <= limit
+  }
 
   for (const line of html.split('\n')) {
     let rest = line

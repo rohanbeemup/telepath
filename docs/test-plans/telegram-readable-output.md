@@ -64,6 +64,14 @@ What was checked, and what turned out false:
   daemon's only thread, so one message would freeze delivery and the Allow/Deny buttons
   for every topic. Severity high: the fix must account for the stack AFTER the candidate
   piece, and must drop formatting it cannot afford rather than failing to make progress.
+- **False, found by the fourth security pass: "termination is enough."** Terminating is not
+  the same as returning promptly. `safeCut` built its unsafe map over the whole remaining
+  line and `fits` ran `applyTags` over the whole remainder, so work grew quadratically:
+  measured 250k chars in 42ms, 500k in 122ms, 1M in 510ms, 2M in 2170ms, a clean
+  four-times-per-doubling. `sayTopic` runs this synchronously before sending anything, so
+  a long enough message blocks the daemon's only thread. Practical exposure is limited,
+  since an assistant text block is bounded by the model's output budget, which is why this
+  is a medium and not the high that finding 4 was.
 - **Ruled out as the "integrator":** `contabo-server-config/kafka-telegram-relay/formatters.js`
   and `backend/shared/telegram/formatters.ts`. Both emit `<b>` and `<code>` bullet
   lists and contain no table construction (grepped for `|---`, `padEnd`, column joins).
@@ -94,6 +102,7 @@ What was checked, and what turned out false:
 | `keeps every chunk within the limit, even when one link is oversized` | the size guarantee holds for input that cannot be cut safely | the state before this fix: no degrade pass, and the remainder appended whole |
 | `terminates on deeply nested formatting` | chunking returns for input whose reopen prefix and closing tags exceed a whole chunk | reserving only the tags already open, ignoring the ones the added piece opens |
 | `drops formatting it cannot afford rather than carrying it` | when the tag stack costs more than half the budget it is closed and not reopened, so content keeps flowing | carrying the stack regardless, leaving no room for content |
+| `chunks a very long line without quadratic work` | scanning is bounded by the chunk budget, not by what remains, so cost grows with input rather than with its square | rebuilding the unsafe map over the whole remainder on every cut |
 | `does not split inside a tag or an entity` | a cut inside `<a href=...>` or `&amp;` never happens, at any limit | cutting at a fixed offset once a line exceeds the budget |
 
 ### Negative cases

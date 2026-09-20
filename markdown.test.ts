@@ -272,6 +272,19 @@ describe('chunking', () => {
     }
   })
 
+  test('chunks a very long line without quadratic work', () => {
+    // sayTopic runs this synchronously, so cost has to grow with the input and
+    // not with its square. Measured before the fix: 2M characters took 2170ms.
+    // The ceiling below leaves roughly twenty times headroom over linear.
+    const F2 = '\x60\x60\x60'
+    const html = mdToTelegramHtml([F2, 'a'.repeat(2_000_000), F2].join('\n'))
+    const started = Date.now()
+    const parts = chunkHtml(html, 3500)
+    const elapsed = Date.now() - started
+    expect(parts.length).toBeGreaterThan(100)
+    expect(elapsed).toBeLessThan(1000)
+  })
+
   test('does not split inside a tag or an entity', () => {
     // ONE long paragraph, so marked renders it as a single line and the splitter
     // has to cut inside it. Densely packed with tags and entities, which is where
