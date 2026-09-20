@@ -1,5 +1,5 @@
 import { test, expect, describe } from 'bun:test'
-import { mdToTelegramHtml, chunkHtml } from './markdown'
+import { mdToTelegramHtml, chunkHtml, htmlToPlain } from './markdown'
 
 // Three backticks, written as escapes. Spelled literally they appear in a regex
 // below, where the lexer in the test-plan checker reads them as an unterminated
@@ -237,6 +237,23 @@ describe('chunking', () => {
     }
   })
 
+  test('degrades a link whose tag alone exceeds the budget to visible text', () => {
+    const url = 'https://example.com/' + 'a'.repeat(5000)
+    const parts = chunkHtml(mdToTelegramHtml(url), 3500)
+    // The destination survives as readable text rather than being dropped.
+    expect(parts.join('').replace(/<[^>]*>/g, '')).toContain('a'.repeat(200))
+    for (const part of parts) expect(part).not.toContain('<a href')
+  })
+
+  test('keeps every chunk within the limit, even when one link is oversized', () => {
+    const url = 'https://example.com/' + 'a'.repeat(5000)
+    for (const limit of [500, 1200, 3500]) {
+      for (const part of chunkHtml(mdToTelegramHtml(url), limit)) {
+        expect(part.length).toBeLessThanOrEqual(limit)
+      }
+    }
+  })
+
   test('does not split inside a tag or an entity', () => {
     // ONE long paragraph, so marked renders it as a single line and the splitter
     // has to cut inside it. Densely packed with tags and entities, which is where
@@ -265,6 +282,24 @@ describe('tables (negative)', () => {
     const out = mdToTelegramHtml(md)
     expect(out).toContain('a | b for the alternative')
     expect(out).not.toContain('▸')
+  })
+
+  test('does not emit a chunk Telegram would refuse', () => {
+    const LIMIT = 3500
+    const adversarial = [
+      'https://example.com/' + 'a'.repeat(5000),
+      '[label](https://example.com/' + 'b'.repeat(5000) + ')',
+      'x'.repeat(9000),
+      Array.from({ length: 40 }, (_, i) => `[l${i}](https://example.com/` + 'c'.repeat(300) + `/${i})`).join(' '),
+    ]
+    for (const md of adversarial) {
+      const parts = chunkHtml(mdToTelegramHtml(md), LIMIT)
+      expect(parts.length).toBeGreaterThan(0)
+      for (const part of parts) {
+        expect(part.length).toBeLessThanOrEqual(LIMIT)
+        expect(htmlToPlain(part).length).toBeLessThanOrEqual(LIMIT)
+      }
+    }
   })
 
   test('does not leave an unbalanced tag in any chunk', () => {

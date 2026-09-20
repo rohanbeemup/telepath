@@ -179,6 +179,20 @@ export function chunkHtml(html: string, limit = 3500): string[] {
   if (!html) return []
   if (html.length <= limit) return [html]
 
+  // A tag can be longer than the budget on its own: marked autolinks a bare URL,
+  // so 5000 characters of path become a 5000-character opening tag with nowhere
+  // safe to cut. Overshooting is not the safe option, because Telegram refuses an
+  // oversized message and the send is lost. Degrade the element to visible text
+  // instead, keeping the destination the reader was shown and, since it is now
+  // ordinary text, splittable.
+  const maxTag = Math.max(64, Math.floor(limit / 4))
+  html = html.replace(/<a ([^>]*)>([\s\S]*?)<\/a>/g, (whole, attrs, inner) => {
+    if (whole.length - inner.length <= maxTag) return whole
+    const href = (/href="([^"]*)"/.exec(attrs) ?? ['', ''])[1]
+    if (!inner || inner === href) return inner || href
+    return `${inner} (${href})`
+  })
+
   const out: string[] = []
   let stack: string[] = []
   let cur = ''
@@ -209,8 +223,16 @@ export function chunkHtml(html: string, limit = 3500): string[] {
       const cut = safeCut(rest, limit - cur.length - sep - reserve)
       if (cut <= 0) {
         if (filled) { flush(); first = true; continue }
-        add(rest, first) // nowhere safe to cut: overshoot rather than corrupt
-        break
+        // Still nothing safe to cut in a fresh chunk: drop this line's markup and
+        // split it as the escaped text it already is, so the size guarantee holds
+        // for every input rather than for the inputs we thought of.
+        const bare = rest.replace(/<[^>]*>/g, '')
+        if (bare.length < rest.length) { rest = bare; continue }
+        add(rest.slice(0, Math.max(1, limit - reserve)), first)
+        rest = rest.slice(Math.max(1, limit - reserve))
+        flush()
+        first = true
+        continue
       }
       add(rest.slice(0, cut), first)
       rest = rest.slice(cut)

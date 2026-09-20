@@ -49,6 +49,13 @@ What was checked, and what turned out false:
   tracked at all. Both render inert as a whole message and produce an active anchor once
   split. The class fix is to parse the complete message once and split its OUTPUT, so no
   fragment is ever parsed as markdown again.
+- **False, found by the security pass on the class fix: "overshooting the limit is safer
+  than corrupting a tag."** It is not, because an oversized chunk is refused by Telegram
+  and the message is lost entirely. Reproduced: `https://example.com/` plus 5000 `a`
+  characters renders to one anchor whose opening tag alone exceeds the budget, so no safe
+  cut exists, and the chunk came out at 10055 characters with a 5020-character plain
+  fallback. Both are over the 4096 limit, both sends fail, and `sayTopic` logs and moves
+  on. Silent loss is worse than a degraded link.
 - **Ruled out as the "integrator":** `contabo-server-config/kafka-telegram-relay/formatters.js`
   and `backend/shared/telegram/formatters.ts`. Both emit `<b>` and `<code>` bullet
   lists and contain no table construction (grepped for `|---`, `padEnd`, column joins).
@@ -75,6 +82,8 @@ What was checked, and what turned out false:
 | `introduces no href that the whole-message render did not contain` | class-level: splitting can add no link that parsing the complete message did not produce | recovering text from the render and re-parsing each piece, the design this replaced |
 | `reopens an open tag in the next chunk and closes it in the emitted one` | a tag left open at a boundary is closed and reopened, so every chunk stands alone | emitting the fragment and letting Telegram reject the unbalanced tag |
 | `splits long text at line boundaries` | a chunk ends at a newline rather than mid-word whenever one is available | slicing the whole message at fixed offsets, ignoring line boundaries |
+| `degrades a link whose tag alone exceeds the budget to visible text` | an unsplittable anchor becomes escaped text carrying the same URL, rather than an unsendable chunk | dropping the element, losing the destination the reader was shown |
+| `keeps every chunk within the limit, even when one link is oversized` | the size guarantee holds for input that cannot be cut safely | the state before this fix: no degrade pass, and the remainder appended whole |
 | `does not split inside a tag or an entity` | a cut inside `<a href=...>` or `&amp;` never happens, at any limit | cutting at a fixed offset once a line exceeds the budget |
 
 ### Negative cases
@@ -84,6 +93,7 @@ What was checked, and what turned out false:
 | `does not wrap a table in a pre block` | no `<pre>` appears in the output for a table input | leaving the old `<pre>` wrapper in place alongside the new rendering |
 | `does not treat a paragraph containing pipes as a table` | prose carrying a bare `\|` (a shell pipe) is not restructured | a line scanner that triggers on any `\|` instead of on marked's `table` token |
 | `does not drop a row whose first cell is empty` | a row with an empty title cell still emits its remaining columns | a guard that skips the row when the title is falsy, silently losing data |
+| `does not emit a chunk Telegram would refuse` | class-level: no chunk, and no plain fallback of one, exceeds the limit for any adversarial input | the state before this fix: no degrade pass, and the remainder appended whole |
 | `does not leave an unbalanced tag in any chunk` | class-level: every chunk's tags open and close within it, for any split point | reopening a tag in the next chunk but forgetting to close it in the emitted one |
 
 ## Out of scope
