@@ -23,7 +23,7 @@ import {
   type SettingSource,
 } from '@anthropic-ai/claude-agent-sdk'
 import { Bot, InlineKeyboard, InputFile, type Context } from 'grammy'
-import { htmlEsc, htmlToPlain, mdToTelegramHtml, chunkMarkdown } from './markdown'
+import { htmlEsc, htmlToPlain, mdToTelegramHtml, chunkHtml } from './markdown'
 import { readFileSync, writeFileSync, mkdirSync, renameSync, existsSync, statSync, chmodSync, readdirSync, rmSync } from 'fs'
 import { homedir } from 'os'
 import { join, dirname, basename } from 'path'
@@ -176,34 +176,38 @@ const bot = new Bot(TOKEN)
 // headings→bold, lists, code, links). Falls back to plain text if conversion
 // or Telegram's entity parser rejects a chunk — so a stray character never
 // drops a message. Chunk a bit smaller than the 4096 cap: escaping adds chars.
+//
+// The whole message is parsed ONCE and its output split. Splitting the markdown
+// and parsing each piece lets a fragment be reinterpreted: a link inside a code
+// fence that straddles a boundary becomes a live anchor with its destination
+// hidden behind the label, and being valid HTML it sails past the fallback.
 async function sayTopic(topicId: string | undefined, text: string): Promise<void> {
   const opts = topicId ? { message_thread_id: Number(topicId) } : {}
-  for (const part of chunkMarkdown(text, 3500)) {
-    let html: string | undefined
-    try {
-      html = mdToTelegramHtml(part)
-    } catch {
-      html = undefined
-    }
+  let html: string | undefined
+  try {
+    html = mdToTelegramHtml(text)
+  } catch {
+    html = undefined
+  }
+  for (const part of chunkHtml(html ?? text, 3500)) {
     if (html) {
       try {
-        await bot.api.sendMessage(FORUM_CHAT_ID, html, { ...opts, parse_mode: 'HTML' })
-        process.stderr.write(`[out] sent topic ${topicId} ${html.length}c (html)\n`)
+        await bot.api.sendMessage(FORUM_CHAT_ID, part, { ...opts, parse_mode: 'HTML' })
+        process.stderr.write(`[out] sent topic ${topicId} ${part.length}c (html)\n`)
         continue
       } catch (e) {
         process.stderr.write(`[out] html rejected, retrying plain: ${e}\n`)
       }
     }
+    const plain = html ? htmlToPlain(part) : part
     try {
-      await bot.api.sendMessage(FORUM_CHAT_ID, part, opts)
-      process.stderr.write(`[out] sent topic ${topicId} ${part.length}c (plain)\n`)
+      await bot.api.sendMessage(FORUM_CHAT_ID, plain, opts)
+      process.stderr.write(`[out] sent topic ${topicId} ${plain.length}c (plain)\n`)
     } catch (e) {
       process.stderr.write(`[out] send FAILED topic ${topicId}: ${e}\n`)
     }
   }
 }
-
-// ── Clarifying questions (AskUserQuestion) ──────────────────────────────────
 // Render Claude's questions as option buttons in the topic; return the selection.
 type AskBtn = {
   multi: boolean

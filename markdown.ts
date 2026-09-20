@@ -116,60 +116,108 @@ export function mdToTelegramHtml(md: string): string {
 }
 
 /**
- * Split markdown into sends that each parse on their own.
+ * Split RENDERED HTML into sends that Telegram will accept.
  *
- * The caller renders every chunk independently, so a fenced block straddling a
- * boundary would lose its fence and the remainder would be parsed as markdown:
- * a link inside a code fence becomes a live anchor with its destination hidden
- * behind the label. That is inert content becoming active, so the split has to
- * carry fence state, closing an open fence at the end of a chunk and reopening
- * it (same marker, same info string) at the start of the next.
+ * Splitting the markdown and parsing each piece is the design this replaces, and
+ * it cannot be made safe. Any fragment gets reinterpreted, so a hard split of an
+ * over-long line ending in a fence marker manufactures a closing fence, and a
+ * fence inside a blockquote or a list is not a top-level fence at all. Both turn
+ * content the author marked literal into an active link whose destination hides
+ * behind its label, and because the result is valid HTML the caller's rejection
+ * fallback never fires. Parsing the whole message once and splitting its OUTPUT
+ * removes the class: a chunk of HTML is never parsed as markdown again.
  *
- * Splitting the markdown rather than the rendered HTML is deliberate: a split of
- * the HTML has to avoid landing inside a tag or an entity and still has to close
- * and reopen <pre>, which is the same problem plus two more.
+ * The split then has to respect HTML instead. It cuts only at points outside
+ * every tag and entity, and any tag still open at the end of a chunk is closed
+ * there and reopened at the start of the next, so each send stands alone.
  */
-export function chunkMarkdown(text: string, limit = 3500): string[] {
-  if (!text) return []
-  if (text.length <= limit) return [text]
+const TAG = /<(\/?)([a-zA-Z][a-zA-Z0-9]*)[^>]*>/g
 
-  const FENCE = /^\s*(`{3,}|~{3,})(.*)$/
-  // Leave room for a reopened fence line on any chunk that needs one.
-  const room = Math.max(16, limit - 16)
-  const lines: string[] = []
-  for (const raw of text.split('\n')) {
-    if (raw.length <= room) { lines.push(raw); continue }
-    for (let i = 0; i < raw.length; i += room) lines.push(raw.slice(i, i + room))
+function tagName(tag: string): string {
+  return (/^<\/?([a-zA-Z][a-zA-Z0-9]*)/.exec(tag) ?? ['', ''])[1]
+}
+
+/** The tag stack after `text` is appended to a chunk that already had `stack` open. */
+function applyTags(stack: string[], text: string): string[] {
+  const out = stack.slice()
+  for (const m of text.matchAll(TAG)) {
+    if (m[0].endsWith('/>')) continue
+    if (m[1] === '/') {
+      for (let i = out.length - 1; i >= 0; i--) {
+        if (tagName(out[i]) === m[2]) { out.splice(i, 1); break }
+      }
+    } else {
+      out.push(m[0])
+    }
   }
+  return out
+}
+
+function closeFor(stack: string[]): string {
+  return stack.map(t => `</${tagName(t)}>`).reverse().join('')
+}
+
+/** The largest index <= budget at which cutting lands outside every tag and entity. */
+function safeCut(s: string, budget: number): number {
+  const unsafe = new Array(s.length + 1).fill(false)
+  const mark = (re: RegExp) => {
+    for (const m of s.matchAll(re)) {
+      for (let i = m.index + 1; i < m.index + m[0].length; i++) unsafe[i] = true
+    }
+  }
+  mark(/<[^>]*>/g)
+  mark(/&[a-zA-Z#0-9]{1,10};/g)
+  mark(/&[a-zA-Z#0-9]{0,10}$/g) // a truncated entity at the end is not a cut point either
+  let cut = -1
+  for (let i = Math.min(budget, s.length); i > 0; i--) if (!unsafe[i]) { cut = i; break }
+  if (cut < 0) return -1
+  for (let i = cut; i > cut - 200 && i > 1; i--) if (!unsafe[i] && /\s/.test(s[i - 1])) return i
+  return cut
+}
+
+export function chunkHtml(html: string, limit = 3500): string[] {
+  if (!html) return []
+  if (html.length <= limit) return [html]
 
   const out: string[] = []
-  let open: string | null = null // the opening fence line, repeated to reopen
-  let marker = ''
-  let cur: string[] = []
-  let len = 0
+  let stack: string[] = []
+  let cur = ''
+  let filled = false // cur holds content, not just a reopened tag prefix
 
-  const seed = () => {
-    cur = open ? [open] : []
-    len = open ? open.length + 1 : 0
-  }
   const flush = () => {
-    if (!cur.length) return
-    out.push(cur.join('\n') + (open ? `\n${marker}` : ''))
-    seed()
+    if (!filled) return
+    out.push(cur + closeFor(stack))
+    cur = stack.join('')
+    filled = false
+  }
+  const add = (piece: string, sep: boolean) => {
+    cur += (sep && filled ? '\n' : '') + piece
+    stack = applyTags(stack, piece)
+    filled = true
   }
 
-  for (const line of lines) {
-    const base = open ? 1 : 0 // a chunk holding only its reopened fence is not full
-    const close = open ? marker.length + 1 : 0
-    if (cur.length > base && len + line.length + 1 + close > limit) flush()
-    cur.push(line)
-    len += line.length + 1
-    const m = FENCE.exec(line)
-    if (m) {
-      if (!open) { open = line; marker = m[1] }
-      else if (m[1][0] === marker[0] && m[1].length >= marker.length && !m[2].trim()) { open = null; marker = '' }
+  for (const line of html.split('\n')) {
+    let rest = line
+    let first = true
+    for (;;) {
+      // Reserve room for the closing tags this chunk will need, plus a little
+      // for tags the incoming text opens and leaves open.
+      const reserve = closeFor(stack).length + 64
+      const sep = filled && first ? 1 : 0
+      if (cur.length + sep + rest.length + reserve <= limit) { add(rest, first); break }
+      if (filled && cur.length + sep + reserve > limit / 2) { flush(); first = true; continue }
+      const cut = safeCut(rest, limit - cur.length - sep - reserve)
+      if (cut <= 0) {
+        if (filled) { flush(); first = true; continue }
+        add(rest, first) // nowhere safe to cut: overshoot rather than corrupt
+        break
+      }
+      add(rest.slice(0, cut), first)
+      rest = rest.slice(cut)
+      flush()
+      first = true
     }
   }
   flush()
-  return out.filter(c => c.trim().length > 0)
+  return out.filter(c => c.replace(/<[^>]*>/g, '').trim().length > 0)
 }

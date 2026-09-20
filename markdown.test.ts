@@ -1,13 +1,13 @@
 import { test, expect, describe } from 'bun:test'
-import { mdToTelegramHtml, chunkMarkdown } from './markdown'
+import { mdToTelegramHtml, chunkHtml } from './markdown'
 
 // Three backticks, written as escapes. Spelled literally they appear in a regex
-// below, where the test-plan checker's lexer reads them as an unterminated
+// below, where the lexer in the test-plan checker reads them as an unterminated
 // template literal and skips the whole file — which silently turns off the
 // plan/suite agreement check this suite is held by.
 const F = '\x60\x60\x60'
 
-// The renderer's job is to make what Claude writes readable in a Telegram
+// The job of the renderer is to make what Claude writes readable in a Telegram
 // message. Telegram wraps ordinary text but does NOT wrap <pre>, so a table
 // left as a pipe grid becomes a horizontally-scrolling sliver on a phone.
 // These cases pin the shape that replaced it: one labelled block per row.
@@ -70,7 +70,7 @@ describe('tables', () => {
     // The label belongs to its own column, not to the neighbouring one.
     expect(out).not.toContain('Uptime: online')
     expect(out).not.toContain('Status: 4d')
-    // Column 1's header is the row's identity, not a label line of its own.
+    // The header of column 1 is the row identity, not a label line of its own.
     expect(out).not.toContain('Node: 163')
   })
 
@@ -102,7 +102,7 @@ describe('tables', () => {
     ].join('\n')
     const out = mdToTelegramHtml(md)
     expect(out).toContain('<code>online</code>')
-    // An already-bold title must not be wrapped a second time: Telegram's
+    // An already-bold title must not be wrapped a second time: the Telegram
     // entity parser is the thing that rejects the message, and the fallback
     // would silently drop all formatting for that send.
     expect(out).toContain('<b>163</b>')
@@ -172,38 +172,83 @@ describe('tables', () => {
 })
 
 describe('chunking', () => {
+  const F = '\x60\x60\x60'
+  // Spelled without double quotes: an odd number of them inside a regex reads
+  // as an unterminated string to the test-plan checker, which then skips the file.
+  const hrefs = (h: string) => (h.match(/<a href=[^>]*>/g) ?? []).sort()
+  // The daemon contract: parse the WHOLE message once, then split the output.
+  const send = (md: string, limit = 3500) => chunkHtml(mdToTelegramHtml(md), limit)
+
   const fenced = (lines: number, extra: string, info = '') =>
     [F + info, ...Array.from({ length: lines }, (_, i) => `line ${i} of literal code inside a fence`), extra, F].join('\n')
 
   test('keeps a fenced code block inert when it spans a chunk boundary', () => {
-    // Content the author marked literal must not become active markup just
-    // because the message was too long for one Telegram send.
-    const md = fenced(160, '[click here](https://evil.example/pwn)')
-    const parts = chunkMarkdown(md, 3500)
+    const parts = send(fenced(160, '[click here](https://evil.example/pwn)'))
     expect(parts.length).toBeGreaterThan(1)
-    for (const part of parts) {
-      const html = mdToTelegramHtml(part)
-      expect(html).not.toContain('<a href')
-      expect(html).toContain('<pre>')
+    for (const part of parts) expect(part).not.toContain('<a href')
+  })
+
+  test('keeps literal content inert when a long line inside it ends in a fence marker', () => {
+    // A hard split of this line used to manufacture a standalone closing fence.
+    const md = [F, 'x'.repeat(3484) + F, '[click here](https://evil.example/pwn)', F].join('\n')
+    expect(mdToTelegramHtml(md)).not.toContain('<a href')
+    for (const part of send(md)) expect(part).not.toContain('<a href')
+  })
+
+  test('keeps a fenced block inside a blockquote inert when it is split', () => {
+    const body = Array.from({ length: 120 }, (_, i) => `> line ${i} of quoted literal code`).join('\n')
+    const md = ['> ' + F, body, '> [click here](https://evil.example/pwn)', '> ' + F].join('\n')
+    expect(mdToTelegramHtml(md)).not.toContain('<a href')
+    for (const part of send(md)) expect(part).not.toContain('<a href')
+  })
+
+  test('introduces no href that the whole-message render did not contain', () => {
+    const cases = [
+      fenced(160, '[click here](https://evil.example/pwn)'),
+      [F, 'x'.repeat(3484) + F, '[a](https://evil.example/1)', F].join('\n'),
+      ['A real [link](https://example.com/ok) in prose.', '', fenced(120, 'plain')].join('\n'),
+    ]
+    for (const md of cases) {
+      const allowed = new Set(hrefs(mdToTelegramHtml(md)))
+      for (const part of send(md, 1200)) {
+        for (const h of hrefs(part)) expect(allowed.has(h)).toBe(true)
+      }
     }
   })
 
-  test('reopens a split fence with its original marker and info string', () => {
-    const parts = chunkMarkdown(fenced(160, 'x', 'ts'), 3500)
+  test('reopens an open tag in the next chunk and closes it in the emitted one', () => {
+    const md = ['> ' + F, ...Array.from({ length: 200 }, (_, i) => `> quoted line ${i}`), '> ' + F].join('\n')
+    const parts = send(md, 1500)
     expect(parts.length).toBeGreaterThan(1)
-    expect(parts[0].endsWith(F)).toBe(true)
-    for (const part of parts.slice(1)) expect(part.startsWith(F + 'ts')).toBe(true)
+    for (const part of parts) {
+      expect(part).toContain('<pre>')
+      expect((part.match(/<pre>/g) ?? []).length).toBe((part.match(/<\/pre>/g) ?? []).length)
+    }
   })
 
   test('splits long text at line boundaries', () => {
     const md = Array.from({ length: 300 }, (_, i) => `sentence number ${i} of ordinary prose`).join('\n')
-    const parts = chunkMarkdown(md, 1000)
+    const parts = chunkHtml(mdToTelegramHtml(md), 1000)
     expect(parts.length).toBeGreaterThan(1)
-    expect(parts.join('\n')).toBe(md)
     for (const p of parts) {
       expect(p.length).toBeLessThanOrEqual(1000)
       expect(p.startsWith('sentence number')).toBe(true)
       expect(p.endsWith('of ordinary prose')).toBe(true)
+    }
+  })
+
+  test('does not split inside a tag or an entity', () => {
+    // ONE long paragraph, so marked renders it as a single line and the splitter
+    // has to cut inside it. Densely packed with tags and entities, which is where
+    // an unchecked cut lands.
+    const md = Array.from({ length: 60 }, (_, i) =>
+      `row ${i} [label ${i}](https://example.com/a-fairly-long-path/${i}) with a&b and x<y,`).join(' ')
+    for (const limit of [200, 333, 700, 1024]) {
+      for (const part of chunkHtml(mdToTelegramHtml(md), limit)) {
+        expect((part.match(/</g) ?? []).length).toBe((part.match(/>/g) ?? []).length)
+        expect(part).not.toMatch(/&[a-zA-Z#0-9]{0,8}$/)
+        expect(part).not.toMatch(/<[^>]*$/)
+      }
     }
   })
 })
@@ -222,12 +267,16 @@ describe('tables (negative)', () => {
     expect(out).not.toContain('▸')
   })
 
-  test('does not leave an unclosed fence in any chunk', () => {
-    const body = Array.from({ length: 200 }, (_, i) => `line ${i} inside the fence`).join('\n')
-    for (const limit of [800, 1500, 2600, 3500]) {
-      for (const part of chunkMarkdown(F + '\n' + body + '\n' + F, limit)) {
-        const fences = (part.match(new RegExp('^' + F, 'gm')) ?? []).length
-        expect(fences % 2).toBe(0)
+  test('does not leave an unbalanced tag in any chunk', () => {
+    const Q = '\x60\x60\x60'
+    const md = ['> ' + Q, ...Array.from({ length: 200 }, (_, i) => `> **bold ${i}** and text ${i}`), '> ' + Q].join('\n')
+    for (const limit of [400, 800, 1500, 2600]) {
+      for (const part of chunkHtml(mdToTelegramHtml(md), limit)) {
+        for (const tag of ['b', 'i', 'code', 'pre', 'blockquote', 'a']) {
+          const open = (part.match(new RegExp('<' + tag + '(?=[ >])', 'g')) ?? []).length
+          const close = (part.match(new RegExp('</' + tag + '>', 'g')) ?? []).length
+          expect(open).toBe(close)
+        }
       }
     }
   })

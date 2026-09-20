@@ -41,6 +41,14 @@ What was checked, and what turned out false:
   `| read | delete |` rendered as `<b>read</b>: delete`, discarding both headers, so the
   reader cannot tell which value is which. Comparison, permission and before/after tables
   all land in this shape.
+- **False, found by the security pass on the fence fix: "tracking fence state makes
+  splitting markdown safe."** It does not, because the defect is not fences, it is that
+  every chunk is parsed again. Two reproductions defeat the tracker: a hard split of an
+  over-long line ending in a fence marker manufactures a standalone closing fence the
+  tracker believes, and a fence inside a blockquote is not top-level so it is never
+  tracked at all. Both render inert as a whole message and produce an active anchor once
+  split. The class fix is to parse the complete message once and split its OUTPUT, so no
+  fragment is ever parsed as markdown again.
 - **Ruled out as the "integrator":** `contabo-server-config/kafka-telegram-relay/formatters.js`
   and `backend/shared/telegram/formatters.ts`. Both emit `<b>` and `<code>` bullet
   lists and contain no table construction (grepped for `|---`, `padEnd`, column joins).
@@ -62,8 +70,12 @@ What was checked, and what turned out false:
 | `still renders headings, lists, code and links as before` | the non-table branches of `mdBlock` are untouched by this change | dropping the bold on headings while rewriting the block walk |
 | `keeps both header labels on a two-column table` | a 2-column table names both columns, so `\| Allowed \| Forbidden \|` cannot be read as key/value | treating every 2-column table as key/value and discarding the header row |
 | `keeps a fenced code block inert when it spans a chunk boundary` | a link inside a fence that is split across messages stays literal text in every chunk | chunking the raw markdown and parsing each piece independently |
-| `reopens a split fence with its original marker and info string` | the reopened fence uses the same marker and language as the one that was split | closing with a hardcoded ``` and losing the info string |
+| `keeps literal content inert when a long line inside it ends in a fence marker` | hard-splitting an over-long line cannot manufacture a fence that reopens parsing | recovering text from the render and re-parsing each piece, the design this replaced |
+| `keeps a fenced block inside a blockquote inert when it is split` | a fence that is not top-level is still literal after a split | recovering text from the render and re-parsing each piece, the design this replaced |
+| `introduces no href that the whole-message render did not contain` | class-level: splitting can add no link that parsing the complete message did not produce | recovering text from the render and re-parsing each piece, the design this replaced |
+| `reopens an open tag in the next chunk and closes it in the emitted one` | a tag left open at a boundary is closed and reopened, so every chunk stands alone | emitting the fragment and letting Telegram reject the unbalanced tag |
 | `splits long text at line boundaries` | a chunk ends at a newline rather than mid-word whenever one is available | slicing the whole message at fixed offsets, ignoring line boundaries |
+| `does not split inside a tag or an entity` | a cut inside `<a href=...>` or `&amp;` never happens, at any limit | cutting at a fixed offset once a line exceeds the budget |
 
 ### Negative cases
 
@@ -72,7 +84,7 @@ What was checked, and what turned out false:
 | `does not wrap a table in a pre block` | no `<pre>` appears in the output for a table input | leaving the old `<pre>` wrapper in place alongside the new rendering |
 | `does not treat a paragraph containing pipes as a table` | prose carrying a bare `\|` (a shell pipe) is not restructured | a line scanner that triggers on any `\|` instead of on marked's `table` token |
 | `does not drop a row whose first cell is empty` | a row with an empty title cell still emits its remaining columns | a guard that skips the row when the title is falsy, silently losing data |
-| `does not leave an unclosed fence in any chunk` | class-level: no chunk ends inside a fenced block, for any split point | reopening the fence in the next chunk but forgetting to close it in the emitted one |
+| `does not leave an unbalanced tag in any chunk` | class-level: every chunk's tags open and close within it, for any split point | reopening a tag in the next chunk but forgetting to close it in the emitted one |
 
 ## Out of scope
 
@@ -80,13 +92,14 @@ What was checked, and what turned out false:
   is not a git repository, so it cannot hold this plan. It receives the same
   `markdown.ts`, the HTML `sayTopic`, and the `marked` dependency, verified by the
   Ring 2 step below rather than by this suite.
-- **Chunking is fence-aware, not render-then-split.** The adversarial review's own
-  recommendation was to render the whole message and split the HTML. That trades one
-  boundary problem for a harder one: a split must then avoid landing inside a tag or an
-  entity, and `<pre>` still has to be closed and reopened. Splitting the markdown while
-  keeping fence state preserves the property that matters (content marked literal stays
-  literal) with a function a test can hold. Tables and lists split across a boundary still
-  render as two tables or two lists, which is cosmetic, not a change of kind.
+- **Render-then-split, not fence-aware markdown splitting.** The first attempt tracked
+  fence state while splitting markdown, and the security pass defeated it twice (see
+  Premise). Parsing once and splitting the output removes the class rather than the two
+  instances: a chunk of HTML is never parsed as markdown, so no split can manufacture
+  markup. The cost is that the splitter must respect HTML instead, which is what the
+  `does not split inside a tag or an entity` and `reopens an open tag` cases hold.
+- **A table or list split across a boundary still renders as two.** That is cosmetic, not
+  a change of kind, and no case covers it.
 - **MarkdownV2 is not revisited.** The HTML subset plus the plain-text fallback is the
   existing decision in this repo, and this change does not reopen it.
 - **The other Telegram senders are untouched.** `kafka-telegram-relay` and the
