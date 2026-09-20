@@ -4,7 +4,7 @@ import { marked } from 'marked'
 // Telegram renders a small HTML subset (b/i/s/code/pre/a). HTML only needs
 // < > & escaped in text — far more robust than MarkdownV2's reserved-char
 // minefield. Claude emits GitHub Markdown; we parse it with `marked` and map
-// the tokens to that subset (headings→bold, lists→•, tables→monospace text).
+// the tokens to that subset (headings→bold, lists→•, tables→labelled blocks).
 export function htmlEsc(s: string): string {
   return s
     .replace(/&/g, '&amp;')
@@ -23,6 +23,15 @@ export function htmlToPlain(s: string): string {
     .replace(/&quot;/g, '"')
     .replace(/&#39;/g, "'")
     .replace(/&amp;/g, '&')
+}
+/**
+ * Bold a rendered cell, unless it is already exactly one bold span. Nesting
+ * <b> inside <b> risks Telegram's entity parser rejecting the message, and the
+ * plain-text fallback would then strip formatting from the entire send.
+ */
+function bold(s: string): string {
+  const already = s.startsWith('<b>') && s.indexOf('</b>') === s.length - 4
+  return already ? s : `<b>${s}</b>`
 }
 function mdInline(tokens: any[]): string {
   if (!tokens) return ''
@@ -58,11 +67,34 @@ function mdBlock(tokens: any[]): string {
         out += '\n'
         break
       case 'table': {
-        // mdInline() already escapes cell text; strip its inline tags and wrap
-        // in <pre>. Do NOT htmlEsc again — that would double-escape (&amp;amp;).
-        const row = (cells: any[]) => cells.map((c: any) => mdInline(c.tokens)).join(' | ')
-        const lines = [row(t.header), ...t.rows.map((r: any) => row(r))]
-        out += `<pre>${lines.join('\n').replace(/<\/?[^>]+>/g, '')}</pre>\n\n`
+        // Telegram wraps ordinary text but never <pre>, so a pipe grid becomes a
+        // horizontally-scrolling sliver on a phone. Render one labelled block per
+        // row instead: column 1 is the row's identity, every other column becomes
+        // a "header: cell" line. Two-column tables are almost always key/value, so
+        // they collapse to one line per row rather than doubling in length.
+        // mdInline() already escapes cell text — do NOT htmlEsc again, that would
+        // double-escape (&amp;amp;).
+        const cell = (c: any) => mdInline(c.tokens).trim()
+        const headers = (t.header as any[]).map(cell)
+        const twoCol = headers.length === 2
+        const blocks: string[] = []
+        for (const r of t.rows as any[]) {
+          const cells = (r as any[]).map(cell)
+          if (twoCol) {
+            const k = cells[0] ?? ''
+            const v = cells[1] ?? ''
+            if (!k && !v) continue
+            blocks.push(!k ? v : !v ? bold(k) : `${bold(k)}: ${v}`)
+            continue
+          }
+          const [title, ...rest] = cells
+          // An empty cell carries no information; a bare "Status:" line is noise.
+          const lines = rest.map((v, i) => (v ? `  ${headers[i + 1]}: ${v}` : '')).filter(Boolean)
+          // A row with no identity still has its other columns worth keeping.
+          if (title) lines.unshift(`▸ ${bold(title)}`)
+          if (lines.length) blocks.push(lines.join('\n'))
+        }
+        if (blocks.length) out += `${blocks.join(twoCol ? '\n' : '\n\n')}\n\n`
         break
       }
       case 'hr': out += '———\n\n'; break

@@ -37,15 +37,15 @@ What was checked, and what turned out false:
 |---|---|---|
 | `renders a multi-column table as one labelled block per row` | each data row becomes a title line from column 1 plus one `label: value` line per remaining column | keeping the pipe grid and only changing the wrapper tag |
 | `collapses a two-column table to one line per row` | a 2-column table yields one `key: value` line per row, not a two-line block | a uniform block-per-row rule that doubles the length of every key/value table |
-| `uses the header cells as labels in the order they appear` | label *n* comes from header cell *n*, not from position 1 or a sorted order | an implementation that emits values without labels, or reorders columns |
+| `uses the header cells as labels in the order they appear` | label *n* comes from header cell *n*, not from position 1 or a sorted order | labelling every column with the first data column's header |
 | `emits no pipe-joined grid for any table` | class-level: no output line carries the `x \| y` row shape for any table input | any partial conversion that leaves wide tables as rows |
-| `keeps a fenced code block that contains pipes verbatim` | text inside a fenced code block is passed through unchanged | a token walk that treats a code block's pipes as a table |
+| `keeps a fenced code block that contains pipes verbatim` | text inside a fenced code block is passed through unchanged | rendering a fenced block through the text path, so its pipes are eaten like a table's |
 | `keeps inline formatting inside table cells` | `**bold**` in a cell survives as `<b>` in the block output | dropping to `t.text` and losing inline tokens |
 | `escapes HTML special characters in cells exactly once` | a cell containing `&` and `<` yields `&amp;` and `&lt;`, never `&amp;amp;` | calling `htmlEsc` on output that `mdInline` already escaped |
 | `drops empty cells instead of emitting a bare label` | an empty cell produces no `label:` line at all | an unconditional join over every column |
 | `renders a table with a single data row` | a 1-row table still renders as a block, with no leading or trailing blank noise | an implementation that needs two or more rows to emit anything |
 | `renders every table in a message and preserves surrounding prose order` | two tables separated by prose come back in source order with the prose between them | a "first table only" implementation |
-| `still renders headings, lists, code and links as before` | the non-table branches of `mdBlock` are untouched by this change | a rewrite of `mdBlock` that regresses a sibling case |
+| `still renders headings, lists, code and links as before` | the non-table branches of `mdBlock` are untouched by this change | dropping the bold on headings while rewriting the block walk |
 
 ### Negative cases
 
