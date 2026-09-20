@@ -56,6 +56,14 @@ What was checked, and what turned out false:
   cut exists, and the chunk came out at 10055 characters with a 5020-character plain
   fallback. Both are over the 4096 limit, both sends fail, and `sayTopic` logs and moves
   on. Silent loss is worse than a degraded link.
+- **False, found by the third security pass: "reserving the closing tags already open is
+  enough."** It is not, because the piece being added opens tags of its own. Reproduced:
+  `'> '.repeat(150) + 'x'.repeat(2000)` renders to 5750 characters in which the reopen
+  prefix plus closing tags cost more than a whole chunk, so no content ever fits, the
+  remainder never shrinks, and chunkHtml does not return. sayTopic awaits it on the
+  daemon's only thread, so one message would freeze delivery and the Allow/Deny buttons
+  for every topic. Severity high: the fix must account for the stack AFTER the candidate
+  piece, and must drop formatting it cannot afford rather than failing to make progress.
 - **Ruled out as the "integrator":** `contabo-server-config/kafka-telegram-relay/formatters.js`
   and `backend/shared/telegram/formatters.ts`. Both emit `<b>` and `<code>` bullet
   lists and contain no table construction (grepped for `|---`, `padEnd`, column joins).
@@ -84,6 +92,8 @@ What was checked, and what turned out false:
 | `splits long text at line boundaries` | a chunk ends at a newline rather than mid-word whenever one is available | slicing the whole message at fixed offsets, ignoring line boundaries |
 | `degrades a link whose tag alone exceeds the budget to visible text` | an unsplittable anchor becomes escaped text carrying the same URL, rather than an unsendable chunk | dropping the element, losing the destination the reader was shown |
 | `keeps every chunk within the limit, even when one link is oversized` | the size guarantee holds for input that cannot be cut safely | the state before this fix: no degrade pass, and the remainder appended whole |
+| `terminates on deeply nested formatting` | chunking returns for input whose reopen prefix and closing tags exceed a whole chunk | reserving only the tags already open, ignoring the ones the added piece opens |
+| `drops formatting it cannot afford rather than carrying it` | when the tag stack costs more than half the budget it is closed and not reopened, so content keeps flowing | carrying the stack regardless, leaving no room for content |
 | `does not split inside a tag or an entity` | a cut inside `<a href=...>` or `&amp;` never happens, at any limit | cutting at a fixed offset once a line exceeds the budget |
 
 ### Negative cases

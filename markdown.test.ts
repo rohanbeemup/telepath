@@ -254,6 +254,24 @@ describe('chunking', () => {
     }
   })
 
+  test('terminates on deeply nested formatting', () => {
+    // The reopen prefix plus closing tags for 150 nested blockquotes cost more
+    // than a whole chunk. Carrying them leaves no room for content, so the loop
+    // never advances and the daemon single thread stops answering every topic.
+    const md = '> '.repeat(150) + 'x'.repeat(2000)
+    const parts = chunkHtml(mdToTelegramHtml(md), 3500)
+    expect(parts.length).toBeGreaterThan(0)
+    expect(parts.length).toBeLessThan(50)
+    expect(parts.join('').replace(/<[^>]*>/g, '')).toContain('x'.repeat(500))
+  })
+
+  test('drops formatting it cannot afford rather than carrying it', () => {
+    const md = '> '.repeat(150) + 'x'.repeat(2000)
+    for (const part of chunkHtml(mdToTelegramHtml(md), 3500)) {
+      expect(part.length).toBeLessThanOrEqual(3500)
+    }
+  })
+
   test('does not split inside a tag or an entity', () => {
     // ONE long paragraph, so marked renders it as a single line and the splitter
     // has to cut inside it. Densely packed with tags and entities, which is where
@@ -290,6 +308,7 @@ describe('tables (negative)', () => {
       'https://example.com/' + 'a'.repeat(5000),
       '[label](https://example.com/' + 'b'.repeat(5000) + ')',
       'x'.repeat(9000),
+      '> '.repeat(150) + 'x'.repeat(2000),
       Array.from({ length: 40 }, (_, i) => `[l${i}](https://example.com/` + 'c'.repeat(300) + `/${i})`).join(' '),
     ]
     for (const md of adversarial) {

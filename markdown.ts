@@ -198,9 +198,18 @@ export function chunkHtml(html: string, limit = 3500): string[] {
   let cur = ''
   let filled = false // cur holds content, not just a reopened tag prefix
 
+  /** What carrying this stack across a boundary costs: reopen it, then close it. */
+  const overhead = (st: string[]) => st.join('').length + closeFor(st).length
+
   const flush = () => {
     if (!filled) return
     out.push(cur + closeFor(stack))
+    // Formatting that costs more than half the budget cannot be carried. With 150
+    // nested blockquotes the reopen prefix plus closing tags exceed a whole chunk,
+    // so no content would ever fit and the split could not advance. Close it here
+    // and continue unformatted: a degraded quote beats a daemon that stops
+    // answering every topic.
+    if (overhead(stack) > limit / 2) stack = []
     cur = stack.join('')
     filled = false
   }
@@ -209,35 +218,45 @@ export function chunkHtml(html: string, limit = 3500): string[] {
     stack = applyTags(stack, piece)
     filled = true
   }
+  /**
+   * Does `piece` still fit once we close whatever is open AFTER adding it? The
+   * tags the piece itself opens are the ones an earlier version missed, which is
+   * how a chunk could overshoot and how the loop could stop making progress.
+   */
+  const fits = (piece: string, sep: boolean) =>
+    cur.length + (sep && filled ? 1 : 0) + piece.length +
+    closeFor(applyTags(stack, piece)).length <= limit
 
   for (const line of html.split('\n')) {
     let rest = line
     let first = true
     for (;;) {
-      // Reserve room for the closing tags this chunk will need, plus a little
-      // for tags the incoming text opens and leaves open.
-      const reserve = closeFor(stack).length + 64
-      const sep = filled && first ? 1 : 0
-      if (cur.length + sep + rest.length + reserve <= limit) { add(rest, first); break }
-      if (filled && cur.length + sep + reserve > limit / 2) { flush(); first = true; continue }
-      const cut = safeCut(rest, limit - cur.length - sep - reserve)
-      if (cut <= 0) {
-        if (filled) { flush(); first = true; continue }
-        // Still nothing safe to cut in a fresh chunk: drop this line's markup and
-        // split it as the escaped text it already is, so the size guarantee holds
-        // for every input rather than for the inputs we thought of.
+      if (fits(rest, first)) { add(rest, first); break }
+      if (filled) { flush(); first = true; continue }
+
+      // Shrink the candidate until it fits with its own closing tags.
+      let piece = ''
+      let hi = Math.min(rest.length, limit)
+      while (hi > 0) {
+        const cut = safeCut(rest, hi)
+        if (cut <= 0) break
+        const cand = rest.slice(0, cut)
+        if (fits(cand, first)) { piece = cand; break }
+        hi = Math.min(cut - 1, Math.floor(hi * 0.9))
+      }
+      if (!piece) {
+        // Nothing cuts safely: drop this line's markup and split it as the
+        // escaped text it already is.
         const bare = rest.replace(/<[^>]*>/g, '')
         if (bare.length < rest.length) { rest = bare; continue }
-        add(rest.slice(0, Math.max(1, limit - reserve)), first)
-        rest = rest.slice(Math.max(1, limit - reserve))
-        flush()
-        first = true
-        continue
+        // Last resort. Always at least one character, so the loop advances.
+        piece = rest.slice(0, Math.max(1, limit - overhead(stack) - cur.length))
       }
-      add(rest.slice(0, cut), first)
-      rest = rest.slice(cut)
+      add(piece, first)
+      rest = rest.slice(piece.length)
       flush()
       first = true
+      if (!rest) break
     }
   }
   flush()
