@@ -1,5 +1,11 @@
 import { test, expect, describe } from 'bun:test'
-import { mdToTelegramHtml } from './markdown'
+import { mdToTelegramHtml, chunkMarkdown } from './markdown'
+
+// Three backticks, written as escapes. Spelled literally they appear in a regex
+// below, where the test-plan checker's lexer reads them as an unterminated
+// template literal and skips the whole file — which silently turns off the
+// plan/suite agreement check this suite is held by.
+const F = '\x60\x60\x60'
 
 // The renderer's job is to make what Claude writes readable in a Telegram
 // message. Telegram wraps ordinary text but does NOT wrap <pre>, so a table
@@ -42,8 +48,20 @@ describe('tables', () => {
 
   test('collapses a two-column table to one line per row', () => {
     expect(mdToTelegramHtml(KV)).toBe(
-      ['<b>Version</b>: 1.0.352', '<b>Env</b>: devnet'].join('\n'),
+      ['Field → Value', '<b>Version</b>: 1.0.352', '<b>Env</b>: devnet'].join('\n'),
     )
+  })
+
+  test('keeps both header labels on a two-column table', () => {
+    // A 2-column table is not always key/value. When the columns are two states
+    // ("Allowed | Forbidden"), dropping the headers leaves the reader unable to
+    // tell which value is which, and the fallback never restores the meaning
+    // because the HTML rendered successfully.
+    const md = ['| Allowed | Forbidden |', '|---|---|', '| read | delete |'].join('\n')
+    const out = mdToTelegramHtml(md)
+    expect(out).toContain('Allowed')
+    expect(out).toContain('Forbidden')
+    expect(out).toContain('<b>read</b>: delete')
   })
 
   test('uses the header cells as labels in the order they appear', () => {
@@ -69,7 +87,7 @@ describe('tables', () => {
   })
 
   test('keeps a fenced code block that contains pipes verbatim', () => {
-    const md = ['```', 'ps aux | grep bun', '| not | a | table |', '```'].join('\n')
+    const md = [F, 'ps aux | grep bun', '| not | a | table |', F].join('\n')
     const out = mdToTelegramHtml(md)
     expect(out).toContain('<pre>')
     expect(out).toContain('ps aux | grep bun')
@@ -138,9 +156,9 @@ describe('tables', () => {
       '- one',
       '- two',
       '',
-      '```',
+      F,
       'code',
-      '```',
+      F,
       '',
       '[link](https://example.com)',
     ].join('\n')
@@ -150,6 +168,43 @@ describe('tables', () => {
     expect(out).toContain('• two')
     expect(out).toContain('<pre>code</pre>')
     expect(out).toContain('<a href="https://example.com">link</a>')
+  })
+})
+
+describe('chunking', () => {
+  const fenced = (lines: number, extra: string, info = '') =>
+    [F + info, ...Array.from({ length: lines }, (_, i) => `line ${i} of literal code inside a fence`), extra, F].join('\n')
+
+  test('keeps a fenced code block inert when it spans a chunk boundary', () => {
+    // Content the author marked literal must not become active markup just
+    // because the message was too long for one Telegram send.
+    const md = fenced(160, '[click here](https://evil.example/pwn)')
+    const parts = chunkMarkdown(md, 3500)
+    expect(parts.length).toBeGreaterThan(1)
+    for (const part of parts) {
+      const html = mdToTelegramHtml(part)
+      expect(html).not.toContain('<a href')
+      expect(html).toContain('<pre>')
+    }
+  })
+
+  test('reopens a split fence with its original marker and info string', () => {
+    const parts = chunkMarkdown(fenced(160, 'x', 'ts'), 3500)
+    expect(parts.length).toBeGreaterThan(1)
+    expect(parts[0].endsWith(F)).toBe(true)
+    for (const part of parts.slice(1)) expect(part.startsWith(F + 'ts')).toBe(true)
+  })
+
+  test('splits long text at line boundaries', () => {
+    const md = Array.from({ length: 300 }, (_, i) => `sentence number ${i} of ordinary prose`).join('\n')
+    const parts = chunkMarkdown(md, 1000)
+    expect(parts.length).toBeGreaterThan(1)
+    expect(parts.join('\n')).toBe(md)
+    for (const p of parts) {
+      expect(p.length).toBeLessThanOrEqual(1000)
+      expect(p.startsWith('sentence number')).toBe(true)
+      expect(p.endsWith('of ordinary prose')).toBe(true)
+    }
   })
 })
 
@@ -165,6 +220,16 @@ describe('tables (negative)', () => {
     const out = mdToTelegramHtml(md)
     expect(out).toContain('a | b for the alternative')
     expect(out).not.toContain('▸')
+  })
+
+  test('does not leave an unclosed fence in any chunk', () => {
+    const body = Array.from({ length: 200 }, (_, i) => `line ${i} inside the fence`).join('\n')
+    for (const limit of [800, 1500, 2600, 3500]) {
+      for (const part of chunkMarkdown(F + '\n' + body + '\n' + F, limit)) {
+        const fences = (part.match(new RegExp('^' + F, 'gm')) ?? []).length
+        expect(fences % 2).toBe(0)
+      }
+    }
   })
 
   test('does not drop a row whose first cell is empty', () => {

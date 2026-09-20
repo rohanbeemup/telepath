@@ -94,6 +94,13 @@ function mdBlock(tokens: any[]): string {
           if (title) lines.unshift(`▸ ${bold(title)}`)
           if (lines.length) blocks.push(lines.join('\n'))
         }
+        // A two-column table is not always key/value: "Allowed | Forbidden" names
+        // two states, and dropping the header row leaves the reader unable to tell
+        // which value is which. One caption line keeps both labels without a
+        // heuristic about what the headers "mean".
+        if (twoCol && blocks.length && headers.some(Boolean)) {
+          blocks.unshift(headers.filter(Boolean).join(' → '))
+        }
         if (blocks.length) out += `${blocks.join(twoCol ? '\n' : '\n\n')}\n\n`
         break
       }
@@ -106,4 +113,63 @@ function mdBlock(tokens: any[]): string {
 }
 export function mdToTelegramHtml(md: string): string {
   return mdBlock(marked.lexer(md)).replace(/\n{3,}/g, '\n\n').trim()
+}
+
+/**
+ * Split markdown into sends that each parse on their own.
+ *
+ * The caller renders every chunk independently, so a fenced block straddling a
+ * boundary would lose its fence and the remainder would be parsed as markdown:
+ * a link inside a code fence becomes a live anchor with its destination hidden
+ * behind the label. That is inert content becoming active, so the split has to
+ * carry fence state, closing an open fence at the end of a chunk and reopening
+ * it (same marker, same info string) at the start of the next.
+ *
+ * Splitting the markdown rather than the rendered HTML is deliberate: a split of
+ * the HTML has to avoid landing inside a tag or an entity and still has to close
+ * and reopen <pre>, which is the same problem plus two more.
+ */
+export function chunkMarkdown(text: string, limit = 3500): string[] {
+  if (!text) return []
+  if (text.length <= limit) return [text]
+
+  const FENCE = /^\s*(`{3,}|~{3,})(.*)$/
+  // Leave room for a reopened fence line on any chunk that needs one.
+  const room = Math.max(16, limit - 16)
+  const lines: string[] = []
+  for (const raw of text.split('\n')) {
+    if (raw.length <= room) { lines.push(raw); continue }
+    for (let i = 0; i < raw.length; i += room) lines.push(raw.slice(i, i + room))
+  }
+
+  const out: string[] = []
+  let open: string | null = null // the opening fence line, repeated to reopen
+  let marker = ''
+  let cur: string[] = []
+  let len = 0
+
+  const seed = () => {
+    cur = open ? [open] : []
+    len = open ? open.length + 1 : 0
+  }
+  const flush = () => {
+    if (!cur.length) return
+    out.push(cur.join('\n') + (open ? `\n${marker}` : ''))
+    seed()
+  }
+
+  for (const line of lines) {
+    const base = open ? 1 : 0 // a chunk holding only its reopened fence is not full
+    const close = open ? marker.length + 1 : 0
+    if (cur.length > base && len + line.length + 1 + close > limit) flush()
+    cur.push(line)
+    len += line.length + 1
+    const m = FENCE.exec(line)
+    if (m) {
+      if (!open) { open = line; marker = m[1] }
+      else if (m[1][0] === marker[0] && m[1].length >= marker.length && !m[2].trim()) { open = null; marker = '' }
+    }
+  }
+  flush()
+  return out.filter(c => c.trim().length > 0)
 }

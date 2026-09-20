@@ -27,6 +27,20 @@ What was checked, and what turned out false:
   `mdBlock` pipe-joins each row and wraps the lot in `<pre>`. Telegram does not wrap
   `<pre>`; it scrolls horizontally, so on a phone a four-column table is a sliver.
   That is the defect this plan fixes.
+- **False, found by cross-family review after the first green: "chunking is a separate
+  concern."** `sayTopic` chunks the RAW markdown and parses each chunk independently, so a
+  fenced code block that straddles a boundary loses its fence and the remainder is parsed
+  as markdown. Reproduced: 6361 characters of fenced content containing
+  `[click here](https://evil.example/pwn)` yields a second chunk where that literal line is
+  an active anchor with its destination hidden behind the label, and `**...**` inside the
+  fence renders bold. This is inert content becoming active markup, which is why it is in
+  scope here rather than deferred. It is pre-existing in this repo, but the back-port would
+  have newly introduced it to the live daemon, which sent plain text before.
+- **False: "two-column tables are always key/value."** Both the plain and the adversarial
+  review flagged it independently. Reproduced: `| Allowed | Forbidden |` with row
+  `| read | delete |` rendered as `<b>read</b>: delete`, discarding both headers, so the
+  reader cannot tell which value is which. Comparison, permission and before/after tables
+  all land in this shape.
 - **Ruled out as the "integrator":** `contabo-server-config/kafka-telegram-relay/formatters.js`
   and `backend/shared/telegram/formatters.ts`. Both emit `<b>` and `<code>` bullet
   lists and contain no table construction (grepped for `|---`, `padEnd`, column joins).
@@ -46,6 +60,10 @@ What was checked, and what turned out false:
 | `renders a table with a single data row` | a 1-row table still renders as a block, with no leading or trailing blank noise | an implementation that needs two or more rows to emit anything |
 | `renders every table in a message and preserves surrounding prose order` | two tables separated by prose come back in source order with the prose between them | a "first table only" implementation |
 | `still renders headings, lists, code and links as before` | the non-table branches of `mdBlock` are untouched by this change | dropping the bold on headings while rewriting the block walk |
+| `keeps both header labels on a two-column table` | a 2-column table names both columns, so `\| Allowed \| Forbidden \|` cannot be read as key/value | treating every 2-column table as key/value and discarding the header row |
+| `keeps a fenced code block inert when it spans a chunk boundary` | a link inside a fence that is split across messages stays literal text in every chunk | chunking the raw markdown and parsing each piece independently |
+| `reopens a split fence with its original marker and info string` | the reopened fence uses the same marker and language as the one that was split | closing with a hardcoded ``` and losing the info string |
+| `splits long text at line boundaries` | a chunk ends at a newline rather than mid-word whenever one is available | slicing the whole message at fixed offsets, ignoring line boundaries |
 
 ### Negative cases
 
@@ -54,6 +72,7 @@ What was checked, and what turned out false:
 | `does not wrap a table in a pre block` | no `<pre>` appears in the output for a table input | leaving the old `<pre>` wrapper in place alongside the new rendering |
 | `does not treat a paragraph containing pipes as a table` | prose carrying a bare `\|` (a shell pipe) is not restructured | a line scanner that triggers on any `\|` instead of on marked's `table` token |
 | `does not drop a row whose first cell is empty` | a row with an empty title cell still emits its remaining columns | a guard that skips the row when the title is falsy, silently losing data |
+| `does not leave an unclosed fence in any chunk` | class-level: no chunk ends inside a fenced block, for any split point | reopening the fence in the next chunk but forgetting to close it in the emitted one |
 
 ## Out of scope
 
@@ -61,8 +80,13 @@ What was checked, and what turned out false:
   is not a git repository, so it cannot hold this plan. It receives the same
   `markdown.ts`, the HTML `sayTopic`, and the `marked` dependency, verified by the
   Ring 2 step below rather than by this suite.
-- **`chunk()` is unchanged.** Splitting a long message is a separate concern; a block
-  that straddles a chunk boundary is pre-existing behaviour.
+- **Chunking is fence-aware, not render-then-split.** The adversarial review's own
+  recommendation was to render the whole message and split the HTML. That trades one
+  boundary problem for a harder one: a split must then avoid landing inside a tag or an
+  entity, and `<pre>` still has to be closed and reopened. Splitting the markdown while
+  keeping fence state preserves the property that matters (content marked literal stays
+  literal) with a function a test can hold. Tables and lists split across a boundary still
+  render as two tables or two lists, which is cosmetic, not a change of kind.
 - **MarkdownV2 is not revisited.** The HTML subset plus the plain-text fallback is the
   existing decision in this repo, and this change does not reopen it.
 - **The other Telegram senders are untouched.** `kafka-telegram-relay` and the

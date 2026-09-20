@@ -23,7 +23,7 @@ import {
   type SettingSource,
 } from '@anthropic-ai/claude-agent-sdk'
 import { Bot, InlineKeyboard, InputFile, type Context } from 'grammy'
-import { htmlEsc, htmlToPlain, mdToTelegramHtml } from './markdown'
+import { htmlEsc, htmlToPlain, mdToTelegramHtml, chunkMarkdown } from './markdown'
 import { readFileSync, writeFileSync, mkdirSync, renameSync, existsSync, statSync, chmodSync, readdirSync, rmSync } from 'fs'
 import { homedir } from 'os'
 import { join, dirname, basename } from 'path'
@@ -172,29 +172,13 @@ const bot = new Bot(TOKEN)
 
 
 // ── Telegram send helpers ───────────────────────────────────────────────────
-function chunk(text: string, limit = 4000): string[] {
-  if (!text) return []
-  if (text.length <= limit) return [text]
-  const out: string[] = []
-  let rest = text
-  while (rest.length > limit) {
-    let cut = rest.lastIndexOf('\n', limit)
-    if (cut < limit / 2) cut = rest.lastIndexOf(' ', limit)
-    if (cut < 1) cut = limit
-    out.push(rest.slice(0, cut))
-    rest = rest.slice(cut).replace(/^\n+/, '')
-  }
-  if (rest) out.push(rest)
-  return out
-}
-
 // Render Claude's GitHub-flavoured Markdown as Telegram HTML (bold,
 // headings→bold, lists, code, links). Falls back to plain text if conversion
 // or Telegram's entity parser rejects a chunk — so a stray character never
 // drops a message. Chunk a bit smaller than the 4096 cap: escaping adds chars.
 async function sayTopic(topicId: string | undefined, text: string): Promise<void> {
   const opts = topicId ? { message_thread_id: Number(topicId) } : {}
-  for (const part of chunk(text, 3500)) {
+  for (const part of chunkMarkdown(text, 3500)) {
     let html: string | undefined
     try {
       html = mdToTelegramHtml(part)
