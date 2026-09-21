@@ -62,7 +62,7 @@ or just **double-click `start.bat`**.
 On a healthy boot you'll see:
 
 ```
-telepath up - chat <FORUM_CHAT_ID>, user <ALLOWED_USER_ID>, default claude-sonnet-4-6, ...
+telepath up - chat <FORUM_CHAT_ID>, user <ALLOWED_USER_ID>, default claude-sonnet-5 @ effort default, models sonnet,opus, ...
   claude binary: ...\node_modules\@anthropic-ai\claude-agent-sdk-win32-x64\claude.exe
 polling as @<your-bot>
 ```

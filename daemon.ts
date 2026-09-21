@@ -51,11 +51,26 @@ const TOKEN = req('TELEGRAM_BOT_TOKEN')
 const ALLOWED_USER_ID = req('ALLOWED_USER_ID')
 const FORUM_CHAT_ID = req('FORUM_CHAT_ID')
 const DEFAULT_CWD = process.env.DEFAULT_CWD || homedir()
-const SONNET_MODEL = process.env.SONNET_MODEL || 'claude-sonnet-4-6'
-const OPUS_MODEL = process.env.OPUS_MODEL || 'claude-opus-4-8'
-const FABLE_MODEL = process.env.FABLE_MODEL || 'claude-fable-5'
-const MODELS: Record<string, string> = { sonnet: SONNET_MODEL, opus: OPUS_MODEL, fable: FABLE_MODEL }
+const HAIKU_MODEL = process.env.HAIKU_MODEL || 'claude-haiku-4-5'
+const SONNET_MODEL = process.env.SONNET_MODEL || 'claude-sonnet-5'
+const OPUS_MODEL = process.env.OPUS_MODEL || 'claude-opus-5'
+const FABLE_MODEL = process.env.FABLE_MODEL || 'claude-fable-5-1'
+const MODELS: Record<string, string> = { haiku: HAIKU_MODEL, sonnet: SONNET_MODEL, opus: OPUS_MODEL, fable: FABLE_MODEL }
 const DEFAULT_MODEL = process.env.DEFAULT_MODEL || SONNET_MODEL
+// Effort (reasoning depth) per session. The v2 session API has no `effort`
+// option, but the claude binary reads CLAUDE_CODE_EFFORT_LEVEL from its
+// environment and lets it override the settings-file level for that process
+// only — so each topic's session gets its own value via `env`.
+const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'] as const
+type Effort = (typeof EFFORT_LEVELS)[number]
+function parseEffort(s: string | undefined): Effort | undefined {
+  const v = s?.trim().toLowerCase()
+  return (EFFORT_LEVELS as readonly string[]).includes(v ?? '') ? (v as Effort) : undefined
+}
+// Unset = let Claude Code decide (its settings / built-in default).
+const DEFAULT_EFFORT = parseEffort(process.env.DEFAULT_EFFORT)
+// Haiku 4.5 rejects effort levels; every other package accepts low…max.
+const EFFORT_MODELS = new Set(['sonnet', 'opus', 'fable'])
 const IDLE_MINUTES = Number(process.env.IDLE_MINUTES || 15)
 const MAX_LIVE_SESSIONS = Number(process.env.MAX_LIVE_SESSIONS || 3)
 const SETTING_SOURCES: SettingSource[] = ['user', 'project', 'local']
@@ -96,7 +111,7 @@ function req(name: string): string {
 }
 
 // ── Registry (persisted topic → session binding) ────────────────────────────
-type Binding = { sessionId?: string; cwd: string; model: string; title: string; lastActive: number; auto?: boolean; controlMsgId?: number }
+type Binding = { sessionId?: string; cwd: string; model: string; effort?: Effort; title: string; lastActive: number; auto?: boolean; controlMsgId?: number }
 type Registry = Record<string, Binding> // keyed by topic_id (string)
 
 function loadRegistry(): Registry {
@@ -118,12 +133,18 @@ const registry: Registry = loadRegistry()
 // Root to scan for repos in the folder picker (defaults to the parent of
 // DEFAULT_CWD — e.g. ~/code when DEFAULT_CWD is ~/code/my-project).
 const REPOS_DIR = process.env.REPOS_DIR || dirname(DEFAULT_CWD)
-type Prefs = { defaultModel: string; defaultCwd: string }
+type Prefs = { defaultModel: string; defaultCwd: string; defaultEffort?: Effort }
 const PREFS_FILE = join(STATE_DIR, 'prefs.json')
 function loadPrefs(): Prefs {
-  const base: Prefs = { defaultModel: DEFAULT_MODEL, defaultCwd: DEFAULT_CWD }
+  const base: Prefs = { defaultModel: DEFAULT_MODEL, defaultCwd: DEFAULT_CWD, defaultEffort: DEFAULT_EFFORT }
   try {
-    return { ...base, ...JSON.parse(readFileSync(PREFS_FILE, 'utf8')) }
+    const raw = JSON.parse(readFileSync(PREFS_FILE, 'utf8'))
+    const saved: Prefs = { ...base, ...raw }
+    // A cleared default is persisted as null (JSON drops undefined), so "key
+    // present" means the user chose, even when the choice was "default"; only
+    // an absent key falls back to DEFAULT_EFFORT from .env.
+    saved.defaultEffort = 'defaultEffort' in raw ? parseEffort(raw.defaultEffort) : DEFAULT_EFFORT
+    return saved
   } catch {
     return base
   }
@@ -141,7 +162,9 @@ function savePrefs(): void {
   try {
     mkdirSync(STATE_DIR, { recursive: true })
     const tmp = PREFS_FILE + '.tmp'
-    writeFileSync(tmp, JSON.stringify(prefs, null, 2) + '\n')
+    // null, not undefined: see loadPrefs — an undefined key would vanish from
+    // the file and the .env default would come back on the next boot.
+    writeFileSync(tmp, JSON.stringify({ ...prefs, defaultEffort: prefs.defaultEffort ?? null }, null, 2) + '\n')
     renameSync(tmp, PREFS_FILE)
   } catch (e) {
     process.stderr.write(`prefs save failed: ${e}\n`)
@@ -681,15 +704,21 @@ function makeHooks(topicId: string) {
   }
 }
 
-function sessionOptions(cwd: string, model: string, topicId: string) {
+function sessionOptions(cwd: string, model: string, topicId: string, effort?: Effort) {
   const outbox = outboxDir(topicId)
   try {
     mkdirSync(outbox, { recursive: true })
   } catch {}
+  // Drop any level inherited from the daemon's own shell first: "default" must
+  // mean Claude Code's own default (settings.json effortLevel or built-in), and
+  // Haiku would otherwise inherit a level it rejects.
+  const env: Record<string, string | undefined> = { ...CHILD_ENV, TELEPATH_OUTBOX: outbox }
+  delete env.CLAUDE_CODE_EFFORT_LEVEL
+  if (effort) env.CLAUDE_CODE_EFFORT_LEVEL = effort
   return {
     model,
     cwd,
-    env: { ...CHILD_ENV, TELEPATH_OUTBOX: outbox },
+    env,
     pathToClaudeCodeExecutable: CLAUDE_BIN,
     settingSources: SETTING_SOURCES,
     permissionMode: 'default' as const,
@@ -727,7 +756,7 @@ async function ensureLive(topicId: string): Promise<Live | undefined> {
   const b = registry[topicId]
   if (!b) return undefined // no binding — needs /new
   enforceCap()
-  const opts = sessionOptions(b.cwd, b.model, topicId)
+  const opts = sessionOptions(b.cwd, b.model, topicId, effortFor(b))
   const session = b.sessionId
     ? unstable_v2_resumeSession(b.sessionId, opts)
     : unstable_v2_createSession(opts)
@@ -831,7 +860,7 @@ async function cmdNew(args: string, fromTopic: string | undefined): Promise<void
     return
   }
   const model = prefs.defaultModel
-  registry[topicId] = { cwd, model, title: name, lastActive: Date.now(), auto }
+  registry[topicId] = { cwd, model, effort: prefs.defaultEffort, title: name, lastActive: Date.now(), auto }
   saveRegistry()
   await ensureLive(topicId)
   await postPinnedControls(topicId)
@@ -882,6 +911,7 @@ async function cmdAttach(args: string, fromTopic: string | undefined): Promise<s
     sessionId: match.sessionId,
     cwd: (match as any).cwd || DEFAULT_CWD,
     model: prefs.defaultModel,
+    effort: prefs.defaultEffort,
     title: name,
     lastActive: Date.now(),
   }
@@ -890,22 +920,42 @@ async function cmdAttach(args: string, fromTopic: string | undefined): Promise<s
   return topicId
 }
 
-async function setModel(topicId: string, which: keyof typeof MODELS): Promise<void> {
+// `use fable high` / `use opus` — model switch with an optional effort level.
+async function setModel(topicId: string, which: keyof typeof MODELS, effort?: Effort): Promise<void> {
   const b = registry[topicId]
   if (!b) {
     await sayTopic(topicId, 'No session bound here.')
     return
   }
   b.model = MODELS[which]
+  if (effort) b.effort = effort
   saveRegistry()
   closeLive(topicId, 'model switch') // next message resumes with new model
-  await sayTopic(topicId, `Model set to ${b.model}. (applies on next message)`)
+  await sayTopic(topicId, `Model set to ${b.model}${effortFor(b) ? ` · effort ${effortFor(b)}` : ''}. (applies on next message)`)
+}
+
+// `effort max` / `effort default` — change only the reasoning depth of this topic.
+async function setEffort(topicId: string, effort: Effort | undefined): Promise<void> {
+  const b = registry[topicId]
+  if (!b) {
+    await sayTopic(topicId, 'No session bound here.')
+    return
+  }
+  if (!supportsEffort(b.model)) {
+    await sayTopic(topicId, `${modelLabel(b.model)} has no effort levels — switch model first.`)
+    return
+  }
+  b.effort = effort
+  saveRegistry()
+  closeLive(topicId, 'effort switch') // the level travels in the child env, so restart the process
+  await sayTopic(topicId, `Effort set to ${effort ?? 'default'}. (applies on next message)`)
 }
 
 // ── Button UX (dummy-proof menus) ───────────────────────────────────────────
 // Everything you can do with /commands is also reachable by tapping buttons.
 // Friendly labels per model.
 const MODEL_LABEL: Record<string, string> = {
+  [HAIKU_MODEL]: '🐇 Haiku',
   [SONNET_MODEL]: '⚡ Sonnet',
   [OPUS_MODEL]: '🧠 Opus',
   [FABLE_MODEL]: '✨ Fable',
@@ -913,20 +963,50 @@ const MODEL_LABEL: Record<string, string> = {
 function modelLabel(m: string): string {
   return MODEL_LABEL[m] || m
 }
-
-// Short / long button labels per model key.
-const MODEL_MENU: Record<string, { short: string; long: string }> = {
-  sonnet: { short: '⚡ Sonnet', long: '⚡ Sonnet — fast & cheap (default)' },
-  opus: { short: '🧠 Opus', long: '🧠 Opus — most capable (~5× cost)' },
-  fable: { short: '✨ Fable', long: '✨ Fable 5 — premium' },
+function modelKey(m: string): string | undefined {
+  return Object.keys(MODELS).find(k => MODELS[k] === m)
 }
-// Only offer models you actually have access to. Fable 5 is NOT on the Claude
-// subscription, so it's off by default — set ENABLED_MODELS=sonnet,opus,fable
-// in .env only if your auth has Fable. Order here = order in the menus.
+// Own-property check: callback data and typed text are user input, and a plain
+// `in` would accept prototype names like "constructor".
+function isModelKey(k: string): boolean {
+  return Object.hasOwn(MODELS, k) && Object.hasOwn(MODEL_MENU, k)
+}
+function supportsEffort(model: string): boolean {
+  const k = modelKey(model)
+  return !!k && EFFORT_MODELS.has(k)
+}
+// The effort a binding actually runs with: its own level, only where the model
+// accepts one (a topic switched to Haiku keeps its level for when it switches back).
+function effortFor(b: Binding): Effort | undefined {
+  return supportsEffort(b.model) ? b.effort : undefined
+}
+const EFFORT_MENU: Record<Effort, { short: string; long: string }> = {
+  low: { short: 'low', long: '🎚 low — quick & cheap' },
+  medium: { short: 'med', long: '🎚 medium — balanced' },
+  high: { short: 'high', long: '🎚 high — deep reasoning' },
+  xhigh: { short: 'xhigh', long: '🎚 xhigh — deeper, best for hard coding' },
+  max: { short: 'max', long: '🎚 max — everything it has' },
+}
+
+// Short / long button labels per model key. Version numbers stay out of the
+// labels because the id behind a key comes from .env (see modelLine()).
+const MODEL_MENU: Record<string, { short: string; long: string }> = {
+  haiku: { short: '🐇 Haiku', long: '🐇 Haiku — cheapest & fastest, no effort levels' },
+  sonnet: { short: '⚡ Sonnet', long: '⚡ Sonnet — fast & cheap' },
+  opus: { short: '🧠 Opus', long: '🧠 Opus — strong all-rounder (~2.5× Sonnet)' },
+  fable: { short: '✨ Fable', long: '✨ Fable — frontier, premium (~2× Opus)' },
+}
+// Which id each enabled key resolves to, for the wizard / settings body text.
+function modelLines(): string {
+  return ENABLED_MODELS.map(k => `${MODEL_MENU[k].short} → ${MODELS[k]}`).join('\n')
+}
+// Only offer models you actually have access to — set ENABLED_MODELS in .env
+// (e.g. ENABLED_MODELS=haiku,sonnet,opus,fable) to what your auth can reach;
+// a model your plan lacks fails on the first message. Order here = menu order.
 const ENABLED_MODELS_RAW = (process.env.ENABLED_MODELS || 'sonnet,opus')
   .split(',')
   .map(s => s.trim().toLowerCase())
-  .filter(k => k in MODELS && k in MODEL_MENU)
+  .filter(isModelKey)
 // Never let the menus end up with zero models (empty/garbage ENABLED_MODELS).
 const ENABLED_MODELS = ENABLED_MODELS_RAW.length ? ENABLED_MODELS_RAW : ['sonnet']
 // Guard the default model: if it points at a disabled model, fall back.
@@ -967,7 +1047,7 @@ function listRepoFolders(): string[] {
 }
 
 // New-session wizard state (single user → keyed by user id).
-type Wizard = { step: 'folder' | 'model' | 'auto'; folders: string[]; cwd?: string; model?: string; bindTopic?: string }
+type Wizard = { step: 'folder' | 'model' | 'effort' | 'auto'; folders: string[]; cwd?: string; model?: string; effort?: Effort; bindTopic?: string }
 const wizard = new Map<string, Wizard>()
 
 function mainMenuKb(): InlineKeyboard {
@@ -994,7 +1074,7 @@ async function quickNew(intoTopic: string | undefined): Promise<void> {
   try {
     const topic = await bot.api.createForumTopic(FORUM_CHAT_ID, name)
     const tid = String(topic.message_thread_id)
-    registry[tid] = { cwd, model, title: name, lastActive: Date.now(), auto: false }
+    registry[tid] = { cwd, model, effort: prefs.defaultEffort, title: name, lastActive: Date.now(), auto: false }
     saveRegistry()
     await ensureLive(tid)
     await paint(intoTopic, `✅ Created "${name}".`, openLinkKb(tid))
@@ -1029,10 +1109,24 @@ function settingsKb(): InlineKeyboard {
     if (i % 2 === 1) kb.row()
   })
   if (ENABLED_MODELS.length % 2 === 1) kb.row()
+  effortRows(kb, prefs.defaultEffort, 'sde')
   return kb.text('📁 Default folder', 'm:sdf').row().text('⬅️ Back', 'm:menu')
 }
+// Two rows of effort buttons (low/med/high, xhigh/max/default) with ✓ on the
+// active one; `ns` is the callback namespace (settings vs topic controls).
+function effortRows(kb: InlineKeyboard, current: Effort | undefined, ns: string): void {
+  EFFORT_LEVELS.forEach((e, i) => {
+    kb.text(`🎚 ${EFFORT_MENU[e].short}${current === e ? ' ✓' : ''}`, `m:${ns}:${e}`)
+    if (i === 2) kb.row()
+  })
+  kb.text(`↺ default${current ? '' : ' ✓'}`, `m:${ns}:auto`).row()
+}
 async function showSettings(intoTopic: string | undefined): Promise<void> {
-  await paint(intoTopic, `⚙️ Settings — defaults for 🆕/⚡ new sessions:\nModel: ${modelLabel(prefs.defaultModel)}\nFolder: ${defaultCwd()}`, settingsKb())
+  await paint(
+    intoTopic,
+    `⚙️ Settings — defaults for 🆕/⚡ new sessions:\nModel: ${modelLabel(prefs.defaultModel)} (${prefs.defaultModel})\nEffort: ${prefs.defaultEffort ?? 'default (Claude Code decides)'}\nFolder: ${defaultCwd()}\n\n${modelLines()}`,
+    settingsKb(),
+  )
 }
 
 // Default-folder picker (own callback namespace so it doesn't touch the wizard).
@@ -1083,6 +1177,7 @@ function topicControlsKb(b: Binding): InlineKeyboard {
   const kb = new InlineKeyboard()
   for (const k of ENABLED_MODELS) kb.text(`${MODEL_MENU[k].short}${b.model === MODELS[k] ? ' ✓' : ''}`, `m:tm:${k}`)
   kb.row()
+  if (supportsEffort(b.model)) effortRows(kb, b.effort, 'te')
   kb.text(b.auto ? '⚡ Auto: ON → switch to approvals' : '🔐 Approvals: ON → switch to auto', 'm:ta').row()
   kb.text('💾 Close & keep', 'm:tclose').text('🗑 Close & delete', 'm:tdelete').row()
   kb.text('🧹 Close, delete & remove all', 'm:twipe')
@@ -1090,7 +1185,8 @@ function topicControlsKb(b: Binding): InlineKeyboard {
 }
 
 function topicControlsText(b: Binding, note?: string): string {
-  return `⚙️ "${b.title}"\nModel: ${modelLabel(b.model)} · ${b.auto ? '⚡ auto (no prompts)' : '🔐 approvals on'}\ncwd ${b.cwd}\n\n💬 Just type your request below.${note ? `\n${note}` : ''}`
+  const effort = supportsEffort(b.model) ? ` · 🎚 ${b.effort ?? 'default'}` : ''
+  return `⚙️ "${b.title}"\nModel: ${modelLabel(b.model)} (${b.model})${effort} · ${b.auto ? '⚡ auto (no prompts)' : '🔐 approvals on'}\ncwd ${b.cwd}\n\n💬 Just type your request below.${note ? `\n${note}` : ''}`
 }
 
 // Post the control panel as a fresh message and PIN it, so it's always one tap
@@ -1190,7 +1286,7 @@ async function renderFolderPage(uid: string, intoTopic: string | undefined, page
   if (!w) return void paint(intoTopic, 'Expired — tap 🆕 again.', mainMenuKb())
   const buttons = w.folders.map((f, i) => ({ label: '📁 ' + basename(f), data: `m:nf:${i}` }))
   const kb = pagedListKb(buttons, page, 'fpage', k => k.text('⬅️ Back', 'm:menu').text('✖️ Cancel', 'm:cancel'))
-  await paint(intoTopic, `📁 Step 1/3 — pick a folder (from ${REPOS_DIR}):${pageSuffix(buttons.length, page)}`, kb)
+  await paint(intoTopic, `📁 Step 1/4 — pick a folder (from ${REPOS_DIR}):${pageSuffix(buttons.length, page)}`, kb)
 }
 
 // Wizard step 2: pick a model.
@@ -1198,16 +1294,25 @@ async function wizardModelStep(uid: string, intoTopic: string | undefined): Prom
   const kb = new InlineKeyboard()
   for (const k of ENABLED_MODELS) kb.text(MODEL_MENU[k].long, `m:nm:${k}`).row()
   kb.text('⬅️ Back', 'm:new').text('✖️ Cancel', 'm:cancel')
-  await paint(intoTopic, '🤖 Step 2/3 — pick a model:', kb)
+  await paint(intoTopic, `🤖 Step 2/4 — pick a model:\n${modelLines()}`, kb)
 }
 
-// Wizard step 3: approvals vs auto.
+// Wizard step 3: pick an effort level (skipped for models without one).
+async function wizardEffortStep(uid: string, intoTopic: string | undefined): Promise<void> {
+  const kb = new InlineKeyboard()
+  for (const e of EFFORT_LEVELS) kb.text(EFFORT_MENU[e].long, `m:ne:${e}`).row()
+  kb.text(`↺ default${prefs.defaultEffort ? ` (settings: ${prefs.defaultEffort})` : ' (Claude Code decides)'}`, 'm:ne:auto').row()
+  kb.text('⬅️ Back', 'm:nback').text('✖️ Cancel', 'm:cancel')
+  await paint(intoTopic, '🎚 Step 3/4 — how hard should it think?', kb)
+}
+
+// Wizard step 4: approvals vs auto.
 async function wizardAutoStep(uid: string, intoTopic: string | undefined): Promise<void> {
   const kb = new InlineKeyboard()
     .text('🔐 Ask me before running tools (recommended)', 'm:na:0').row()
     .text('⚡ Auto-run everything (no prompts)', 'm:na:1').row()
     .text('✖️ Cancel', 'm:cancel')
-  await paint(intoTopic, '🔐 Step 3/3 — how should tools run?', kb)
+  await paint(intoTopic, '🔐 Step 4/4 — how should tools run?', kb)
 }
 
 // Wizard finish: create or bind a session, then drop the user into its topic.
@@ -1217,6 +1322,8 @@ async function finishWizard(uid: string, auto: boolean): Promise<void> {
   wizard.delete(uid)
   const name = basename(w.cwd)
   const model = w.model || prefs.defaultModel
+  // "↺ default" in the wizard leaves w.effort unset → the Settings default.
+  const effort = w.effort ?? prefs.defaultEffort
   let topicId = w.bindTopic
   if (!topicId) {
     try {
@@ -1227,7 +1334,7 @@ async function finishWizard(uid: string, auto: boolean): Promise<void> {
       return
     }
   }
-  registry[topicId] = { cwd: w.cwd, model, title: name, lastActive: Date.now(), auto }
+  registry[topicId] = { cwd: w.cwd, model, effort, title: name, lastActive: Date.now(), auto }
   saveRegistry()
   await ensureLive(topicId)
   // If this was the "start here" flow, the wizard message lives in the same
@@ -1263,9 +1370,16 @@ async function handleMenu(ctx: Context, data: string): Promise<void> {
   if (data === 'm:cancel') { wizard.delete(uid); await ack('Cancelled'); return showMainMenu(topicId) }
   if (data === 'm:ctl') { await ack(); return topicId ? showTopicControls(topicId) : showMainMenu(topicId) }
 
-  // Settings: default model / default folder.
-  const sdm = /^m:sdm:(sonnet|opus|fable)$/.exec(data)
-  if (sdm) { prefs.defaultModel = MODELS[sdm[1]]; savePrefs(); await ack(`Default: ${sdm[1]}`); return showSettings(topicId) }
+  // Settings: default model / default effort / default folder.
+  const sdm = /^m:sdm:(\w+)$/.exec(data)
+  if (sdm && isModelKey(sdm[1])) { prefs.defaultModel = MODELS[sdm[1]]; savePrefs(); await ack(`Default: ${sdm[1]}`); return showSettings(topicId) }
+  const sde = /^m:sde:(\w+)$/.exec(data)
+  if (sde && (sde[1] === 'auto' || parseEffort(sde[1]))) {
+    prefs.defaultEffort = parseEffort(sde[1])
+    savePrefs()
+    await ack(`Default effort: ${prefs.defaultEffort ?? 'default'}`)
+    return showSettings(topicId)
+  }
   if (data === 'm:sdf') { await ack(); return showDefaultFolderPicker(topicId, 0) }
   const sdfp = /^m:sdfp:(\d+)$/.exec(data)
   if (sdfp) { await ack(); return showDefaultFolderPicker(topicId, Number(sdfp[1])) }
@@ -1303,13 +1417,35 @@ async function handleMenu(ctx: Context, data: string): Promise<void> {
     await ack(basename(w.cwd || ''))
     return wizardModelStep(uid, topicId)
   }
-  const nm = /^m:nm:(sonnet|opus|fable)$/.exec(data)
-  if (nm) {
+  const nm = /^m:nm:(\w+)$/.exec(data)
+  if (nm && isModelKey(nm[1])) {
     const w = wizard.get(uid)
     if (!w) return void ack('Expired — tap 🆕 again')
     w.model = MODELS[nm[1]]
-    w.step = 'auto'
+    w.effort = undefined
     await ack(modelLabel(w.model))
+    if (supportsEffort(w.model)) {
+      w.step = 'effort'
+      return wizardEffortStep(uid, topicId)
+    }
+    w.step = 'auto'
+    return wizardAutoStep(uid, topicId)
+  }
+  if (data === 'm:nback') {
+    // ⬅️ from the effort step: back to the model list, keeping the folder.
+    const w = wizard.get(uid)
+    if (!w) return void ack('Expired — tap 🆕 again')
+    w.step = 'model'
+    await ack()
+    return wizardModelStep(uid, topicId)
+  }
+  const ne = /^m:ne:(\w+)$/.exec(data)
+  if (ne && (ne[1] === 'auto' || parseEffort(ne[1]))) {
+    const w = wizard.get(uid)
+    if (!w) return void ack('Expired — tap 🆕 again')
+    w.effort = parseEffort(ne[1])
+    w.step = 'auto'
+    await ack(`🎚 ${w.effort ?? 'default'}`)
     return wizardAutoStep(uid, topicId)
   }
   const na = /^m:na:(0|1)$/.exec(data)
@@ -1317,14 +1453,24 @@ async function handleMenu(ctx: Context, data: string): Promise<void> {
 
   // Topic controls (read the topic from the message the button is attached to).
   if (!topicId) return void ack()
-  const tm = /^m:tm:(sonnet|opus|fable)$/.exec(data)
-  if (tm) {
+  const tm = /^m:tm:(\w+)$/.exec(data)
+  if (tm && isModelKey(tm[1])) {
     const b = registry[topicId]
     if (!b) return void ack('No session here')
     b.model = MODELS[tm[1]]
     saveRegistry()
     closeLive(topicId, 'model switch') // next message resumes with new model
     await ack(`Model: ${tm[1]}`)
+    return paint(topicId, topicControlsText(b, '(applies on next message)'), topicControlsKb(b))
+  }
+  const te = /^m:te:(\w+)$/.exec(data)
+  if (te && (te[1] === 'auto' || parseEffort(te[1]))) {
+    const b = registry[topicId]
+    if (!b) return void ack('No session here')
+    b.effort = parseEffort(te[1])
+    saveRegistry()
+    closeLive(topicId, 'effort switch') // the level lives in the child env → new process
+    await ack(`Effort: ${b.effort ?? 'default'}`)
     return paint(topicId, topicControlsText(b, '(applies on next message)'), topicControlsKb(b))
   }
   if (data === 'm:ta') {
@@ -1398,16 +1544,17 @@ async function handleMenu(ctx: Context, data: string): Promise<void> {
 const HELP = `Everything is buttons — you rarely need to type commands.
 
 📋 GENERAL topic — send anything (or tap the blue Menu button) to open:
-• 🆕 New session — pick a repo (from ${REPOS_DIR}), a model, and approvals
-• ⚡ Quick new — instant session in your default folder + model
+• 🆕 New session — pick a repo (from ${REPOS_DIR}), a model, an effort level, and approvals
+• ⚡ Quick new — instant session in your default folder + model + effort
 • 📋 My sessions — list past sessions; tap one to reopen it
 • ▶️ Resume last — jump into the most recent session
-• ⚙️ Settings — set the default model + folder for new sessions
+• ⚙️ Settings — set the default model, effort + folder for new sessions
 • ❓ Help — this text
 
 💬 SESSION topic — just type your request. A 📌 pinned panel sits at the top of
 every session topic with:
-• ⚡ Sonnet / 🧠 Opus — switch model (applies next message)
+• 🐇 Haiku / ⚡ Sonnet / 🧠 Opus / ✨ Fable — switch model (applies next message)
+• 🎚 low / med / high / xhigh / max / ↺ default — how hard it thinks (Haiku has none)
 • 🔐 Approvals ↔ ⚡ Auto — toggle whether tools ask before running
 • 💾 Close & keep — stop the session + close the topic, keep everything
    (a ♻️ Reopen button appears to resume later with full context)
@@ -1455,8 +1602,15 @@ async function handleText(ctx: Context, text: string): Promise<void> {
   // free-text answer (the documented AskUserQuestion `response` path).
   const ft = askFreeText.get(topicId)
   if (ft) return void ft(text)
-  const useModel = /^use (opus|sonnet|fable)$/i.exec(text)
-  if (useModel) return setModel(topicId, useModel[1].toLowerCase() as keyof typeof MODELS)
+  // `use fable high`, `use opus`, `effort max`, `effort default`.
+  const useModel = /^use (\w+)(?:\s+(\w+))?$/i.exec(text)
+  if (useModel && isModelKey(useModel[1].toLowerCase()) && (!useModel[2] || parseEffort(useModel[2]))) {
+    return setModel(topicId, useModel[1].toLowerCase(), parseEffort(useModel[2]))
+  }
+  const useEffort = /^effort (\w+)$/i.exec(text)
+  if (useEffort && (useEffort[1].toLowerCase() === 'default' || parseEffort(useEffort[1]))) {
+    return setEffort(topicId, parseEffort(useEffort[1]))
+  }
   // Typed in a topic with no session → offer a one-tap "start here".
   if (!registry[topicId]) {
     await send(topicId, 'This topic has no Claude session yet.', new InlineKeyboard().text('🆕 Start a session here', 'm:newhere'))
@@ -1610,7 +1764,7 @@ await bot.api.setMyCommands([
 ])
 process.stderr.write(
   `telepath up — chat ${FORUM_CHAT_ID}, user ${ALLOWED_USER_ID}, ` +
-    `default ${DEFAULT_MODEL}, cap ${MAX_LIVE_SESSIONS}, idle ${IDLE_MINUTES}m\n` +
+    `default ${prefs.defaultModel} @ effort ${prefs.defaultEffort ?? 'default'}, models ${ENABLED_MODELS.join(',')}, cap ${MAX_LIVE_SESSIONS}, idle ${IDLE_MINUTES}m\n` +
     `  claude binary: ${CLAUDE_BIN}\n`,
 )
 bot.start({
