@@ -69,23 +69,24 @@ In the **General** topic, send anything (or `/menu`) to get the menu:
 
 | Button | What it does |
 |---|---|
-| 🆕 **New session** | Three taps: pick a project folder (scanned from `REPOS_DIR`, git repos first), a model, then approvals-vs-auto. |
-| ⚡ **Quick new** | One tap: a session in your default folder + default model. |
+| 🆕 **New session** | Four taps: pick a project folder (scanned from `REPOS_DIR`, git repos first), a model, an effort level (low → max; skipped for Haiku), then approvals-vs-auto. |
+| ⚡ **Quick new** | One tap: a session in your default folder + default model + default effort. |
 | 📋 **My sessions** | Past sessions as buttons (📌 bound, 🟢 live) — including ones started in your terminal. Tap one to reopen it. |
 | ▶️ **Resume last** | Jump straight into the most recently active session. |
-| ⚙️ **Settings** | Default model + default folder for new sessions (persisted in `prefs.json`). |
+| ⚙️ **Settings** | Default model, default effort + default folder for new sessions (persisted in `prefs.json`). |
 
 In a **session topic**: just type. A 📌 **pinned control panel** sits at the top of every session topic:
 
 | Button | What it does |
 |---|---|
-| ⚡ Sonnet / 🧠 Opus | Switch this topic's model (applies on the next message). |
+| 🐇 Haiku / ⚡ Sonnet / 🧠 Opus / ✨ Fable | Switch this topic's model (applies on the next message). Only the packages in `ENABLED_MODELS` are shown. |
+| 🎚 low / med / high / xhigh / max / ↺ default | How hard this topic's model thinks (Claude Code's effort level; applies on the next message). Hidden for Haiku, which has no levels. |
 | 🔐 Approvals ↔ ⚡ Auto | Toggle whether risky tools ask before running. |
 | 💾 Close & keep | Stop the session and close the topic; context is kept and a ♻️ **Reopen** button resumes it. |
 | 🗑 Close & delete | Remove the topic + binding. The transcript stays on disk (still `claude --resume`-able). |
 | 🧹 Close, delete & remove all | Full wipe: topic, binding, delivered files **and** the transcript — no longer resumable. Asks to confirm first. |
 
-Clarifying questions appear as buttons — tap one, or type your own reply. Typing still works for everything: `use opus` / `use sonnet` switches model, and the commands below are unchanged.
+Clarifying questions appear as buttons — tap one, or type your own reply. Typing still works for everything: `use fable high` / `use opus` switches model (with an optional effort level), `effort max` / `effort default` changes only the effort, and the commands below are unchanged.
 
 <details>
 <summary>Typed commands</summary>
@@ -136,9 +137,11 @@ sudo loginctl enable-linger "$USER"      # <-- don't skip this
 
 ## Configuration
 
-All via `.env` (see [`.env.example`](.env.example)). Key options: `DEFAULT_MODEL`, `SONNET_MODEL`, `OPUS_MODEL`, `FABLE_MODEL`, `ENABLED_MODELS`, `REPOS_DIR`, `IDLE_MINUTES`, `MAX_LIVE_SESSIONS`, `DEFAULT_CWD`, `TG_CLAUDE_STATE_DIR`, `CLAUDE_BINARY`.
+All via `.env` (see [`.env.example`](.env.example)). Key options: `DEFAULT_MODEL`, `DEFAULT_EFFORT`, `HAIKU_MODEL`, `SONNET_MODEL`, `OPUS_MODEL`, `FABLE_MODEL`, `ENABLED_MODELS`, `REPOS_DIR`, `IDLE_MINUTES`, `MAX_LIVE_SESSIONS`, `DEFAULT_CWD`, `TG_CLAUDE_STATE_DIR`, `CLAUDE_BINARY`.
 
-- **`ENABLED_MODELS`** (default `sonnet,opus`) decides which models the menus offer — list only what your auth can actually use. Fable 5 is **not** on the Claude subscription, so it is off by default; add `fable` only if your auth has it. Topics still pinned to a now-disabled model are migrated to the default on boot, so a session can't get stuck failing on a model you can't reach.
+- **Model packages.** Four keys — `haiku`, `sonnet`, `opus`, `fable` — each mapped to a model id by its `*_MODEL` variable (defaults: Haiku 4.5, Sonnet 5, Opus 5, Fable 5.1). Pin an older generation by changing the id, e.g. `OPUS_MODEL=claude-opus-4-8`. The menus show the friendly name; the wizard and Settings also print which id each key resolves to.
+- **`ENABLED_MODELS`** (default `sonnet,opus`) decides which packages the menus offer — list only what your auth can actually use; a model your plan lacks fails on the first message of a topic. Fable is premium and not on every plan, so it is off by default. Topics still pinned to a now-disabled model are migrated to the default on boot, so a session can't get stuck failing on a model you can't reach.
+- **Effort.** Claude Code's effort level (`low`, `medium`, `high`, `xhigh`, `max`) is chosen per topic: in the 🆕 wizard, on the pinned panel, or by typing `effort xhigh`. `DEFAULT_EFFORT` seeds new topics; unset means Claude Code decides (its `settings.json` `effortLevel` or built-in default). The level travels to the session's `claude` process as `CLAUDE_CODE_EFFORT_LEVEL`, which overrides the settings file for that process only — so switching effort restarts the topic's process, and the change applies on the next message. Haiku 4.5 has no effort levels, so the buttons are hidden for it.
 - **`REPOS_DIR`** (default: the parent of `DEFAULT_CWD`) is the root the folder picker scans. Git repos sort first, then other project folders by recency.
 - Runtime state lives next to the daemon (or in `TG_CLAUDE_STATE_DIR`): `registry.json` (topic → session), `prefs.json` (menu defaults), `outbox/<topic>/` (files awaiting delivery). All gitignored.
 
@@ -148,7 +151,7 @@ The daemon (`daemon.ts`) holds the bot token and routes by `message_thread_id`. 
 
 ## Cost & billing
 
-Usage runs on your Claude **subscription**, metered like any Claude Code usage — **Opus ≈ 5× Sonnet**, so the default is Sonnet and you opt into Opus per topic. Heavy use can hit your plan's rate limits (you'll see throttling).
+Usage runs on your Claude **subscription**, metered like any Claude Code usage — per token roughly **Fable ≈ 2× Opus ≈ 5× Sonnet ≈ 10× Haiku**, and a higher effort level spends more tokens per turn on the same model — so the default is Sonnet and you opt into Opus, Fable or a higher effort per topic. Heavy use can hit your plan's rate limits (you'll see throttling).
 
 > **Agent SDK billing — status (as of June 2026).** Anthropic announced a change (slated for **June 15, 2026**) that would move Agent SDK / `claude -p` usage on subscription plans to a **separate monthly Agent SDK credit** — then **paused it**. As of now **nothing has changed**: Agent SDK / `claude -p` usage (which is *all* of telepath, plus any `claude -p` cron jobs) draws from your **normal subscription rate limits exactly as before** — no separate credit, nothing to claim, limits unchanged. Anthropic has said they'll give **advance notice** before any future change.
 >
