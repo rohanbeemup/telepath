@@ -26,7 +26,7 @@ Telegram allows exactly **one poller per bot token**, and the Claude Agent SDK i
 - ⚡ **Auto mode** — per topic, run tools without prompts (opt-in, one tap or `/auto`).
 - ❓ **Clarifying questions & plan mode** — `AskUserQuestion` renders as tappable option buttons; plan mode shows the full plan then asks to approve.
 - 💸 **Cost controls** — Sonnet by default (`use opus` per topic), idle-eviction, and a concurrent-session cap.
-- ⏳ **Rate-limit auto-resume** — a turn cut off by a hard rate limit is picked up again automatically when the window resets, instead of stalling until you notice.
+- ⏳ **Rate-limit auto-resume** — a turn cut off by a hard rate limit is picked up again automatically when the window resets, instead of stalling until you notice. With [claude-rotator](https://github.com/yom-ooo/claude-rotator) installed, every rate-limit event is relayed to it so it can switch accounts, and the topic then continues at once instead of waiting for the reset.
 - 🖼️ **Files both ways** — send a photo or document into a topic and the session reads it; anything the session drops in its `TELEPATH_OUTBOX` folder is delivered back to the topic (images as photos, the rest as documents).
 - ✍️ **Formatted replies** — Claude's Markdown is rendered as Telegram HTML (bold, headings, lists, code, links), with a plain-text fallback so a message is never dropped. Tables become one labelled block per row, because Telegram never wraps a `<pre>` grid and a phone shows you a sliver of it.
 - 🆔 **Resumable** — each new topic prints its session id + a `claude --resume …` command so you can pick it up on your laptop.
@@ -137,7 +137,9 @@ sudo loginctl enable-linger "$USER"      # <-- don't skip this
 
 ## Configuration
 
-All via `.env` (see [`.env.example`](.env.example)). Key options: `DEFAULT_MODEL`, `DEFAULT_EFFORT`, `HAIKU_MODEL`, `SONNET_MODEL`, `OPUS_MODEL`, `FABLE_MODEL`, `ENABLED_MODELS`, `REPOS_DIR`, `IDLE_MINUTES`, `MAX_LIVE_SESSIONS`, `DEFAULT_CWD`, `TG_CLAUDE_STATE_DIR`, `CLAUDE_BINARY`.
+All via `.env` (see [`.env.example`](.env.example)). Key options: `DEFAULT_MODEL`, `DEFAULT_EFFORT`, `HAIKU_MODEL`, `SONNET_MODEL`, `OPUS_MODEL`, `FABLE_MODEL`, `ENABLED_MODELS`, `REPOS_DIR`, `IDLE_MINUTES`, `MAX_LIVE_SESSIONS`, `DEFAULT_CWD`, `TG_CLAUDE_STATE_DIR`, `CLAUDE_BINARY`, `ROTATOR_HANDOFF`.
+
+- **Account rotator.** Sessions spawned here talk to the claude binary directly, so the rotator's VS Code shim never sees their `rate_limit_event`s. When `~/.claude-rotator/rotator.py` exists, the daemon relays every event itself (`rotator.py limit-event --stdin`, the shim's own contract) and appends it to `~/.claude-accounts/limit-events.log`, so the rotator sees the budget these topics burn on the shared account. After a rejection it watches the rotator's `.active` marker for about 30 s; when the account changes, the topic's claude process (still holding the old token) is closed and the session resumes at once on the new one, with its context intact. `ROTATOR_HANDOFF=off` disables this; `CLAUDE_ROTATOR_PY`, `CLAUDE_ROTATOR_SCRIPT` and `CLAUDE_ROTATOR_HOME` mirror the shim's overrides.
 
 - **Model packages.** Four keys — `haiku`, `sonnet`, `opus`, `fable` — each mapped to a model id by its `*_MODEL` variable (defaults: Haiku 4.5, Sonnet 5, Opus 5, Fable 5.1). Pin an older generation by changing the id, e.g. `OPUS_MODEL=claude-opus-4-8`. The menus show the friendly name; the wizard and Settings also print which id each key resolves to.
 - **`ENABLED_MODELS`** (default `sonnet,opus`) decides which packages the menus offer — list only what your auth can actually use; a model your plan lacks fails on the first message of a topic. Fable is premium and not on every plan, so it is off by default. Topics still pinned to a now-disabled model are migrated to the default on boot, so a session can't get stuck failing on a model you can't reach.

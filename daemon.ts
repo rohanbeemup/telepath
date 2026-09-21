@@ -24,6 +24,7 @@ import {
 } from '@anthropic-ai/claude-agent-sdk'
 import { Bot, InlineKeyboard, InputFile, type Context } from 'grammy'
 import { htmlEsc, htmlToPlain, renderWithDeadline, chunkHtml } from './markdown'
+import { ROTATOR_ENABLED, handOffToRotator, rotatorActive, waitForRotation } from './rotator'
 import { readFileSync, writeFileSync, mkdirSync, renameSync, existsSync, statSync, chmodSync, readdirSync, rmSync } from 'fs'
 import { homedir } from 'os'
 import { join, dirname, basename } from 'path'
@@ -392,6 +393,25 @@ function scheduleRateLimitResume(topicId: string, resetsAt?: number): string | u
   const d = new Date(at)
   return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
 }
+// When the account rotator switches the shared credentials after a rejection, this
+// topic's claude process still holds the old token and would sit out the whole reset.
+// Close it (the context lives in the transcript) and continue at once on the new account.
+// `hadTimer` says whether a reset nudge was scheduled: if the user has since messaged the
+// topic that nudge is gone, they took over, and we must not interrupt them.
+async function resumeAfterRotation(topicId: string, before: string | undefined, hadTimer: boolean): Promise<void> {
+  const now = await waitForRotation(before)
+  if (!now) return
+  if (!registry[topicId]) return
+  if (hadTimer && !resumeTimers.has(topicId)) return
+  cancelRateLimitResume(topicId)
+  closeLive(topicId, `account rotated ${before ?? '?'} -> ${now}`)
+  await sayTopic(topicId, `🔁 Account rotated to ${now} — continuing now.`)
+  await sendToTopic(
+    topicId,
+    'The rate limit that interrupted you was resolved by switching accounts. Continue with the task you were working on. ' +
+      'If you were waiting on a background task or command, check its result now (the completion notification may have been lost) and proceed.',
+  )
+}
 
 // ── Stream pump: forward a session's output into its topic ───────────────────
 async function pump(l: Live): Promise<void> {
@@ -424,16 +444,22 @@ async function pump(l: Live): Promise<void> {
         // was blocked).
         const info = (msg as any).rate_limit_info as { status?: string; resetsAt?: number } | undefined
         process.stderr.write(`[pump] topic ${l.topicId} rate_limit_event status=${info?.status} resetsAt=${info?.resetsAt}\n`)
+        // The account rotator (if installed) judges every event against its own
+        // thresholds; sessions spawned here bypass its VS Code shim, so relay it.
+        handOffToRotator(msg)
         if (info?.status === 'rejected' && !rateLimited) {
           rateLimited = true
+          const activeBefore = rotatorActive()
           const until = scheduleRateLimitResume(l.topicId, info.resetsAt)
+          const rotating = ROTATOR_ENABLED ? ' If the account rotator switches accounts I continue right away.' : ''
           await send(
             l.topicId,
             until
-              ? `⏳ Rate limit hit on this model — resets at ${until}. I'll continue automatically then, or switch to a lighter model (e.g. Sonnet) via ⚙️ Controls to keep going now.`
-              : '⏳ Rate limit hit on this model. Wait a moment and send your message again, or switch to a lighter model (e.g. Sonnet) via ⚙️ Controls.',
+              ? `⏳ Rate limit hit on this model — resets at ${until}.${rotating} Otherwise I'll continue automatically then, or switch to a lighter model (e.g. Sonnet) via ⚙️ Controls to keep going now.`
+              : `⏳ Rate limit hit on this model.${rotating} Otherwise wait a moment and send your message again, or switch to a lighter model (e.g. Sonnet) via ⚙️ Controls.`,
             new InlineKeyboard().text('⚙️ Controls', 'm:ctl'),
           )
+          if (ROTATOR_ENABLED) void resumeAfterRotation(l.topicId, activeBefore, until !== undefined)
         }
       }
       if (msg.type === 'assistant') {
