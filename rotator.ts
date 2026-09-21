@@ -17,18 +17,29 @@ import { appendFileSync, existsSync, readFileSync } from 'fs'
 import { homedir } from 'os'
 import { join } from 'path'
 
-// Same overrides the shim honours, so one environment configures both.
-const ACCOUNTS_DIR = process.env.CLAUDE_ROTATOR_HOME || join(homedir(), '.claude-accounts')
-const SCRIPT = process.env.CLAUDE_ROTATOR_SCRIPT || join(homedir(), '.claude-rotator', 'rotator.py')
-const PYTHON = process.env.CLAUDE_ROTATOR_PY || 'python'
+// Same overrides the shim honours, so one environment configures both. Read at call
+// time, not at import: ES imports are evaluated before daemon.ts runs loadEnv(), so a
+// module-level constant would only ever see the shell's environment and silently
+// ignore anything set in the state directory's .env.
+function accountsDir(): string {
+  return process.env.CLAUDE_ROTATOR_HOME || join(homedir(), '.claude-accounts')
+}
+function script(): string {
+  return process.env.CLAUDE_ROTATOR_SCRIPT || join(homedir(), '.claude-rotator', 'rotator.py')
+}
+function python(): string {
+  return process.env.CLAUDE_ROTATOR_PY || 'python'
+}
 
 /** A rotator is installed and the hand-off is not switched off (`ROTATOR_HANDOFF=off`). */
-export const ROTATOR_ENABLED = process.env.ROTATOR_HANDOFF !== 'off' && existsSync(SCRIPT)
+export function rotatorEnabled(): boolean {
+  return process.env.ROTATOR_HANDOFF !== 'off' && existsSync(script())
+}
 
 /** The account the rotator has connected, per its `.active` marker; undefined without one. */
 export function rotatorActive(): string | undefined {
   try {
-    return readFileSync(join(ACCOUNTS_DIR, '.active'), 'utf8').trim() || undefined
+    return readFileSync(join(accountsDir(), '.active'), 'utf8').trim() || undefined
   } catch {
     return undefined
   }
@@ -41,13 +52,13 @@ export function limitEventLine(msg: unknown, now = new Date()): string {
 
 /** Relay a rate_limit_event to the rotator exactly as the shim does; fire-and-forget. */
 export function handOffToRotator(msg: unknown): void {
-  if (!ROTATOR_ENABLED) return
+  if (!rotatorEnabled()) return
   // The shim appends every event here too; the rotator's dashboard reads this log.
   try {
-    appendFileSync(join(ACCOUNTS_DIR, 'limit-events.log'), limitEventLine(msg) + '\n')
+    appendFileSync(join(accountsDir(), 'limit-events.log'), limitEventLine(msg) + '\n')
   } catch {}
   try {
-    const p = spawn(PYTHON, [SCRIPT, 'limit-event', '--stdin'], { stdio: ['pipe', 'ignore', 'ignore'], windowsHide: true })
+    const p = spawn(python(), [script(), 'limit-event', '--stdin'], { stdio: ['pipe', 'ignore', 'ignore'], windowsHide: true })
     p.on('error', e => process.stderr.write(`[rotator] hand-off failed: ${e}\n`))
     p.stdin.on('error', () => {})
     p.stdin.end(JSON.stringify(msg))

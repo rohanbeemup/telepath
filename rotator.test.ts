@@ -1,5 +1,31 @@
-import { test, expect, describe } from 'bun:test'
-import { limitEventLine, waitForRotation } from './rotator'
+import { test, expect, describe, afterEach } from 'bun:test'
+import { limitEventLine, rotatorEnabled, waitForRotation } from './rotator'
+
+// daemon.ts loads the state directory's .env AFTER its imports are evaluated, so the
+// switch and the rotator paths must be read when asked, not frozen at import time.
+describe('rotatorEnabled', () => {
+  const saved = { ROTATOR_HANDOFF: process.env.ROTATOR_HANDOFF, CLAUDE_ROTATOR_SCRIPT: process.env.CLAUDE_ROTATOR_SCRIPT }
+  afterEach(() => {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+  })
+
+  test('honours env set after the module was imported', () => {
+    process.env.CLAUDE_ROTATOR_SCRIPT = import.meta.path // any file that exists
+    delete process.env.ROTATOR_HANDOFF
+    expect(rotatorEnabled()).toBe(true)
+    process.env.ROTATOR_HANDOFF = 'off'
+    expect(rotatorEnabled()).toBe(false)
+  })
+
+  test('no script at the configured path means no rotator', () => {
+    delete process.env.ROTATOR_HANDOFF
+    process.env.CLAUDE_ROTATOR_SCRIPT = import.meta.path + '.does-not-exist'
+    expect(rotatorEnabled()).toBe(false)
+  })
+})
 
 // The rotator's dashboard and its own tooling read limit-events.log in the shim's
 // format; a line this daemon appends must be indistinguishable from the shim's.
