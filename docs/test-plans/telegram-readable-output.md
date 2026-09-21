@@ -72,6 +72,16 @@ What was checked, and what turned out false:
   a long enough message blocks the daemon's only thread. Practical exposure is limited,
   since an assistant text block is bounded by the model's output budget, which is why this
   is a medium and not the high that finding 4 was.
+- **False, found by the fifth security pass: "bounding the splitter bounds the work."** The
+  splitter was never the expensive part. `marked`'s inline lexer backtracks on long runs of
+  unterminated delimiters and its cost grows with the square of the run. Measured at 80k
+  characters on one line: `[a](` 11.5s, `[a]` 9.5s, `![a](` 11.9s, `*a` 7.5s, `**a` 5.4s,
+  `` `a `` 7.5s, `~~a` 5.3s, `- a` 6.2s, and `_a` **33.5s**. Eight constructs, so a guard
+  keyed on any one of them is worthless. Parsing once made this reachable with the whole
+  message rather than with 3500 characters at a time, so it is a regression this branch
+  introduced. What it is NOT is a length problem: 200k of ordinary prose across many lines
+  parses in 127ms. The blowup needs one very long line, which is what the guard keys on.
+  My own scaling case missed it entirely by starting its timer after rendering.
 - **Ruled out as the "integrator":** `contabo-server-config/kafka-telegram-relay/formatters.js`
   and `backend/shared/telegram/formatters.ts`. Both emit `<b>` and `<code>` bullet
   lists and contain no table construction (grepped for `|---`, `padEnd`, column joins).
@@ -102,6 +112,8 @@ What was checked, and what turned out false:
 | `keeps every chunk within the limit, even when one link is oversized` | the size guarantee holds for input that cannot be cut safely | the state before this fix: no degrade pass, and the remainder appended whole |
 | `terminates on deeply nested formatting` | chunking returns for input whose reopen prefix and closing tags exceed a whole chunk | reserving only the tags already open, ignoring the ones the added piece opens |
 | `drops formatting it cannot afford rather than carrying it` | when the tag stack costs more than half the budget it is closed and not reopened, so content keeps flowing | carrying the stack regardless, leaving no room for content |
+| `renders hostile inline markup without quadratic work` | a message carrying a pathological delimiter run is bounded, measured end to end including the parse | guarding the splitter while leaving the parser unbounded |
+| `falls back to literal text rather than parsing an oversized line` | the guard degrades formatting for that message instead of dropping or stalling it | skipping the message, or parsing it anyway |
 | `chunks a very long line without quadratic work` | scanning is bounded by the chunk budget, not by what remains, so cost grows with input rather than with its square | rebuilding the unsafe map over the whole remainder on every cut |
 | `does not split inside a tag or an entity` | a cut inside `<a href=...>` or `&amp;` never happens, at any limit | cutting at a fixed offset once a line exceeds the budget |
 

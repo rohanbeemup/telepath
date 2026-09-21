@@ -111,7 +111,28 @@ function mdBlock(tokens: any[]): string {
   }
   return out
 }
+/**
+ * One line longer than this is parsed as literal text instead of markdown.
+ *
+ * marked's inline lexer backtracks on long runs of unterminated delimiters and
+ * its cost grows with the square of the run. Measured at 80k characters on a
+ * single line: `_a` 33.5s, `![a](` 11.9s, `[a](` 11.5s, `[a]` 9.5s, `*a` 7.5s,
+ * `` `a `` 7.5s, `- a` 6.2s, `**a` 5.4s, `~~a` 5.3s. Eight constructs do it, so
+ * a guard keyed on any one of them is worthless, and sayTopic parses on the
+ * daemon's only thread, so a stall takes every topic's approvals with it.
+ *
+ * Length alone is not the trigger: 200k of ordinary prose across many lines
+ * parses in 127ms, because inline lexing happens per block. The blowup needs one
+ * very long line, so that is what this bounds, which leaves every ordinary
+ * message formatted. At this cap the worst measured construct costs about 330ms.
+ */
+const MAX_INLINE_RUN = 8000
+
 export function mdToTelegramHtml(md: string): string {
+  for (const line of md.split('\n')) {
+    // Degraded, not dropped: the text still goes out, without formatting.
+    if (line.length > MAX_INLINE_RUN) return htmlEsc(md)
+  }
   return mdBlock(marked.lexer(md)).replace(/\n{3,}/g, '\n\n').trim()
 }
 

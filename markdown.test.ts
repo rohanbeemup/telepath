@@ -272,6 +272,31 @@ describe('chunking', () => {
     }
   })
 
+  test('renders hostile inline markup without quadratic work', () => {
+    // Eight delimiters send marked quadratic on one long line; _a is the worst,
+    // measured at 33.5 seconds for 80k characters, on the thread that also
+    // serves approvals. Timed end to end, parse included.
+    for (const unit of ['_a', '[a](', '*a', '~~a', '`a']) {
+      const md = unit.repeat(Math.ceil(80_000 / unit.length))
+      const started = Date.now()
+      const parts = chunkHtml(mdToTelegramHtml(md), 3500)
+      expect(Date.now() - started).toBeLessThan(1000)
+      expect(parts.length).toBeGreaterThan(0)
+    }
+  })
+
+  test('falls back to literal text rather than parsing an oversized line', () => {
+    const md = '_a'.repeat(40_000)
+    const out = mdToTelegramHtml(md)
+    // The content survives, unformatted: degraded, not dropped, not stalled.
+    expect(out).toContain('_a_a')
+    expect(out).not.toContain('<i>')
+    // Ordinary long messages keep their formatting: length alone is not the trigger.
+    const ordinary = Array.from({ length: 4000 }, (_, i) => `**line ${i}** of ordinary prose`).join('\n')
+    expect(ordinary.length).toBeGreaterThan(100_000)
+    expect(mdToTelegramHtml(ordinary)).toContain('<b>line 0</b>')
+  })
+
   test('chunks a very long line without quadratic work', () => {
     // sayTopic runs this synchronously, so cost has to grow with the input and
     // not with its square. Measured before the fix: 2M characters took 2170ms.
@@ -281,8 +306,13 @@ describe('chunking', () => {
     const started = Date.now()
     const parts = chunkHtml(html, 3500)
     const elapsed = Date.now() - started
+    // NOTE: this case times the split only. Rendering is timed by
+    // 'renders hostile inline markup without quadratic work', which exists
+    // because this one starting its timer here is how a 33-second parse hid.
     expect(parts.length).toBeGreaterThan(100)
-    expect(elapsed).toBeLessThan(1000)
+    // Bounded scanning does this in about 20ms; scanning the whole remainder on
+    // every cut took 974ms. The ceiling sits between them with real margin.
+    expect(elapsed).toBeLessThan(250)
   })
 
   test('does not split inside a tag or an entity', () => {
