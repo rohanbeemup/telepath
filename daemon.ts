@@ -138,8 +138,12 @@ const PREFS_FILE = join(STATE_DIR, 'prefs.json')
 function loadPrefs(): Prefs {
   const base: Prefs = { defaultModel: DEFAULT_MODEL, defaultCwd: DEFAULT_CWD, defaultEffort: DEFAULT_EFFORT }
   try {
-    const saved = { ...base, ...JSON.parse(readFileSync(PREFS_FILE, 'utf8')) }
-    saved.defaultEffort = parseEffort(saved.defaultEffort) // drop a garbage value from an old prefs.json
+    const raw = JSON.parse(readFileSync(PREFS_FILE, 'utf8'))
+    const saved: Prefs = { ...base, ...raw }
+    // A cleared default is persisted as null (JSON drops undefined), so "key
+    // present" means the user chose, even when the choice was "default"; only
+    // an absent key falls back to DEFAULT_EFFORT from .env.
+    saved.defaultEffort = 'defaultEffort' in raw ? parseEffort(raw.defaultEffort) : DEFAULT_EFFORT
     return saved
   } catch {
     return base
@@ -158,7 +162,9 @@ function savePrefs(): void {
   try {
     mkdirSync(STATE_DIR, { recursive: true })
     const tmp = PREFS_FILE + '.tmp'
-    writeFileSync(tmp, JSON.stringify(prefs, null, 2) + '\n')
+    // null, not undefined: see loadPrefs — an undefined key would vanish from
+    // the file and the .env default would come back on the next boot.
+    writeFileSync(tmp, JSON.stringify({ ...prefs, defaultEffort: prefs.defaultEffort ?? null }, null, 2) + '\n')
     renameSync(tmp, PREFS_FILE)
   } catch (e) {
     process.stderr.write(`prefs save failed: ${e}\n`)
@@ -703,9 +709,11 @@ function sessionOptions(cwd: string, model: string, topicId: string, effort?: Ef
   try {
     mkdirSync(outbox, { recursive: true })
   } catch {}
-  // No effort chosen → leave the var as the parent had it, so Claude Code's own
-  // default (settings.json effortLevel or built-in) applies.
+  // Drop any level inherited from the daemon's own shell first: "default" must
+  // mean Claude Code's own default (settings.json effortLevel or built-in), and
+  // Haiku would otherwise inherit a level it rejects.
   const env: Record<string, string | undefined> = { ...CHILD_ENV, TELEPATH_OUTBOX: outbox }
+  delete env.CLAUDE_CODE_EFFORT_LEVEL
   if (effort) env.CLAUDE_CODE_EFFORT_LEVEL = effort
   return {
     model,
@@ -958,6 +966,11 @@ function modelLabel(m: string): string {
 function modelKey(m: string): string | undefined {
   return Object.keys(MODELS).find(k => MODELS[k] === m)
 }
+// Own-property check: callback data and typed text are user input, and a plain
+// `in` would accept prototype names like "constructor".
+function isModelKey(k: string): boolean {
+  return Object.hasOwn(MODELS, k) && Object.hasOwn(MODEL_MENU, k)
+}
 function supportsEffort(model: string): boolean {
   const k = modelKey(model)
   return !!k && EFFORT_MODELS.has(k)
@@ -993,7 +1006,7 @@ function modelLines(): string {
 const ENABLED_MODELS_RAW = (process.env.ENABLED_MODELS || 'sonnet,opus')
   .split(',')
   .map(s => s.trim().toLowerCase())
-  .filter(k => k in MODELS && k in MODEL_MENU)
+  .filter(isModelKey)
 // Never let the menus end up with zero models (empty/garbage ENABLED_MODELS).
 const ENABLED_MODELS = ENABLED_MODELS_RAW.length ? ENABLED_MODELS_RAW : ['sonnet']
 // Guard the default model: if it points at a disabled model, fall back.
@@ -1359,7 +1372,7 @@ async function handleMenu(ctx: Context, data: string): Promise<void> {
 
   // Settings: default model / default effort / default folder.
   const sdm = /^m:sdm:(\w+)$/.exec(data)
-  if (sdm && sdm[1] in MODELS) { prefs.defaultModel = MODELS[sdm[1]]; savePrefs(); await ack(`Default: ${sdm[1]}`); return showSettings(topicId) }
+  if (sdm && isModelKey(sdm[1])) { prefs.defaultModel = MODELS[sdm[1]]; savePrefs(); await ack(`Default: ${sdm[1]}`); return showSettings(topicId) }
   const sde = /^m:sde:(\w+)$/.exec(data)
   if (sde && (sde[1] === 'auto' || parseEffort(sde[1]))) {
     prefs.defaultEffort = parseEffort(sde[1])
@@ -1405,7 +1418,7 @@ async function handleMenu(ctx: Context, data: string): Promise<void> {
     return wizardModelStep(uid, topicId)
   }
   const nm = /^m:nm:(\w+)$/.exec(data)
-  if (nm && nm[1] in MODELS) {
+  if (nm && isModelKey(nm[1])) {
     const w = wizard.get(uid)
     if (!w) return void ack('Expired — tap 🆕 again')
     w.model = MODELS[nm[1]]
@@ -1441,7 +1454,7 @@ async function handleMenu(ctx: Context, data: string): Promise<void> {
   // Topic controls (read the topic from the message the button is attached to).
   if (!topicId) return void ack()
   const tm = /^m:tm:(\w+)$/.exec(data)
-  if (tm && tm[1] in MODELS) {
+  if (tm && isModelKey(tm[1])) {
     const b = registry[topicId]
     if (!b) return void ack('No session here')
     b.model = MODELS[tm[1]]
@@ -1591,7 +1604,7 @@ async function handleText(ctx: Context, text: string): Promise<void> {
   if (ft) return void ft(text)
   // `use fable high`, `use opus`, `effort max`, `effort default`.
   const useModel = /^use (\w+)(?:\s+(\w+))?$/i.exec(text)
-  if (useModel && useModel[1].toLowerCase() in MODELS && (!useModel[2] || parseEffort(useModel[2]))) {
+  if (useModel && isModelKey(useModel[1].toLowerCase()) && (!useModel[2] || parseEffort(useModel[2]))) {
     return setModel(topicId, useModel[1].toLowerCase(), parseEffort(useModel[2]))
   }
   const useEffort = /^effort (\w+)$/i.exec(text)
