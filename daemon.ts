@@ -23,7 +23,7 @@ import {
   type SettingSource,
 } from '@anthropic-ai/claude-agent-sdk'
 import { Bot, InlineKeyboard, InputFile, type Context } from 'grammy'
-import { marked } from 'marked'
+import { htmlEsc, htmlToPlain, renderWithDeadline, chunkHtml } from './markdown'
 import { readFileSync, writeFileSync, mkdirSync, renameSync, existsSync, statSync, chmodSync, readdirSync, rmSync } from 'fs'
 import { homedir } from 'os'
 import { join, dirname, basename } from 'path'
@@ -193,131 +193,43 @@ function permToken(): string {
 
 const bot = new Bot(TOKEN)
 
-// ── Markdown → Telegram HTML ────────────────────────────────────────────────
-// Telegram renders a small HTML subset (b/i/s/code/pre/a). HTML only needs
-// < > & escaped in text — far more robust than MarkdownV2's reserved-char
-// minefield. Claude emits GitHub Markdown; we parse it with `marked` and map
-// the tokens to that subset (headings→bold, lists→•, tables→monospace text).
-function htmlEsc(s: string): string {
-  return s
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;')
-}
-// Inverse of htmlEsc + tag strip — used as a plain-text fallback when Telegram
-// rejects an HTML message (unescape &amp; last so it doesn't double-decode).
-function htmlToPlain(s: string): string {
-  return s
-    .replace(/<\/?[^>]+>/g, '')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&amp;/g, '&')
-}
-function mdInline(tokens: any[]): string {
-  if (!tokens) return ''
-  return tokens
-    .map((t: any) => {
-      switch (t.type) {
-        case 'strong': return `<b>${mdInline(t.tokens)}</b>`
-        case 'em': return `<i>${mdInline(t.tokens)}</i>`
-        case 'del': return `<s>${mdInline(t.tokens)}</s>`
-        case 'codespan': return `<code>${htmlEsc(t.text)}</code>`
-        case 'link': return `<a href="${htmlEsc(t.href)}">${mdInline(t.tokens) || htmlEsc(t.text)}</a>`
-        case 'br': return '\n'
-        case 'text': return t.tokens ? mdInline(t.tokens) : htmlEsc(t.text)
-        default: return htmlEsc(t.raw ?? t.text ?? '')
-      }
-    })
-    .join('')
-}
-function mdBlock(tokens: any[]): string {
-  let out = ''
-  for (const t of tokens as any[]) {
-    switch (t.type) {
-      case 'heading': out += `<b>${mdInline(t.tokens)}</b>\n\n`; break
-      case 'paragraph': out += `${mdInline(t.tokens)}\n\n`; break
-      case 'text': out += `${t.tokens ? mdInline(t.tokens) : htmlEsc(t.text)}\n`; break
-      case 'code': out += `<pre>${htmlEsc(t.text)}</pre>\n\n`; break
-      case 'blockquote': out += `<blockquote>${mdBlock(t.tokens).trim()}</blockquote>\n\n`; break
-      case 'list':
-        t.items.forEach((it: any, i: number) => {
-          const marker = t.ordered ? `${(t.start || 1) + i}. ` : '• '
-          out += `${marker}${mdBlock(it.tokens).trim()}\n`
-        })
-        out += '\n'
-        break
-      case 'table': {
-        // mdInline() already escapes cell text; strip its inline tags and wrap
-        // in <pre>. Do NOT htmlEsc again — that would double-escape (&amp;amp;).
-        const row = (cells: any[]) => cells.map((c: any) => mdInline(c.tokens)).join(' | ')
-        const lines = [row(t.header), ...t.rows.map((r: any) => row(r))]
-        out += `<pre>${lines.join('\n').replace(/<\/?[^>]+>/g, '')}</pre>\n\n`
-        break
-      }
-      case 'hr': out += '———\n\n'; break
-      case 'space': break
-      default: out += htmlEsc(t.raw ?? '')
-    }
-  }
-  return out
-}
-function mdToTelegramHtml(md: string): string {
-  return mdBlock(marked.lexer(md)).replace(/\n{3,}/g, '\n\n').trim()
-}
 
 // ── Telegram send helpers ───────────────────────────────────────────────────
-function chunk(text: string, limit = 4000): string[] {
-  if (!text) return []
-  if (text.length <= limit) return [text]
-  const out: string[] = []
-  let rest = text
-  while (rest.length > limit) {
-    let cut = rest.lastIndexOf('\n', limit)
-    if (cut < limit / 2) cut = rest.lastIndexOf(' ', limit)
-    if (cut < 1) cut = limit
-    out.push(rest.slice(0, cut))
-    rest = rest.slice(cut).replace(/^\n+/, '')
-  }
-  if (rest) out.push(rest)
-  return out
-}
-
 // Render Claude's GitHub-flavoured Markdown as Telegram HTML (bold,
 // headings→bold, lists, code, links). Falls back to plain text if conversion
 // or Telegram's entity parser rejects a chunk — so a stray character never
 // drops a message. Chunk a bit smaller than the 4096 cap: escaping adds chars.
+//
+// The whole message is parsed ONCE and its output split. Splitting the markdown
+// and parsing each piece lets a fragment be reinterpreted: a link inside a code
+// fence that straddles a boundary becomes a live anchor with its destination
+// hidden behind the label, and being valid HTML it sails past the fallback.
 async function sayTopic(topicId: string | undefined, text: string): Promise<void> {
   const opts = topicId ? { message_thread_id: Number(topicId) } : {}
-  for (const part of chunk(text, 3500)) {
-    let html: string | undefined
-    try {
-      html = mdToTelegramHtml(part)
-    } catch {
-      html = undefined
-    }
+  // Rendering runs on a worker with a deadline. marked's inline lexer is
+  // quadratic on long delimiter runs, and this call sits on the daemon's only
+  // thread, so an unbounded parse would stall approvals for every topic, not
+  // just this one. Past the deadline we send the text unformatted.
+  const html = await renderWithDeadline(text, 1500)
+  for (const part of chunkHtml(html ?? text, 3500)) {
     if (html) {
       try {
-        await bot.api.sendMessage(FORUM_CHAT_ID, html, { ...opts, parse_mode: 'HTML' })
-        process.stderr.write(`[out] sent topic ${topicId} ${html.length}c (html)\n`)
+        await bot.api.sendMessage(FORUM_CHAT_ID, part, { ...opts, parse_mode: 'HTML' })
+        process.stderr.write(`[out] sent topic ${topicId} ${part.length}c (html)\n`)
         continue
       } catch (e) {
         process.stderr.write(`[out] html rejected, retrying plain: ${e}\n`)
       }
     }
+    const plain = html ? htmlToPlain(part) : part
     try {
-      await bot.api.sendMessage(FORUM_CHAT_ID, part, opts)
-      process.stderr.write(`[out] sent topic ${topicId} ${part.length}c (plain)\n`)
+      await bot.api.sendMessage(FORUM_CHAT_ID, plain, opts)
+      process.stderr.write(`[out] sent topic ${topicId} ${plain.length}c (plain)\n`)
     } catch (e) {
       process.stderr.write(`[out] send FAILED topic ${topicId}: ${e}\n`)
     }
   }
 }
-
-// ── Clarifying questions (AskUserQuestion) ──────────────────────────────────
 // Render Claude's questions as option buttons in the topic; return the selection.
 type AskBtn = {
   multi: boolean
