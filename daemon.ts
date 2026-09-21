@@ -24,6 +24,7 @@ import {
 } from '@anthropic-ai/claude-agent-sdk'
 import { Bot, InlineKeyboard, InputFile, type Context } from 'grammy'
 import { htmlEsc, htmlToPlain, renderWithDeadline, chunkHtml } from './markdown'
+import { rotatorEnabled, handOffToRotator, rotatorActive, waitForRotation } from './rotator'
 import { readFileSync, writeFileSync, mkdirSync, renameSync, existsSync, statSync, chmodSync, readdirSync, rmSync } from 'fs'
 import { homedir } from 'os'
 import { join, dirname, basename } from 'path'
@@ -361,7 +362,13 @@ function summarizeInput(tool: string, input: Record<string, unknown>): string {
 // have to come back and ask "and now?". The timer is cancelled when the user
 // messages the topic themselves (they've taken over, e.g. switched model).
 const resumeTimers = new Map<string, ReturnType<typeof setTimeout>>()
+// Per-topic takeover generation. Every caller of cancelRateLimitResume is a user
+// message into the topic or a close/delete/wipe of it, i.e. the user took over — so
+// each call bumps this, and a pending rotation watch compares against the value it
+// captured. Independent of whether a reset timer existed (resetsAt is often absent).
+const takeoverGen = new Map<string, number>()
 function cancelRateLimitResume(topicId: string): void {
+  takeoverGen.set(topicId, (takeoverGen.get(topicId) ?? 0) + 1)
   const t = resumeTimers.get(topicId)
   if (t) {
     clearTimeout(t)
@@ -391,6 +398,27 @@ function scheduleRateLimitResume(topicId: string, resetsAt?: number): string | u
   )
   const d = new Date(at)
   return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+}
+// When the account rotator switches the shared credentials after a rejection, this
+// topic's claude process still holds the old token and would sit out the whole reset.
+// Close it (the context lives in the transcript) and continue at once on the new account.
+// If the user messaged, closed or deleted the topic while we were polling, they took
+// over and we must not close their live turn or inject a continuation: the takeover
+// generation captured here will have moved on.
+async function resumeAfterRotation(topicId: string, before: string | undefined): Promise<void> {
+  const gen = takeoverGen.get(topicId) ?? 0
+  const now = await waitForRotation(before)
+  if (!now) return
+  if (!registry[topicId]) return
+  if ((takeoverGen.get(topicId) ?? 0) !== gen) return
+  cancelRateLimitResume(topicId)
+  closeLive(topicId, `account rotated ${before ?? '?'} -> ${now}`)
+  await sayTopic(topicId, `🔁 Account rotated to ${now} — continuing now.`)
+  await sendToTopic(
+    topicId,
+    'The rate limit that interrupted you was resolved by switching accounts. Continue with the task you were working on. ' +
+      'If you were waiting on a background task or command, check its result now (the completion notification may have been lost) and proceed.',
+  )
 }
 
 // ── Stream pump: forward a session's output into its topic ───────────────────
@@ -424,16 +452,26 @@ async function pump(l: Live): Promise<void> {
         // was blocked).
         const info = (msg as any).rate_limit_info as { status?: string; resetsAt?: number } | undefined
         process.stderr.write(`[pump] topic ${l.topicId} rate_limit_event status=${info?.status} resetsAt=${info?.resetsAt}\n`)
+        // Baseline for the rotation watch, read BEFORE the hand-off: the rotator child
+        // runs concurrently and can flip .active before a read placed after the spawn,
+        // which would make the new account the baseline and hide the switch.
+        const activeBefore = info?.status === 'rejected' ? rotatorActive() : undefined
+        // The account rotator (if installed) judges every event against its own
+        // thresholds; sessions spawned here bypass its VS Code shim, so relay it.
+        handOffToRotator(msg)
         if (info?.status === 'rejected' && !rateLimited) {
           rateLimited = true
+          const rotator = rotatorEnabled()
           const until = scheduleRateLimitResume(l.topicId, info.resetsAt)
+          const rotating = rotator ? ' If the account rotator switches accounts I continue right away.' : ''
           await send(
             l.topicId,
             until
-              ? `⏳ Rate limit hit on this model — resets at ${until}. I'll continue automatically then, or switch to a lighter model (e.g. Sonnet) via ⚙️ Controls to keep going now.`
-              : '⏳ Rate limit hit on this model. Wait a moment and send your message again, or switch to a lighter model (e.g. Sonnet) via ⚙️ Controls.',
+              ? `⏳ Rate limit hit on this model — resets at ${until}.${rotating} Otherwise I'll continue automatically then, or switch to a lighter model (e.g. Sonnet) via ⚙️ Controls to keep going now.`
+              : `⏳ Rate limit hit on this model.${rotating} Otherwise wait a moment and send your message again, or switch to a lighter model (e.g. Sonnet) via ⚙️ Controls.`,
             new InlineKeyboard().text('⚙️ Controls', 'm:ctl'),
           )
+          if (rotator) void resumeAfterRotation(l.topicId, activeBefore)
         }
       }
       if (msg.type === 'assistant') {
