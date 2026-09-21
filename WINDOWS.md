@@ -77,6 +77,25 @@ CLAUDE_BINARY=C:\Users\<you>\.bun\bin\claude.exe
 
 (Find it with `where.exe claude` in PowerShell.)
 
+If a topic's first message comes back with
+
+```
+API Error: 400 ... "Claude Code 2.1.117 does not support this model; version 2.1.251 or newer is required" ... claude_code_version_too_old
+```
+
+the bundled binary is too old for that model (the Claude 5 generation needs
+2.1.251+), and the pinned SDK cannot simply be upgraded: newer SDK releases dropped
+the `unstable_v2_*` session API this daemon is built on. Set `CLAUDE_BINARY` to a
+newer Claude Code instead. Any of these work:
+
+- a native install (`irm https://claude.ai/install.ps1 | iex`), which lands at
+  `C:\Users\<you>\.local\bin\claude.exe` and keeps itself current — the durable option;
+- the copy inside the VS Code extension,
+  `C:\Users\<you>\.vscode\extensions\anthropic.claude-code-<version>-win32-x64\resources\native-binary\claude.exe`
+  — works today, but the path carries the version, so re-point it when the extension updates.
+
+An older SDK driving a newer binary is fine: the protocol is owned by the binary.
+
 ## Smoke test
 
 In the **General** topic:
