@@ -82,6 +82,26 @@ What was checked, and what turned out false:
   introduced. What it is NOT is a length problem: 200k of ordinary prose across many lines
   parses in 127ms. The blowup needs one very long line, which is what the guard keys on.
   My own scaling case missed it entirely by starting its timer after rendering.
+- **False, found by checking my own guard before the sixth pass returned: "a per-line cap
+  bounds the parse."** It does not compose. One line just under the 8000 cap parses in
+  312ms, but the cost is additive, so 10 such lines took 2.5s, 50 took 13.2s and 100 took
+  28.1s. The hostile input is simply reshaped, not blocked. The bound has to be on the
+  whole message, and the cost behaves like the sum of the squares of the line lengths:
+  measured, milliseconds are about that sum over 2e5, consistent across a single 40k line
+  (8165ms), a single 8k line (312ms) and ten of them (2536ms).
+- **False, found by the sixth pass: "a hostile run needs one long physical line."** marked
+  treats consecutive non-blank lines as one paragraph, so inline lexing spans newlines.
+  `Array(40).fill('_a'.repeat(1000)).join('\n')` passes a per-line cap with every line at
+  2000 characters and still took 12.0s for 80k. Together with the composition defect above,
+  that is two independent bypasses of two different static guards, which is the signal to
+  stop guessing at patterns. **The bound is now on TIME, not on shape**: rendering runs in a
+  worker with a deadline, and `worker.terminate()` in Bun does kill a synchronous CPU loop
+  (verified: terminate returned in 802ms against a 60s spin, main thread still responsive).
+  Ordinary messages cost 13 to 23ms end to end, hostile ones stop at the deadline and are
+  sent unformatted. This closes the class by construction rather than by enumeration, so
+  the static `MAX_INLINE_RUN` guard is removed rather than kept alongside: its only
+  remaining value was saving CPU on hostile input, against a real cost of degrading
+  legitimate long lines.
 - **Ruled out as the "integrator":** `contabo-server-config/kafka-telegram-relay/formatters.js`
   and `backend/shared/telegram/formatters.ts`. Both emit `<b>` and `<code>` bullet
   lists and contain no table construction (grepped for `|---`, `padEnd`, column joins).
@@ -112,8 +132,10 @@ What was checked, and what turned out false:
 | `keeps every chunk within the limit, even when one link is oversized` | the size guarantee holds for input that cannot be cut safely | the state before this fix: no degrade pass, and the remainder appended whole |
 | `terminates on deeply nested formatting` | chunking returns for input whose reopen prefix and closing tags exceed a whole chunk | reserving only the tags already open, ignoring the ones the added piece opens |
 | `drops formatting it cannot afford rather than carrying it` | when the tag stack costs more than half the budget it is closed and not reopened, so content keeps flowing | carrying the stack regardless, leaving no room for content |
-| `renders hostile inline markup without quadratic work` | a message carrying a pathological delimiter run is bounded, measured end to end including the parse | guarding the splitter while leaving the parser unbounded |
-| `falls back to literal text rather than parsing an oversized line` | the guard degrades formatting for that message instead of dropping or stalling it | skipping the message, or parsing it anyway |
+| `bounds a hostile render by deadline rather than by pattern` | three shapes that each defeated a static guard are all bounded, because the bound is on elapsed time | any guard keyed on the shape of the input rather than on its cost |
+| `returns nothing rather than partial html when the deadline is missed` | the caller gets a clean absence to degrade on, never a half-parsed document | resolving with whatever the worker had produced so far |
+| `renders an ordinary message well inside the deadline` | the bound costs ordinary messages their formatting in no case | a deadline so tight that normal output degrades |
+| `bounds parsing cost across many lines, not just one` | hostile text spread over many lines is bounded too, whether the lines form one paragraph or many | capping each line, which reshapes the attack instead of blocking it |
 | `chunks a very long line without quadratic work` | scanning is bounded by the chunk budget, not by what remains, so cost grows with input rather than with its square | rebuilding the unsafe map over the whole remainder on every cut |
 | `does not split inside a tag or an entity` | a cut inside `<a href=...>` or `&amp;` never happens, at any limit | cutting at a fixed offset once a line exceeds the budget |
 

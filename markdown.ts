@@ -111,29 +111,51 @@ function mdBlock(tokens: any[]): string {
   }
   return out
 }
+export function mdToTelegramHtml(md: string): string {
+  return mdBlock(marked.lexer(md)).replace(/\n{3,}/g, '\n\n').trim()
+}
+
 /**
- * One line longer than this is parsed as literal text instead of markdown.
+ * Render a message with a deadline, on a worker thread.
  *
  * marked's inline lexer backtracks on long runs of unterminated delimiters and
- * its cost grows with the square of the run. Measured at 80k characters on a
- * single line: `_a` 33.5s, `![a](` 11.9s, `[a](` 11.5s, `[a]` 9.5s, `*a` 7.5s,
- * `` `a `` 7.5s, `- a` 6.2s, `**a` 5.4s, `~~a` 5.3s. Eight constructs do it, so
- * a guard keyed on any one of them is worthless, and sayTopic parses on the
- * daemon's only thread, so a stall takes every topic's approvals with it.
+ * its cost grows with the square of the run: 80k characters of `_a` took 33.5s,
+ * and seven other constructs do the same. Two static guards were tried and both
+ * were defeated, because the cost depends on the shape of the input in ways a
+ * cheap check cannot predict: a per-line cap does not compose (100 lines just
+ * under it took 28.1s), and marked lexes inline across newlines, so 40 lines of
+ * 2000 characters are one 80k paragraph (12.0s).
  *
- * Length alone is not the trigger: 200k of ordinary prose across many lines
- * parses in 127ms, because inline lexing happens per block. The blowup needs one
- * very long line, so that is what this bounds, which leaves every ordinary
- * message formatted. At this cap the worst measured construct costs about 330ms.
+ * So the bound is on elapsed time rather than on shape, which closes the class
+ * by construction: whatever the parser does, the daemon's thread is free after
+ * `ms`. Bun's `worker.terminate()` does kill a synchronous CPU loop, which is
+ * what makes this work at all.
+ *
+ * Returns undefined when the deadline passes, when the worker fails to start,
+ * or when rendering throws. The caller degrades to sending the text unformatted:
+ * degraded, never dropped, never half-parsed.
  */
-const MAX_INLINE_RUN = 8000
-
-export function mdToTelegramHtml(md: string): string {
-  for (const line of md.split('\n')) {
-    // Degraded, not dropped: the text still goes out, without formatting.
-    if (line.length > MAX_INLINE_RUN) return htmlEsc(md)
+export function renderWithDeadline(md: string, ms = 1500): Promise<string | undefined> {
+  let worker: Worker
+  try {
+    worker = new Worker(new URL('./render-worker.ts', import.meta.url))
+  } catch {
+    return Promise.resolve(undefined)
   }
-  return mdBlock(marked.lexer(md)).replace(/\n{3,}/g, '\n\n').trim()
+  return new Promise<string | undefined>(resolve => {
+    let settled = false
+    const done = (html?: string) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      try { worker.terminate() } catch {}
+      resolve(html)
+    }
+    const timer = setTimeout(() => done(undefined), ms)
+    worker.addEventListener('message', (e: MessageEvent) => done((e.data as any)?.html ?? undefined))
+    worker.addEventListener('error', () => done(undefined))
+    worker.postMessage(md)
+  })
 }
 
 /**

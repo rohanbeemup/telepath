@@ -23,7 +23,7 @@ import {
   type SettingSource,
 } from '@anthropic-ai/claude-agent-sdk'
 import { Bot, InlineKeyboard, InputFile, type Context } from 'grammy'
-import { htmlEsc, htmlToPlain, mdToTelegramHtml, chunkHtml } from './markdown'
+import { htmlEsc, htmlToPlain, renderWithDeadline, chunkHtml } from './markdown'
 import { readFileSync, writeFileSync, mkdirSync, renameSync, existsSync, statSync, chmodSync, readdirSync, rmSync } from 'fs'
 import { homedir } from 'os'
 import { join, dirname, basename } from 'path'
@@ -183,12 +183,11 @@ const bot = new Bot(TOKEN)
 // hidden behind the label, and being valid HTML it sails past the fallback.
 async function sayTopic(topicId: string | undefined, text: string): Promise<void> {
   const opts = topicId ? { message_thread_id: Number(topicId) } : {}
-  let html: string | undefined
-  try {
-    html = mdToTelegramHtml(text)
-  } catch {
-    html = undefined
-  }
+  // Rendering runs on a worker with a deadline. marked's inline lexer is
+  // quadratic on long delimiter runs, and this call sits on the daemon's only
+  // thread, so an unbounded parse would stall approvals for every topic, not
+  // just this one. Past the deadline we send the text unformatted.
+  const html = await renderWithDeadline(text, 1500)
   for (const part of chunkHtml(html ?? text, 3500)) {
     if (html) {
       try {

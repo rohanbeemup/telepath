@@ -1,5 +1,5 @@
 import { test, expect, describe } from 'bun:test'
-import { mdToTelegramHtml, chunkHtml, htmlToPlain } from './markdown'
+import { mdToTelegramHtml, chunkHtml, htmlToPlain, renderWithDeadline } from './markdown'
 
 // Three backticks, written as escapes. Spelled literally they appear in a regex
 // below, where the lexer in the test-plan checker reads them as an unterminated
@@ -272,29 +272,51 @@ describe('chunking', () => {
     }
   })
 
-  test('renders hostile inline markup without quadratic work', () => {
-    // Eight delimiters send marked quadratic on one long line; _a is the worst,
-    // measured at 33.5 seconds for 80k characters, on the thread that also
-    // serves approvals. Timed end to end, parse included.
-    for (const unit of ['_a', '[a](', '*a', '~~a', '`a']) {
-      const md = unit.repeat(Math.ceil(80_000 / unit.length))
+  test('bounds a hostile render by deadline rather than by pattern', async () => {
+    // Each of these defeated a static guard: one long line, many lines forming a
+    // single paragraph (marked lexes inline across newlines), and many separate
+    // blocks. The bound is elapsed time, so the shape stops mattering.
+    const shapes = [
+      '_a'.repeat(40_000),
+      Array.from({ length: 40 }, () => '_a'.repeat(1000)).join('\n'),
+      Array.from({ length: 100 }, () => '_a'.repeat(3999)).join('\n\n'),
+    ]
+    for (const md of shapes) {
       const started = Date.now()
-      const parts = chunkHtml(mdToTelegramHtml(md), 3500)
-      expect(Date.now() - started).toBeLessThan(1000)
-      expect(parts.length).toBeGreaterThan(0)
+      const html = await renderWithDeadline(md, 800)
+      expect(Date.now() - started).toBeLessThan(2500)
+      expect(html).toBeUndefined()
     }
   })
 
-  test('falls back to literal text rather than parsing an oversized line', () => {
-    const md = '_a'.repeat(40_000)
-    const out = mdToTelegramHtml(md)
-    // The content survives, unformatted: degraded, not dropped, not stalled.
-    expect(out).toContain('_a_a')
-    expect(out).not.toContain('<i>')
-    // Ordinary long messages keep their formatting: length alone is not the trigger.
-    const ordinary = Array.from({ length: 4000 }, (_, i) => `**line ${i}** of ordinary prose`).join('\n')
-    expect(ordinary.length).toBeGreaterThan(100_000)
-    expect(mdToTelegramHtml(ordinary)).toContain('<b>line 0</b>')
+  test('returns nothing rather than partial html when the deadline is missed', async () => {
+    const html = await renderWithDeadline('_a'.repeat(40_000), 300)
+    // Absence, not a half-parsed document the caller might send.
+    expect(html).toBeUndefined()
+  })
+
+  test('renders an ordinary message well inside the deadline', async () => {
+    const md = ['## Heading', '', '- one', '- two', '', '| a | b |', '|---|---|', '| 1 | 2 |', '', '**bold** text'].join('\n')
+    const started = Date.now()
+    const html = await renderWithDeadline(md, 1500)
+    expect(Date.now() - started).toBeLessThan(1000)
+    expect(html).toContain('<b>Heading</b>')
+    expect(html).toContain('• one')
+    expect(html).toContain('<b>1</b>: 2')
+  })
+
+  test('bounds parsing cost across many lines, not just one', async () => {
+    // 100 lines each just under an 8000 character cap took 28.1 seconds: a
+    // per-line cap does not compose, because the cost is additive. The same text
+    // joined into ONE paragraph took 12.0 seconds, because marked lexes inline
+    // across newlines. Both are bounded by the deadline.
+    for (const sep of ['\n\n', '\n']) {
+      const md = Array.from({ length: 100 }, () => '_a'.repeat(3999)).join(sep)
+      const started = Date.now()
+      const html = await renderWithDeadline(md, 800)
+      expect(Date.now() - started).toBeLessThan(2500)
+      expect(html).toBeUndefined()
+    }
   })
 
   test('chunks a very long line without quadratic work', () => {
