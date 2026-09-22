@@ -5,6 +5,7 @@
  * Telegram API, plus the permission prompts a session blocks on.
  */
 import { Bot, InlineKeyboard, InputFile, type Context } from 'grammy'
+import { autoRetry } from '@grammyjs/auto-retry'
 import type { CanUseTool, PermissionResult } from '@anthropic-ai/claude-agent-sdk'
 import { basename } from 'path'
 import type { Config } from './config'
@@ -71,6 +72,10 @@ export class TelegramBot {
 
   constructor(private readonly d: BotDeps) {
     this.bot = new Bot(d.cfg.telegramToken)
+    // Every API call waits out a 429 for exactly the `retry_after` Telegram names (up to
+    // 30 s, three attempts) instead of failing, so a burst of answers across topics is
+    // delayed rather than lost. The status message has its own budget on top of this.
+    this.bot.api.config.use(autoRetry({ maxRetryAttempts: 3, maxDelaySeconds: 30 }))
     this.status = new TurnStatus(this.statusTransport())
     this.wire()
   }
@@ -159,6 +164,7 @@ export class TelegramBot {
         this.d.log.error('out.send_failed', { topic: topicId, error: e })
       }
     }
+    if (topicId) this.status.bump(topicId) // the status must stay the last message
   }
 
   /** Plain send (menus, notices, feed). */
@@ -167,6 +173,7 @@ export class TelegramBot {
     if (kb) opts.reply_markup = kb
     try {
       await this.bot.api.sendMessage(this.d.cfg.forumChatId, text, opts)
+      if (topicId) this.status.bump(topicId)
     } catch (e) {
       this.d.metrics.inc('send_failed')
       this.d.log.error('out.send_failed', { topic: topicId, error: e })
@@ -317,6 +324,7 @@ export class TelegramBot {
       }
     }
     this.d.metrics.inc('approvals_asked')
+    this.status.bump(topicId)
     return new Promise<PermissionResult>(resolve => this.pending.set(token, { resolve, topicId, messageId }))
   }
 
@@ -331,7 +339,10 @@ export class TelegramBot {
       `\n\n(tap a choice${multi ? '; ✅ Done when finished' : ''}, or just type your own reply)`
     return this.bot.api
       .sendMessage(this.d.cfg.forumChatId, body, { message_thread_id: Number(topicId), reply_markup: askKeyboard(token, options, multi, selected) })
-      .then(sent => new Promise<string | string[]>(resolve => this.askBtns.set(token, { multi, selected, options, messageId: sent.message_id, resolve })))
+      .then(sent => {
+        this.status.bump(topicId)
+        return new Promise<string | string[]>(resolve => this.askBtns.set(token, { multi, selected, options, messageId: sent.message_id, resolve }))
+      })
   }
 
   private async askQuestions(topicId: string, input: Record<string, unknown>): Promise<PermissionResult> {
@@ -364,6 +375,7 @@ export class TelegramBot {
       if (isImage(path)) await this.bot.api.sendPhoto(this.d.cfg.forumChatId, new InputFile(path), opts)
       else await this.bot.api.sendDocument(this.d.cfg.forumChatId, new InputFile(path), opts)
       this.d.metrics.inc('files_sent')
+      this.status.bump(topicId)
       return true
     } catch (e) {
       this.d.metrics.inc('files_failed')

@@ -30,10 +30,18 @@ class FakeTransport implements StatusTransport {
   }
 }
 
-function harness() {
+function harness(over: { maxOpsPerMinute?: number; editEveryMs?: number } = {}) {
   let now = 1_000_000
   const t = new FakeTransport()
-  const s = new TurnStatus(t, { now: () => now, editEveryMs: 12_000, firstEditAfterMs: 3_000, typingEveryMs: 4_500, minKeepMs: 5_000 })
+  const s = new TurnStatus(t, {
+    now: () => now,
+    editEveryMs: over.editEveryMs ?? 12_000,
+    firstEditAfterMs: 3_000,
+    typingEveryMs: 4_500,
+    minKeepMs: 5_000,
+    maxOpsPerMinute: over.maxOpsPerMinute ?? 60,
+    moveDebounceMs: 1_500,
+  })
   const advance = async (ms: number) => {
     now += ms
     await s.tick()
@@ -212,6 +220,67 @@ describe('TurnStatus', () => {
     await h.advance(11_000) // past it: the summary lands and the closing is forgotten
     expect(h.t.edits[h.t.edits.length - 1][2]).toBe('✅ Done · 0:10 · 1 tool call')
     expect(h.s.pendingClosings()).toBe(0)
+  })
+
+  test('the status moves below new messages so the last message in a topic is always the timer', async () => {
+    const h = harness()
+    h.s.begin('7', 1)
+    await h.settle()
+    h.s.addItems('7', [{ kind: 'command', label: 'x' }])
+    await h.advance(4_000)
+    const firstId = h.t.edits[0][1]
+    // Claude posts three messages in quick succession: one move, not three
+    h.s.bump('7')
+    await h.advance(500)
+    h.s.bump('7')
+    await h.advance(500)
+    h.s.bump('7')
+    await h.advance(1_000) // 1.0 s after the last bump: inside the debounce
+    expect(h.t.removed.length).toBe(0)
+    await h.advance(1_000) // 2.0 s after: the status is deleted and re-posted at the bottom
+    expect(h.t.removed).toEqual([['7', firstId]])
+    expect(h.t.created.length).toBe(2)
+    expect(h.t.created[1][1]).toContain('🖥 x') // the text travelled with it
+    const movedId = h.t.created.length + 99 // FakeTransport ids are sequential from 100
+    // later edits go to the new message
+    h.s.addItems('7', [{ kind: 'edit', label: 'a.ts' }])
+    await h.advance(13_000)
+    expect(h.t.edits[h.t.edits.length - 1][1]).toBe(movedId)
+    // finishing right after another post puts the verdict at the bottom instead of editing the buried one
+    h.s.bump('7')
+    await h.s.finish('7', 'ok')
+    expect(h.t.removed.length).toBe(2)
+    expect(h.t.created[h.t.created.length - 1][1].startsWith('✅ Done')).toBe(true)
+  })
+
+  test('edits across all topics share one budget and slow down as topics multiply', async () => {
+    const h = harness({ maxOpsPerMinute: 6, editEveryMs: 1_000 })
+    for (const t of ['1', '2', '3']) h.s.begin(t, 1)
+    await h.settle()
+    for (const t of ['1', '2', '3']) h.s.addItems(t, [{ kind: 'command', label: 'go ' + t }])
+    const opsBefore = h.t.created.length // the three creates already spent budget
+    for (let i = 0; i < 59; i++) await h.advance(1_000) // the whole first minute, before the creates leave the window
+    const spent = opsBefore + h.t.edits.length + h.t.removed.length
+    expect(spent).toBeLessThanOrEqual(6) // never more than the budget within one minute
+    // every topic got at least one edit: the budget is shared fairly, not hogged by one
+    for (const t of ['1', '2', '3']) expect(h.t.edits.some(e => e[0] === t)).toBe(true)
+    // and the per-topic interval stretched: with 3 topics and 6/min, 30 s apart, so ≤ 2 edits each in a minute
+    for (const t of ['1', '2', '3']) expect(h.t.edits.filter(e => e[0] === t).length).toBeLessThanOrEqual(2)
+  })
+
+  test('typing slows down when many topics are active', async () => {
+    const few = harness()
+    few.s.begin('1', 1)
+    await few.settle()
+    for (let i = 0; i < 20; i++) await few.advance(1_000)
+    const perTopicFew = few.t.typing.filter(t => t === '1').length
+    const many = harness()
+    for (const t of ['1', '2', '3', '4', '5']) many.s.begin(t, 1)
+    await many.settle()
+    for (let i = 0; i < 20; i++) await many.advance(1_000)
+    const perTopicMany = many.t.typing.filter(t => t === '1').length
+    expect(perTopicMany).toBeLessThan(perTopicFew)
+    expect(perTopicMany).toBeGreaterThan(0)
   })
 
   test('queued messages are counted while a turn runs and the count falls as results arrive', async () => {

@@ -19,10 +19,14 @@ Rewrite on the current Agent SDK, in tested modules, with observability.
   life, so idle sessions were never evicted; a session is now idle when no turn is in
   flight and nothing happened for `IDLE_MINUTES`.
 - **A live status message per turn.** `⏳ Working · 1:42 · 9 tool calls`, edited in place
-  at most every 12 s and only when changed, backing off exactly as Telegram asks on a
-  429, typing indicator alongside, queue count when more messages arrive, the rate-limit
-  wait while it holds, and a one-line summary (or nothing, for a short quiet turn) when
-  the turn ends. Answers stay new messages because an edit sends no notification. Commands
+  at most every 12 s and only when changed, typing indicator alongside, queue count when
+  more messages arrive, the rate-limit wait while it holds, and a one-line summary (or
+  nothing, for a short quiet turn) when the turn ends. It stays the last message of the
+  topic: content posted below it moves it to the bottom, once per burst. All status
+  operations across all topics share one budget (12/min; Telegram's ~20/min limit is per
+  group, and topics share a group), the interval stretches with the number of active
+  topics, typing slows above three, and grammy's `auto-retry` waits out any 429 on any
+  API call. Answers stay new messages because an edit sends no notification. Commands
   shown in it are masked for well-known secret shapes (bearer headers, `KEY=value`
   credentials, token prefixes, a bot token in a URL).
 - **The activity feed is a digest** inside that status message. About every 15 seconds, and before any text or task

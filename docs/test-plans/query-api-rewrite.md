@@ -110,6 +110,17 @@ what turned out false or true:
   status are redacted for well-known secret shapes, because the message is edited and
   stays visible. The core is transport-agnostic (create/edit/remove/type), the same three
   calls Slack and Discord offer.
+- **Asked after the first evening with the status: "does this hit rate limits with several
+  topics, and why is the timer buried above the answers?"** Telegram's limit of about
+  twenty operations a minute is per GROUP, and every topic is a thread of one group, so
+  five topics at one edit per 12 s would already exceed it on their own. All status
+  operations now draw from one shared budget (12/min by default, the rest is left for real
+  messages), the per-topic interval stretches with the number of active topics, typing
+  halves above three topics, and grammy's `auto-retry` waits out any 429 the bot still
+  meets instead of dropping the call. A message cannot be moved on Telegram, so when
+  something is posted below the status it is deleted and re-posted silently at the bottom,
+  once per burst; a turn's verdict is posted at the bottom too when content arrived after
+  the last move. The last message in a topic is therefore the timer or the verdict.
 - **Found by Copilot's review of the status push (five findings, all confirmed):** an old
   pump's unconditional `idle` closed a replacement session's fresh status as "stopped"
   after a model switch; a status spanning queued turns summarized an early failure as
@@ -245,6 +256,9 @@ binary's version against the minimum the current models need, and the bot's iden
 | `a rate limit shows as waiting in the status` | the header reads paused while the limit holds, with the reset time when known and without it otherwise; the summary keeps it | a truthiness check on the note, so a rejection without `resetsAt` keeps spinning |
 | `an earlier failure in a queued run is not summarized as done` | the most severe outcome across the queued turns wins the summary; an explicit stop still reads stopped | the last turn's outcome overwriting an earlier error or rate limit |
 | `the closing summary is retried after a 429 until it lands` | a throttled final edit is retried from the tick after the retry-after and then forgotten | discarding the final edit's result and leaving "Working" behind |
+| `the status moves below new messages so the last message in a topic is always the timer` | after content is posted the status is deleted and re-posted at the bottom, once per burst (debounced), carrying its text; later edits go to the new message; a finish right after a post puts the verdict at the bottom | a status buried under the answers, which tells the reader nothing about whether Claude is still busy |
+| `edits across all topics share one budget and slow down as topics multiply` | with N active topics no more than the shared per-minute budget is spent, every topic still gets edits, and the per-topic interval stretches to fit | per-topic intervals that add up past the per-group limit when several topics run |
+| `typing slows down when many topics are active` | the typing cadence halves above three active topics and never stops | a typing loop per topic that scales linearly into Telegram's limits |
 | `queued messages are counted while a turn runs and the count falls as results arrive` | `N messages queued` while more than one turn is in flight; gone at one | a user unsure whether a second message was taken |
 | `compares dotted versions numerically` | `2.1.278 > 2.1.99 > 2.0.1000` | a string comparison |
 | `flags a binary older than the minimum` | 2.1.117 against minimum 2.1.251 is a failure with both numbers in the message | a boot that proceeds to the first 400 |
