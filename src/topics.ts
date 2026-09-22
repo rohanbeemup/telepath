@@ -210,6 +210,7 @@ export class TopicManager {
       l.session.send(payload)
     }
     this.d.metrics.inc('messages_in')
+    void this.d.onEvent(topicId, { kind: 'turn', phase: 'start', inFlight: l.inFlight })
     return true
   }
 
@@ -293,6 +294,7 @@ export class TopicManager {
                   : `⏳ Rate limit hit on this model.${rotating} Otherwise wait a moment and send your message again, or switch to a lighter model via ⚙️ Controls.`,
               )
               if (rot) void this.resumeAfterRotation(topicId, activeBefore)
+              await this.d.onEvent(topicId, { kind: 'turn', phase: 'waiting', inFlight: l.inFlight, note: until ? `resets at ${until}` : undefined })
               break
             }
             case 'turnEnd':
@@ -302,6 +304,12 @@ export class TopicManager {
               this.d.metrics.inc('turns')
               if (ev.kind === 'turnError') this.d.metrics.inc('turn_errors')
               await this.d.onEvent(topicId, ev)
+              await this.d.onEvent(topicId, {
+                kind: 'turn',
+                phase: 'end',
+                inFlight: l.inFlight,
+                outcome: ev.kind === 'turnEnd' ? 'ok' : ev.afterRateLimit ? 'limited' : 'error',
+              })
               break
             default:
               await this.d.onEvent(topicId, ev)

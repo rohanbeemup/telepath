@@ -20,6 +20,14 @@ export type Event =
   | { kind: 'denied'; tool: string; message: string }
   | { kind: 'assistantError'; error: string }
   | { kind: 'state'; state: 'idle' | 'running' | 'requires_action' }
+  /**
+   * Emitted by TopicManager, not by interpret(): the turn lifecycle as the daemon sees
+   * it. `start` when a user message is sent (inFlight counts it), `end` when its result
+   * arrives (inFlight already decremented), `waiting` while a rate limit holds it.
+   */
+  | { kind: 'turn'; phase: 'start'; inFlight: number }
+  | { kind: 'turn'; phase: 'end'; inFlight: number; outcome: 'ok' | 'error' | 'limited' }
+  | { kind: 'turn'; phase: 'waiting'; inFlight: number; note: string | undefined }
 
 /** Per live session. `alerted` is the once-per-turn latch for rate-limit alerts. */
 export type PumpState = { sessionId?: string; alerted: boolean }

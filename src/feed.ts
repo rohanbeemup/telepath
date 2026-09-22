@@ -8,9 +8,10 @@
  *
  * The first version sent one line per tool call and was read on a phone as spam: file
  * names of a machine the reader cannot reach, one message per edit because calls arrive
- * seconds apart. So the feed is now a digest: commands and subagent briefs are readable
- * and kept as lines; edits collapse to one line with a count; reads and searches are a
- * count only. Pure functions here; the batching window and the toggle live elsewhere.
+ * seconds apart. So the feed is a digest: commands and subagent briefs are readable and
+ * kept as lines; edits collapse to one line with a count; reads and searches are a count
+ * only. The digest is rendered inside the turn's live status message (status.ts).
+ * Pure functions here.
  */
 import { basename } from 'path'
 
@@ -23,6 +24,30 @@ function oneLine(s: string, max = MAX): string {
 
 function fileName(p: unknown): string {
   return typeof p === 'string' && p ? basename(p.replace(/\\/g, '/')) : '?'
+}
+
+/**
+ * Commands are shown by their text when the model gave no description, and a command
+ * can carry a credential (`curl -H "Authorization: Bearer …"`, `TOKEN=… ./deploy`). The
+ * chat is private and the approval prompt already shows commands, but the status message
+ * is edited repeatedly and stays visible, so obvious secrets are masked by shape. This is
+ * masking by identity of well-known formats, not an entropy heuristic: a git SHA or a
+ * device id keeps its face.
+ */
+// key, optional closing quote of a JSON key, separator, optional opening quote, value
+// (optionally prefixed by the word Bearer), matching closing quote.
+const KEYED_SECRET = /\b(token|secret|password|passwd|pwd|api[_-]?key|apikey|auth|authorization|bearer|client[_-]?secret|access[_-]?key)\b(["']?)(\s*[=:]\s*|\s+)(["']?)(?:Bearer\s+)?[^\s"']{4,}\4/gi
+const SHAPED_SECRET =
+  /\b(sk-[A-Za-z0-9_-]{8,}|ghp_[A-Za-z0-9]{20,}|gho_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|glsa_[A-Za-z0-9_]{20,}|FlyV1\s+\S+|AIza[0-9A-Za-z_-]{30,})/g
+// A Telegram bot token (`<digits>:<35 chars>`) usually follows "bot" in a URL, so no word
+// boundary can precede it.
+const BOT_TOKEN = /\d{6,}:[A-Za-z0-9_-]{30,}/g
+
+export function redactSecrets(s: string): string {
+  return s
+    .replace(KEYED_SECRET, (_m, key: string, q: string, sep: string) => `${key}${q}${sep}[redacted]`)
+    .replace(SHAPED_SECRET, '[redacted]')
+    .replace(BOT_TOKEN, '[redacted]')
 }
 
 export type FeedItem = {
@@ -41,7 +66,7 @@ export function toolItem(name: string, input: Record<string, unknown> | undefine
   switch (name) {
     case 'Bash':
     case 'PowerShell': {
-      const what = typeof i.description === 'string' && i.description ? i.description : String(i.command ?? '')
+      const what = typeof i.description === 'string' && i.description ? i.description : redactSecrets(String(i.command ?? ''))
       return { kind: 'command', label: oneLine(what), background: !!i.run_in_background }
     }
     case 'Read':
@@ -55,7 +80,7 @@ export function toolItem(name: string, input: Record<string, unknown> | undefine
     case 'Glob':
       return { kind: 'search', label: oneLine(String(i.pattern ?? ''), 60) }
     case 'WebFetch':
-      return { kind: 'web', label: oneLine(String(i.url ?? ''), 100) }
+      return { kind: 'web', label: oneLine(redactSecrets(String(i.url ?? '')), 100) }
     case 'WebSearch':
       return { kind: 'web', label: oneLine(String(i.query ?? ''), 100) }
     case 'Agent':
@@ -66,7 +91,7 @@ export function toolItem(name: string, input: Record<string, unknown> | undefine
       try {
         brief = JSON.stringify(i)
       } catch {}
-      return { kind: 'other', label: oneLine(`${name} ${brief}`, 100) }
+      return { kind: 'other', label: oneLine(redactSecrets(`${name} ${brief}`), 100) }
     }
   }
 }
@@ -160,62 +185,4 @@ export function digest(items: FeedItem[]): string[] {
   if (searches) counts.push(`🔍 ${searches} search${searches === 1 ? '' : 'es'}`)
   if (counts.length) lines.push(counts.join(' · '))
   return lines
-}
-
-/** Pack lines into messages of at most `max` characters, splitting only between lines. */
-export function packLines(lines: string[], max: number): string[] {
-  const out: string[] = []
-  let cur = ''
-  for (const raw of lines) {
-    const line = raw.length > max ? raw.slice(0, max - 1) + '…' : raw
-    if (!cur) cur = line
-    else if (cur.length + 1 + line.length <= max) cur += '\n' + line
-    else {
-      out.push(cur)
-      cur = line
-    }
-  }
-  if (cur) out.push(cur)
-  return out
-}
-
-/**
- * Collects feed items per topic and sends one digest per window (or on demand, before
- * something else is posted so chronology holds). `flush` is injected: the batcher knows
- * nothing about Telegram, and a test reads what it would have sent.
- */
-export class FeedBatcher {
-  private readonly buf = new Map<string, { items: FeedItem[]; timer: ReturnType<typeof setTimeout> }>()
-  constructor(
-    private readonly flush: (topicId: string, text: string) => void,
-    private readonly windowMs = 15_000,
-    private readonly maxChars = 3900,
-  ) {}
-
-  add(topicId: string, items: FeedItem[]): void {
-    if (!items.length) return
-    const cur = this.buf.get(topicId)
-    if (cur) {
-      cur.items.push(...items)
-      return
-    }
-    const timer = setTimeout(() => this.fire(topicId), this.windowMs)
-    this.buf.set(topicId, { items: [...items], timer })
-  }
-
-  /** Send the digest of what is waiting for a topic now. */
-  fire(topicId: string): void {
-    const b = this.buf.get(topicId)
-    if (!b) return
-    clearTimeout(b.timer)
-    this.buf.delete(topicId)
-    for (const chunk of packLines(digest(b.items), this.maxChars)) this.flush(topicId, chunk)
-  }
-
-  drop(topicId: string): void {
-    const b = this.buf.get(topicId)
-    if (!b) return
-    clearTimeout(b.timer)
-    this.buf.delete(topicId)
-  }
 }

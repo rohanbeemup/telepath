@@ -1,5 +1,5 @@
 import { test, expect, describe } from 'bun:test'
-import { toolItem, feedItems, describeTask, digest, FeedBatcher, packLines, type FeedItem } from './feed'
+import { toolItem, feedItems, describeTask, digest, redactSecrets, type FeedItem } from './feed'
 
 // The activity feed is what the user sees of a session that runs in auto mode and talks
 // little. On a phone it must read as a digest, not as one message per file the machine
@@ -43,6 +43,25 @@ describe('toolItem', () => {
     const item = toolItem('Bash', { command: 'x'.repeat(1000) + '\n' + 'y'.repeat(1000) })
     expect(item.label.includes('\n')).toBe(false)
     expect(item.label.length).toBeLessThanOrEqual(160)
+  })
+
+  test('labels never leak obvious secrets', () => {
+    const cases: [string, string][] = [
+      ['curl -H "Authorization: Bearer abcdef123456" https://x', 'curl -H "Authorization: [redacted]" https://x'],
+      // a made-up shape only: a real-looking glsa_ token trips GitHub push protection
+      ['TOKEN=glsa_FAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKE ./deploy', 'TOKEN=[redacted] ./deploy'],
+      ['export API_KEY=sk-live-0123456789abcdef && run', 'export API_KEY=[redacted] && run'],
+      ['git push https://ghp_abcdefghijklmnopqrstuvwxyz1234@github.com/x', 'git push https://[redacted]@github.com/x'],
+      ['curl https://api.telegram.org/bot123456789:AAEvh1-6FH_kTbYsSGjnb0np96APObjpXy0/getMe', 'curl https://api.telegram.org/bot[redacted]/getMe'],
+    ]
+    for (const [input, expected] of cases) expect(redactSecrets(input)).toBe(expected)
+    // a git sha and a device id are identifiers, not secrets: they keep their face
+    expect(redactSecrets('git show f6f7e9d0c1fb5fa1789ebe7867d2f4e3a1b2c3d4')).toBe('git show f6f7e9d0c1fb5fa1789ebe7867d2f4e3a1b2c3d4')
+    // the redaction applies to command labels and to the fallback for unknown tools
+    expect(toolItem('Bash', { command: 'curl -H "Authorization: Bearer abcdef123456" https://x' }).label).toContain('[redacted]')
+    expect(toolItem('mcp__x__y', { password: 'hunter22' }).label).toContain('[redacted]')
+    // a description written by the model is shown as-is: it is prose, not a command
+    expect(toolItem('Bash', { command: 'x', description: 'Rotate the token' }).label).toBe('Rotate the token')
   })
 })
 
@@ -105,43 +124,5 @@ describe('describeTask', () => {
     expect(describeTask('completed', 'Run the suite', true)).toBe('✅ done: Run the suite')
     expect(describeTask('failed', 'Start the server', true)).toBe('❌ failed: Start the server')
     expect(describeTask('stopped', '', true)).toBe('⏹ stopped: task')
-  })
-})
-
-describe('FeedBatcher', () => {
-  test('batches items within the window into one digest per topic', async () => {
-    const sent: [string, string][] = []
-    const fb = new FeedBatcher((t, text) => void sent.push([t, text]), 15)
-    fb.add('1', [{ kind: 'edit', label: 'a.ts' }])
-    fb.add('1', [{ kind: 'edit', label: 'b.ts' }, { kind: 'command', label: 'Run tests' }])
-    fb.add('2', [{ kind: 'read', label: 'x' }])
-    fb.add('1', []) // nothing to add, nothing scheduled twice
-    await new Promise(r => setTimeout(r, 60))
-    expect(sent).toEqual([
-      ['1', '🖥 Run tests\n✏️ edited 2 files: a.ts, b.ts'],
-      ['2', '📖 1 read'],
-    ])
-  })
-
-  test('splits an oversized batch into several sends instead of truncating it', () => {
-    const sent: string[] = []
-    const fb = new FeedBatcher((_t, text) => void sent.push(text), 10_000, 50)
-    fb.add('1', Array.from({ length: 4 }, (_, i) => ({ kind: 'command' as const, label: `command number ${i} ${'x'.repeat(20)}` })))
-    fb.fire('1')
-    expect(sent.length).toBeGreaterThan(1)
-    for (const s of sent) expect(s.length).toBeLessThanOrEqual(50)
-    expect(sent.join('\n').split('\n').length).toBe(4) // every line arrives
-    expect(packLines(['a'.repeat(80)], 50)[0].length).toBe(50) // a single over-long line is capped, not dropped
-  })
-
-  test('fire sends what is waiting at once and drop discards it', async () => {
-    const sent: string[] = []
-    const fb = new FeedBatcher((_t, text) => void sent.push(text), 10_000)
-    fb.add('1', [{ kind: 'command', label: 'now' }])
-    fb.fire('1')
-    fb.add('1', [{ kind: 'command', label: 'never' }])
-    fb.drop('1')
-    await new Promise(r => setTimeout(r, 20))
-    expect(sent).toEqual(['🖥 now'])
   })
 })

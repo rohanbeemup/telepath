@@ -18,7 +18,14 @@ Rewrite on the current Agent SDK, in tested modules, with observability.
 - **Idle eviction works.** The previous `pumping` flag was true for a session's whole
   life, so idle sessions were never evicted; a session is now idle when no turn is in
   flight and nothing happened for `IDLE_MINUTES`.
-- **The activity feed is a digest.** About every 15 seconds, and before any text or task
+- **A live status message per turn.** `⏳ Working · 1:42 · 9 tool calls`, edited in place
+  at most every 12 s and only when changed, backing off exactly as Telegram asks on a
+  429, typing indicator alongside, queue count when more messages arrive, the rate-limit
+  wait while it holds, and a one-line summary (or nothing, for a short quiet turn) when
+  the turn ends. Answers stay new messages because an edit sends no notification. Commands
+  shown in it are masked for well-known secret shapes (bearer headers, `KEY=value`
+  credentials, token prefixes, a bot token in a URL).
+- **The activity feed is a digest** inside that status message. About every 15 seconds, and before any text or task
   completion so chronology holds: commands, subagents and task starts by their
   description, edits collapsed to one counted line, reads and searches as a count. The
   first version's one message per tool call read as spam on a phone (file names of a

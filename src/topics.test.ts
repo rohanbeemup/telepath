@@ -248,6 +248,26 @@ describe('TopicManager', () => {
     expect(h.rotator.handedOff.length).toBe(1)
   })
 
+  test('emits turn start and end with the number of turns in flight', async () => {
+    const h = harness()
+    h.bind('1')
+    await h.tm.sendToTopic('1', 'first')
+    await h.tm.sendToTopic('1', 'second')
+    const turns = () => h.events.filter(([, ev]) => ev.kind === 'turn').map(([, ev]) => ev as Extract<Event, { kind: 'turn' }>)
+    expect(turns().map(t => [t.phase, t.inFlight])).toEqual([['start', 1], ['start', 2]])
+    const s = h.backend.last()
+    s.emit(result())
+    await h.tick()
+    s.emit({ type: 'result', subtype: 'error_during_execution', is_error: true, errors: ['x'], session_id: 's' })
+    await h.tick()
+    const ends = turns().filter(t => t.phase === 'end') as Extract<Event, { kind: 'turn'; phase: 'end' }>[]
+    expect(ends.map(t => [t.inFlight, t.outcome])).toEqual([[1, 'ok'], [0, 'error']])
+    // a rejection reports the wait to the status
+    s.emit({ type: 'rate_limit_event', rate_limit_info: { status: 'rejected' } })
+    await h.tick()
+    expect(turns().some(t => t.phase === 'waiting')).toBe(true)
+  })
+
   test('never leaks the bot token into a session environment', async () => {
     const h = harness()
     h.bind('1')

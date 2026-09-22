@@ -9,7 +9,8 @@ import type { CanUseTool, PermissionResult } from '@anthropic-ai/claude-agent-sd
 import { basename } from 'path'
 import type { Config } from './config'
 import { parseTyped } from './commands'
-import { FeedBatcher, describeTask } from './feed'
+import { describeTask } from './feed'
+import { TurnStatus, type StatusTransport } from './status'
 import { deleteTranscript, isImage, listRepoFolders, type Files } from './files'
 import type { Event } from './interpret'
 import type { Logger, Metrics } from './log'
@@ -65,16 +66,66 @@ export class TelegramBot {
   private tokenSeed = 0
   /** Set for the duration of a button tap so menu screens repaint the tapped message in place. */
   private menuCtx: Context | undefined
-  readonly feed: FeedBatcher
+  /** One live "working" message per turn; driven by a 1 s tick from the daemon. */
+  readonly status: TurnStatus
 
   constructor(private readonly d: BotDeps) {
     this.bot = new Bot(d.cfg.telegramToken)
-    this.feed = new FeedBatcher((topicId, text) => void this.send(topicId, text))
+    this.status = new TurnStatus(this.statusTransport())
     this.wire()
   }
 
   attachTopics(topics: TopicManager): void {
     this.topics = topics
+  }
+
+  /**
+   * The status message's transport over the Bot API, with Telegram's answers mapped to
+   * what TurnStatus needs: a 429 carries `retry_after` (honoured exactly), "message is
+   * not modified" is a success, and a message the user deleted is `gone`.
+   */
+  private statusTransport(): StatusTransport {
+    const chat = this.d.cfg.forumChatId
+    const describe = (e: unknown): { code?: number; text: string; retryAfter?: number } => {
+      const any = e as { error_code?: number; description?: string; parameters?: { retry_after?: number }; message?: string }
+      return { code: any?.error_code, text: String(any?.description ?? any?.message ?? e), retryAfter: any?.parameters?.retry_after }
+    }
+    return {
+      create: async (topicId, text) => {
+        try {
+          const sent = await this.bot.api.sendMessage(chat, text, { message_thread_id: Number(topicId), disable_notification: true })
+          this.d.metrics.inc('status_created')
+          return sent.message_id
+        } catch (e) {
+          this.d.log.warn('status.create_failed', { topic: topicId, error: e })
+          return undefined
+        }
+      },
+      edit: async (topicId, messageId, text) => {
+        try {
+          await this.bot.api.editMessageText(chat, messageId, text)
+          this.d.metrics.inc('status_edits')
+          return { ok: true }
+        } catch (e) {
+          const d = describe(e)
+          if (/not modified/i.test(d.text)) return { ok: true }
+          if (d.code === 429) {
+            this.d.metrics.inc('status_edit_429')
+            this.d.log.warn('status.edit_rate_limited', { topic: topicId, retryAfter: d.retryAfter })
+            return { ok: false, retryAfterMs: (d.retryAfter ?? 5) * 1000 }
+          }
+          if (d.code === 400 && /message (to edit )?not found|can't be edited|MESSAGE_ID_INVALID/i.test(d.text)) return { ok: false, gone: true }
+          this.d.log.warn('status.edit_failed', { topic: topicId, error: d.text })
+          return { ok: false }
+        }
+      },
+      remove: async (topicId, messageId) => {
+        await this.bot.api.deleteMessage(chat, messageId).catch(() => {})
+      },
+      type: async topicId => {
+        await this.bot.api.sendChatAction(chat, 'typing', { message_thread_id: Number(topicId) }).catch(() => {})
+      },
+    }
   }
 
   // ── delivery ─────────────────────────────────────────────────────────────
@@ -143,24 +194,28 @@ export class TelegramBot {
     const b = this.d.store.registry[topicId]
     switch (ev.kind) {
       case 'say':
-        this.feed.fire(topicId) // what was done comes before what is said about it
         await this.say(topicId, ev.text)
         return
       case 'feed':
+        // Into the turn's live status message; interpret() already gated on feedOn.
         this.d.metrics.inc('feed_items', ev.items.length)
-        this.feed.add(topicId, ev.items)
+        this.status.addItems(topicId, ev.items)
         return
       case 'sessionId': {
         const cwd = b?.cwd ?? this.d.cfg.defaultCwd
         await this.say(topicId, `🆔 Session id: ${ev.id}\nResume on laptop:\ncd ${cwd} && claude --resume ${ev.id}`)
         return
       }
+      case 'turn':
+        if (ev.phase === 'start') this.status.begin(topicId, ev.inFlight, b ? feedOn(b) : false)
+        else if (ev.phase === 'waiting') this.status.waiting(topicId, ev.note)
+        else if (ev.inFlight > 0) this.status.setInFlight(topicId, ev.inFlight)
+        else await this.status.finish(topicId, ev.outcome)
+        return
       case 'turnEnd':
-        this.feed.fire(topicId)
         await this.flushOutbox(topicId)
         return
       case 'turnError': {
-        this.feed.fire(topicId)
         await this.flushOutbox(topicId)
         if (ev.afterRateLimit) return // the friendlier rate-limit notice was already shown
         const detail = ev.errors.length ? `\n${ev.errors.map(e => e.slice(0, 300)).join('\n')}` : ''
@@ -170,12 +225,11 @@ export class TelegramBot {
       case 'task': {
         const line = describeTask(ev.status, ev.description, ev.background)
         if (ev.status === 'started') {
-          if (b && feedOn(b)) this.feed.add(topicId, [{ kind: 'task', label: line }])
+          if (b && feedOn(b)) this.status.addItems(topicId, [{ kind: 'task', label: line }])
         } else {
-          // A settled background task is always surfaced: the SDK re-invokes the model with
-          // the result, but if that continuation is rate-limited the user would never hear.
-          // The pending digest goes first, so "started" never arrives after "done".
-          this.feed.fire(topicId)
+          // A settled background task is always surfaced as its own message: the SDK
+          // re-invokes the model with the result, but if that continuation is
+          // rate-limited the user would never hear.
           await this.send(topicId, line)
         }
         return
@@ -188,7 +242,9 @@ export class TelegramBot {
         await this.send(topicId, `⚠️ model error: ${ev.error}. Tap ⚙️ to switch model or adjust this session.`, controlsKb())
         return
       case 'state':
-        if (ev.state === 'running') await this.typing(topicId)
+        // The stream ended (close, eviction, crash): a turn that never got its result must
+        // not leave a "Working" message behind.
+        if (ev.state === 'idle') await this.status.finish(topicId, 'stopped')
         return
       default:
         return
@@ -652,7 +708,7 @@ export class TelegramBot {
     if (data === 'm:tclose') {
       this.topics.userTookOver(topicId)
       this.topics.closeLive(topicId, 'closed & kept by user')
-      this.feed.drop(topicId)
+      void this.status.drop(topicId)
       if (b?.controlMsgId) await this.bot.api.unpinChatMessage(this.d.cfg.forumChatId, b.controlMsgId).catch(() => {})
       await ack('💾 Closed')
       await this.paint(topicId, '💾 Session closed and saved — your context is kept. Reopen to resume.', new InlineKeyboard().text('♻️ Reopen & resume', 'm:treopen'))
@@ -704,7 +760,7 @@ export class TelegramBot {
     this.topics.userTookOver(topicId)
     this.topics.closeLive(topicId, wipe ? 'wiped by user' : 'deleted by user')
     this.topics.forget(topicId)
-    this.feed.drop(topicId)
+    void this.status.drop(topicId)
     delete this.d.store.registry[topicId]
     this.d.store.saveRegistry()
     this.d.metrics.inc(wipe ? 'topics_wiped' : 'topics_deleted')
@@ -954,9 +1010,13 @@ every session topic with:
 • 🐇 Haiku / ⚡ Sonnet / 🧠 Opus / ✨ Fable — switch model (applies next message)
 • 🎚 low / med / high / xhigh / max / ↺ default — how hard it thinks (Haiku has none)
 • 🔐 Approvals ↔ ⚡ Auto — toggle whether tools ask before running
-• 🔎 Activity feed — a digest every ~15 s of what the session did: 🖥 commands and
-   🤖 subagents by their description, ✏️ edits as one counted line, reads as a count;
-   on by default in ⚡ auto, where nothing else shows what the session is doing
+• 🔎 Activity feed — whether the turn's live status message also lists what the
+   session did: 🖥 commands and 🤖 subagents by their description, ✏️ edits as one
+   counted line, reads as a count; on by default in ⚡ auto
+
+⏳ Every turn shows one live status message ("Working · 1:42 · 9 tool calls"), updated
+every few seconds while Claude works, ending in a one-line summary. Answers, questions
+and approvals always arrive as new messages, so your phone still notifies you.
 • 💾 Close & keep — stop the session + close the topic, keep everything
    (a ♻️ Reopen button appears to resume later with full context)
 • 🗑 Close & delete — remove the topic + session (transcript stays on disk)
