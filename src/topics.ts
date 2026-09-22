@@ -42,8 +42,16 @@ export type Live = {
   model: string
   cwd: string
   lastActive: number
-  /** A turn is in flight: a user message was sent and no result has come back. */
-  busy: boolean
+  /**
+   * Turns in flight: incremented per user message sent, decremented per result. The
+   * CLI queues messages and answers each with its own result, so a second message sent
+   * during a turn keeps the session busy until its own result arrives.
+   */
+  inFlight: number
+}
+
+export function isBusy(l: Live): boolean {
+  return l.inFlight > 0
 }
 
 export type Rotator = {
@@ -169,7 +177,7 @@ export class TopicManager {
       env,
       ...this.d.extras(topicId),
     })
-    const l: Live = { session, topicId, model: b.model, cwd: b.cwd, lastActive: this.now(), busy: false }
+    const l: Live = { session, topicId, model: b.model, cwd: b.cwd, lastActive: this.now(), inFlight: 0 }
     this.live.set(topicId, l)
     this.d.metrics.inc('sessions_opened')
     this.d.log.info('session.open', { topic: topicId, model: b.model, effort: effortFor(this.d.catalog, b) ?? null, resume: b.sessionId ?? null })
@@ -183,7 +191,7 @@ export class TopicManager {
     let l = this.ensureLive(topicId)
     if (!l) return false
     l.lastActive = this.now()
-    l.busy = true
+    l.inFlight++
     let payload = text
     if (!this.primed.has(topicId)) {
       this.primed.add(topicId)
@@ -198,7 +206,7 @@ export class TopicManager {
       const l2 = this.ensureLive(topicId)
       if (!l2) return false
       l = l2
-      l.busy = true
+      l.inFlight++
       l.session.send(payload)
     }
     this.d.metrics.inc('messages_in')
@@ -209,7 +217,7 @@ export class TopicManager {
   evictIdle(): void {
     const cutoff = this.now() - this.d.idleMinutes * 60_000
     for (const l of [...this.live.values()]) {
-      if (!l.busy && l.lastActive < cutoff) {
+      if (!isBusy(l) && l.lastActive < cutoff) {
         this.d.metrics.inc('sessions_evicted_idle')
         this.closeLive(l.topicId, 'idle')
       }
@@ -272,8 +280,8 @@ export class TopicManager {
               break
             case 'rateLimitHit': {
               this.d.metrics.inc('rate_limit_rejections')
-              // Baseline BEFORE the hand-off could flip it; the relay event has already
-              // been dispatched above in message order, so read the marker now.
+              // Baseline BEFORE the hand-off: interpret() orders the hit ahead of the
+              // relay for exactly this read, so the rotator has not been spawned yet.
               const activeBefore = this.d.rotator.active()
               const rot = this.d.rotator.enabled()
               const until = this.scheduleResume(topicId, ev.resetsAt)
@@ -289,7 +297,7 @@ export class TopicManager {
             }
             case 'turnEnd':
             case 'turnError':
-              l.busy = false
+              l.inFlight = Math.max(0, l.inFlight - 1)
               l.lastActive = this.now()
               this.d.metrics.inc('turns')
               if (ev.kind === 'turnError') this.d.metrics.inc('turn_errors')

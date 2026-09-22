@@ -24,10 +24,15 @@ export class Mailbox<T> implements AsyncIterable<T> {
     this.queue.push(item)
   }
 
-  /** Ends the iteration: a pending or future next() resolves done; pushes throw. */
+  /**
+   * Ends the iteration: a pending or future next() resolves done; pushes throw. Queued
+   * items are dropped too — a closing session must not drain prompts the user sent
+   * before the close, so they cannot start turns in a process that is being terminated.
+   */
   close(): void {
     if (this._closed) return
     this._closed = true
+    this.queue.length = 0
     if (this.waiter) {
       const w = this.waiter
       this.waiter = undefined
@@ -38,8 +43,8 @@ export class Mailbox<T> implements AsyncIterable<T> {
   [Symbol.asyncIterator](): AsyncIterator<T> {
     return {
       next: (): Promise<IteratorResult<T>> => {
-        if (this.queue.length) return Promise.resolve({ value: this.queue.shift() as T, done: false })
         if (this._closed) return Promise.resolve({ value: undefined as unknown as T, done: true })
+        if (this.queue.length) return Promise.resolve({ value: this.queue.shift() as T, done: false })
         return new Promise(resolve => {
           this.waiter = resolve
         })

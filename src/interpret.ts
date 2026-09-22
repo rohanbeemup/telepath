@@ -58,11 +58,14 @@ export function interpret(msg: any, st: PumpState, opts: InterpretOptions): Even
     }
     case 'rate_limit_event': {
       const info = msg.rate_limit_info ?? {}
-      out.push({ kind: 'limitRelay', raw: msg })
+      // The hit comes BEFORE the relay: the handler of the hit reads the rotator's
+      // `.active` marker as its baseline, and the relay spawns the rotator, which may
+      // flip that marker within milliseconds. Baseline first, then hand off.
       if (info.status === 'rejected' && !st.alerted) {
         st.alerted = true
         out.push({ kind: 'rateLimitHit', resetsAt: typeof info.resetsAt === 'number' ? info.resetsAt : undefined })
       }
+      out.push({ kind: 'limitRelay', raw: msg })
       return out
     }
     case 'result': {

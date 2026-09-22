@@ -79,6 +79,17 @@ what turned out false or true:
   prepended to the topic's first prompt (which was already the guaranteed channel) and the
   hook is gone rather than kept as decoration. The smoke now tests the channel the daemon
   actually uses.
+- **Found by Copilot's review of the first push (nine findings, all confirmed against the
+  code):** a `/attach` prefix bound the first of several matches; a registry that failed to
+  parse was overwritten with `{}` (my own boot-time "repair"); the unformatted fallback went
+  through the HTML-aware splitter, which reads `<…>` as tags; `use haiku` switched to a
+  package the config had disabled; an oversized feed burst was truncated at the tail; a
+  closed mailbox still drained queued prompts; the rotation baseline was read after the
+  hand-off had spawned the rotator (the same race fixed in PR #6, reintroduced by event
+  ordering); a boolean `busy` let a queued second turn be evicted as idle; and the 🗑 delete
+  prompt claimed permanence the operation does not have. Each has a case below or a
+  wording fix, and the SDK's peer dependency `@anthropic-ai/sdk >=0.93.0` was unmet by the
+  lockfile (0.81.0) and is now a direct dependency.
 - **Found by the same smoke: breaking out of `for await` on the stream ends the session.**
   Returning the SDK's generator closes the query. The daemon's pump never breaks; the smoke
   script now mirrors it with one reader per session.
@@ -129,12 +140,14 @@ binary's version against the minimum the current models need, and the bot's iden
 | `applies defaults for optional settings` | idle minutes, cap, model ids and log level take their documented defaults when unset | a required-everything config that a fresh clone cannot boot |
 | `keeps only enabled models it knows and never ends with none` | `ENABLED_MODELS=fable,unicorn` yields `[fable]`; an all-garbage list yields the fallback | an empty menu when the list is mistyped |
 | `falls back to the first enabled model when the default is disabled` | `DEFAULT_MODEL` pointing at a disabled package resolves to the first enabled one | booting with a default the menus cannot show |
+| `a known package that is not enabled is refused where a switch is requested` | `isEnabledModelKey` is false for a known key outside `ENABLED_MODELS`; the wizard, the panel, Settings and `use` all consult it | accepting any known key, so a disabled model a plan cannot reach is selectable |
 | `parses the five effort levels case-insensitively and nothing else` | `LOW`…`max` parse; `""`, `turbo`, `default` do not | a comparison that accepts any string |
 | `haiku accepts no effort level, the other packages accept all five` | `supportsEffort` is false for haiku and true for sonnet, opus, fable | sending an effort the model rejects |
 | `a binding on a model without effort levels runs without one but keeps its choice` | `effortFor` is undefined for a Haiku binding whose stored effort is `max`; the stored value survives a switch back | clearing the stored effort on a model switch |
 | `persists a cleared default effort as null so it survives a restart` | clearing the default writes an explicit null and reloading yields no effort even with `DEFAULT_EFFORT` set | `JSON.stringify` dropping the undefined key so the .env default returns on boot |
 | `an absent effort key falls back to the configured default` | a prefs file from before the field existed inherits `DEFAULT_EFFORT` | treating absence as a deliberate clear |
 | `drops a garbage effort value from an old prefs file` | `defaultEffort: "turbo"` on disk loads as undefined | trusting the file over the parser |
+| `refuses to start on a malformed registry instead of overwriting it` | a registry that does not parse throws `StateError` and the file is untouched; a missing file starts empty | treating "could not parse" as "empty" and saving `{}` over every binding |
 | `writes atomically through a temp file and rename` | after save the final file holds the new content and no temp file remains | writing in place, which a crash mid-write turns into a truncated registry |
 | `migrates bindings off a disabled model at load` | a binding on a model no longer enabled is moved to the default and the store is marked dirty | a topic that keeps failing on a model the plan cannot reach |
 | `emits one JSON line per event with ts, level, event and fields` | a log call produces parseable JSON carrying exactly those keys | free-form strings that nothing can filter or count |
@@ -153,11 +166,12 @@ binary's version against the minimum the current models need, and the bot's iden
 | `a message without tool calls yields no lines` | text-only and undefined content yield `[]` | a placeholder line for every message |
 | `describes a started background task and a settled one` | `task_started` with `is_backgrounded` and `task_notification` each yield one line carrying status and description | showing only completions, so a start is invisible |
 | `batches lines within the window into one message per topic` | lines added within the window leave as one message per topic, in order | one Telegram message per tool call, tripping the twenty-a-minute limit |
+| `splits an oversized batch into several sends instead of truncating it` | a burst larger than one message leaves as several bounded messages with every line, in order | slicing the joined batch at the cap and dropping the tail |
 | `fire sends what is waiting at once and drop discards it` | `fire` flushes immediately (before a close); `drop` discards without sending | a close that loses the last lines, or a wipe that posts into a deleted topic |
 | `assistant text becomes one say event` | text blocks in one message concatenate into a single say | one message per block |
 | `tool calls become feed lines and subagent calls are indented` | `parent_tool_use_id` set yields lines prefixed as subagent work | subagent internals indistinguishable from the main thread |
 | `captures the session id on the first assistant or result, never on init` | the id event fires once, only after a turn produced output | saving an id from `init` for a session closed before its first turn, which then fails every resume |
-| `a rejected rate limit yields one rate-limit event and later allowed events yield none` | status `rejected` → one event; `allowed`/`allowed_warning` → none | alerting on every status change |
+| `a rejected rate limit yields one rate-limit event and later allowed events yield none` | status `rejected` → one hit event ordered BEFORE the relay, so the rotation baseline is read before the hand-off spawns the rotator; `allowed`/`allowed_warning` → relay only | alerting on every status change, or relaying first and reading a baseline the rotator has already moved |
 | `resets the rate-limit alert at the end of the turn` | after a `result`, the next `rejected` alerts again | a flag that stays set and silences every later turn |
 | `a non-success result yields a turn-error event and success yields a quiet turn-end` | `error_during_execution` → error event with the subtype; `success` → turn-end only | a notice on every turn, or none on failures |
 | `a background task notice carries status and summary` | `task_notification` yields status and summary verbatim | dropping the summary the user needs to tell tasks apart |
@@ -166,10 +180,11 @@ binary's version against the minimum the current models need, and the bot's iden
 | `delivers pushed messages in order to a single consumer` | three pushes are read as three items in order | a Set or a map that reorders |
 | `waits for the next push instead of ending` | with the queue empty, `next()` stays pending until a push | returning `done` on an empty queue, which ends the session |
 | `ends the iteration when closed and rejects pushes after close` | `close()` resolves the pending `next()` as done; a later push throws | a push into a closed mailbox that is silently lost |
+| `drops queued items on close instead of draining them afterwards` | after `close()`, a previously pushed item is never yielded | checking the queue before the closed flag |
 | `wraps text as a user message with parent_tool_use_id null` | `userMessage(text)` has the exact shape the SDK types require | a message the CLI rejects as malformed |
 | `opens a session on first message and reuses it while live` | two messages open one backend session | a new process per message |
 | `evicts the least recently active session when the cap is reached and tells that topic` | the oldest topic is closed and notified; the new one opens | evicting the newest, or evicting silently |
-| `evicts idle sessions and leaves a session mid-turn alone` | idle past the limit closes; `pumping` protects a running turn | killing a turn in progress |
+| `evicts idle sessions and leaves a session mid-turn alone` | idle past the limit closes; a turn in flight protects the session, and a second message queued during a turn keeps it busy until its own result | a boolean that the first result clears while a queued turn still runs |
 | `a model or effort switch closes the live session so the next message resumes with the new options` | after the switch the backend sees a new open with the new model and effort | a live process that keeps the old model until eviction |
 | `resumes with the recorded session id and records it once produced` | `open` receives `resume` when the binding has an id; the id from the stream is stored | a resume that starts a blank session |
 | `schedules a resume nudge for a usable resetsAt and cancels it when the user takes over` | a future reset schedules; a user message cancels | a nudge that fires into a topic the user already continued |

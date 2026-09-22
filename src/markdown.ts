@@ -227,6 +227,27 @@ function safeCut(s: string, budget: number, window = 4096): number {
   return cut
 }
 
+/**
+ * Split UNRENDERED text into sends. The plain fallback (render deadline missed) must not
+ * go through chunkHtml: that splitter reads `<…>` as tags to balance and may strip them,
+ * so text that merely contains angle brackets would be mutated. Cut between lines where
+ * possible, else at whitespace, else hard; never change a character.
+ */
+export function chunkPlain(text: string, limit = 3500): string[] {
+  const out: string[] = []
+  let rest = text
+  while (rest.length > limit) {
+    let cut = rest.lastIndexOf('\n', limit)
+    if (cut < limit / 2) cut = rest.lastIndexOf(' ', limit)
+    if (cut < limit / 2) cut = limit
+    out.push(rest.slice(0, cut))
+    rest = rest.slice(cut)
+    if (rest.startsWith('\n') || rest.startsWith(' ')) rest = rest.slice(1)
+  }
+  if (rest) out.push(rest)
+  return out.filter(c => c.trim().length > 0)
+}
+
 export function chunkHtml(html: string, limit = 3500): string[] {
   if (!html) return []
   if (html.length <= limit) return [html]

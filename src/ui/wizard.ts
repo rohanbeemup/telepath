@@ -3,7 +3,7 @@
  * Pure transitions; the bot renders each step and feeds taps back in as actions, so
  * the order, the skipped step for Haiku and every refusal are tested without Telegram.
  */
-import { isModelKey, parseEffort, supportsEffort, type Catalog, type Effort } from '../models'
+import { isEnabledModelKey, isModelKey, parseEffort, supportsEffort, type Catalog, type Effort } from '../models'
 
 export type WizardState = {
   step: 'folder' | 'model' | 'effort' | 'auto'
@@ -39,7 +39,7 @@ export function wizardStep(s: WizardState, a: WizardAction, catalog: Catalog): W
     }
     case 'pickModel': {
       if (s.step !== 'model' && s.step !== 'effort' && s.step !== 'auto') return { state: s, refused: 'pick a folder first' }
-      if (!isModelKey(catalog, a.key)) return { state: s, refused: 'unknown model' }
+      if (!isEnabledModelKey(catalog, a.key)) return { state: s, refused: isModelKey(catalog, a.key) ? 'that model is not enabled' : 'unknown model' }
       const model = catalog.ids[a.key]
       return { state: { ...s, model, effort: undefined, step: supportsEffort(catalog, model) ? 'effort' : 'auto' } }
     }

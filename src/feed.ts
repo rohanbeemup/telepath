@@ -89,6 +89,23 @@ export function describeTask(status: 'started' | 'completed' | 'failed' | 'stopp
   }
 }
 
+/** Pack lines into messages of at most `max` characters, splitting only between lines. */
+export function packLines(lines: string[], max: number): string[] {
+  const out: string[] = []
+  let cur = ''
+  for (const raw of lines) {
+    const line = raw.length > max ? raw.slice(0, max - 1) + '…' : raw
+    if (!cur) cur = line
+    else if (cur.length + 1 + line.length <= max) cur += '\n' + line
+    else {
+      out.push(cur)
+      cur = line
+    }
+  }
+  if (cur) out.push(cur)
+  return out
+}
+
 /**
  * Batches feed lines per topic. A turn often fires several tools within a second and
  * Telegram allows a bot about twenty messages a minute per group, so lines wait a
@@ -120,7 +137,10 @@ export class FeedBatcher {
     if (!b) return
     clearTimeout(b.timer)
     this.buf.delete(topicId)
-    this.flush(topicId, b.lines.join('\n').slice(0, this.maxChars))
+    // A burst larger than one message becomes several, never a truncated one: the
+    // feed promises a line per tool call, and the tail of a burst is where the
+    // interesting call usually is.
+    for (const chunk of packLines(b.lines, this.maxChars)) this.flush(topicId, chunk)
   }
 
   drop(topicId: string): void {

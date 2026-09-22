@@ -32,6 +32,14 @@ Rewrite on the current Agent SDK, in tested modules, with observability.
   `allowedTools` is no longer passed. Found by the new Ring 2 smoke.
 - The outbox contract was also registered as a SessionStart hook that never ran under the
   SDK; the first-prompt priming (which did) is now the only channel.
+- From review: `/attach` and the sessions list refuse an ambiguous prefix instead of
+  binding the first match; a registry that does not parse stops the boot (exit 2) and is
+  never overwritten; the unformatted fallback is split as plain text; `use <key>` and the
+  panel refuse packages outside `ENABLED_MODELS`; an oversized feed burst is sent as
+  several messages; closing a session drops its queued prompts; the rotation baseline is
+  read before the rotator is spawned; a queued second turn keeps a session busy until its
+  own result; the 🗑 delete prompt no longer claims the transcript is gone. The SDK's peer
+  dependency `@anthropic-ai/sdk` is now pinned to a version it accepts.
 
 ### Added
 - Structured JSON-lines logging (`LOG_LEVEL`, `LOG_FORMAT`), per-process counters, a

@@ -56,6 +56,11 @@ describe('wizard', () => {
       expect(r.refused).toBeTruthy()
       expect(r.state).toEqual(r0.state)
     }
+    // a known package the config disabled is refused too: the menus never offered it
+    const partial = buildCatalog({ ...catalog, enabled: ['sonnet', 'opus'] })
+    const off = wizardStep(r0.state, { type: 'pickModel', key: 'haiku' }, partial)
+    expect(off.refused).toBeTruthy()
+    expect(off.state).toEqual(r0.state)
     // an out-of-range folder index is refused the same way
     const bad = wizardStep(startWizard(folders), { type: 'pickFolder', index: 9 }, catalog)
     expect(bad.refused).toBeTruthy()

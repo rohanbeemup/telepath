@@ -38,6 +38,14 @@ describe('Mailbox', () => {
     expect(() => m.push('x')).toThrow()
     expect(m.closed).toBe(true)
   })
+
+  test('drops queued items on close instead of draining them afterwards', async () => {
+    const m = new Mailbox<string>()
+    m.push('queued-before-close')
+    m.close()
+    const iter = m[Symbol.asyncIterator]()
+    expect((await iter.next()).done).toBe(true)
+  })
 })
 
 describe('userMessage', () => {

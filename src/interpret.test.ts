@@ -43,7 +43,8 @@ describe('interpret', () => {
     const rejected = { type: 'rate_limit_event', rate_limit_info: { status: 'rejected', resetsAt: 1790000000 } }
     const allowed = { type: 'rate_limit_event', rate_limit_info: { status: 'allowed' } }
     const warn = { type: 'rate_limit_event', rate_limit_info: { status: 'allowed_warning' } }
-    expect(kinds(interpret(rejected, st, feedOff))).toEqual(['limitRelay', 'rateLimitHit'])
+    // the hit precedes the relay, so its handler captures the rotator baseline before the hand-off can move it
+    expect(kinds(interpret(rejected, st, feedOff))).toEqual(['rateLimitHit', 'limitRelay'])
     expect(kinds(interpret(allowed, st, feedOff))).toEqual(['limitRelay'])
     expect(kinds(interpret(warn, st, feedOff))).toEqual(['limitRelay'])
   })
@@ -60,7 +61,7 @@ describe('interpret', () => {
     const rejected = { type: 'rate_limit_event', rate_limit_info: { status: 'rejected' } }
     interpret(rejected, st, feedOff)
     interpret({ type: 'result', subtype: 'success', is_error: false, session_id: 's1' }, st, feedOff)
-    expect(kinds(interpret(rejected, st, feedOff))).toEqual(['limitRelay', 'rateLimitHit'])
+    expect(kinds(interpret(rejected, st, feedOff))).toEqual(['rateLimitHit', 'limitRelay'])
   })
 
   test('a non-success result yields a turn-error event and success yields a quiet turn-end', () => {

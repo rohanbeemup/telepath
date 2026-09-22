@@ -3,7 +3,7 @@
  * Settings menu edits). Both are written atomically through a temp file and a rename,
  * so a crash mid-write cannot leave a truncated file behind.
  */
-import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'fs'
+import { mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'fs'
 import { join } from 'path'
 import { parseEffort, type Catalog, type Effort } from './models'
 
@@ -36,11 +36,28 @@ function writeAtomic(file: string, data: unknown): void {
   renameSync(tmp, file)
 }
 
+export class StateError extends Error {
+  constructor(
+    readonly file: string,
+    detail: string,
+  ) {
+    super(`${file} is not valid JSON (${detail}). Refusing to start rather than overwrite it: fix or move the file, then start again.`)
+    this.name = 'StateError'
+  }
+}
+
+/** Missing file → undefined. A file that exists but does not parse is an error, never "empty". */
 function readJson(file: string): unknown {
+  let text: string
   try {
-    return JSON.parse(readFileSync(file, 'utf8'))
+    text = readFileSync(file, 'utf8')
   } catch {
     return undefined
+  }
+  try {
+    return JSON.parse(text)
+  } catch (e) {
+    throw new StateError(file, e instanceof Error ? e.message : String(e))
   }
 }
 
@@ -114,6 +131,6 @@ export function loadStore(dir: string, defaults: StoreDefaults, catalog: Catalog
   }
 
   const store = new Store(dir, registry, prefs, defaults)
-  if (migrated || (existsSync(join(dir, 'registry.json')) && rawRegistry === undefined)) store.saveRegistry()
+  if (migrated) store.saveRegistry()
   return store
 }

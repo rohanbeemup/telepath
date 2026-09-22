@@ -13,8 +13,8 @@ import { FeedBatcher, describeTask } from './feed'
 import { deleteTranscript, isImage, listRepoFolders, type Files } from './files'
 import type { Event } from './interpret'
 import type { Logger, Metrics } from './log'
-import { htmlEsc, htmlToPlain, renderWithDeadline, chunkHtml } from './markdown'
-import { isModelKey, modelLabel, parseEffort, supportsEffort, type Effort } from './models'
+import { htmlEsc, htmlToPlain, renderWithDeadline, chunkHtml, chunkPlain } from './markdown'
+import { isEnabledModelKey, modelLabel, parseEffort, supportsEffort, MODEL_MENU, type Effort } from './models'
 import { listSessions } from './session'
 import { feedOn, type Binding, type Store } from './state'
 import type { SessionExtras, TopicManager } from './topics'
@@ -84,7 +84,9 @@ export class TelegramBot {
     const opts = topicId ? { message_thread_id: Number(topicId) } : {}
     const html = await renderWithDeadline(text, 1500)
     if (html === undefined) this.d.metrics.inc('render_degraded')
-    for (const part of chunkHtml(html ?? text, 3500)) {
+    // Rendered output is split HTML-aware; the unformatted fallback is split as plain
+    // text, because the HTML splitter would read its angle brackets as tags.
+    for (const part of html !== undefined ? chunkHtml(html, 3500) : chunkPlain(text, 3500)) {
       if (html) {
         try {
           await this.bot.api.sendMessage(this.d.cfg.forumChatId, part, { ...opts, parse_mode: 'HTML' })
@@ -376,17 +378,25 @@ export class TelegramBot {
   }
 
   private async attach(shortId: string, name: string | undefined, fromTopic: string | undefined): Promise<string | undefined> {
-    let match
+    let matches
     try {
-      match = (await listSessions()).find(s => s.sessionId.startsWith(shortId))
+      matches = (await listSessions()).filter(s => s.sessionId.startsWith(shortId))
     } catch (e) {
       await this.say(fromTopic, `listSessions failed: ${e}`)
       return
     }
-    if (!match) {
+    if (matches.length === 0) {
       await this.say(fromTopic, `No session starting with \`${shortId}\`.`)
       return
     }
+    if (matches.length > 1) {
+      // A prefix that fits several sessions must not bind the first one it happens to
+      // meet: that would open (and expose) the wrong transcript. Ask for more characters.
+      const list = matches.slice(0, 6).map(s => `• ${s.sessionId.slice(0, 12)}… ${(s.summary || s.firstPrompt || '').replace(/\s+/g, ' ').slice(0, 40)}`).join('\n')
+      await this.say(fromTopic, `\`${shortId}\` matches ${matches.length} sessions — use more characters:\n${list}`)
+      return
+    }
+    const match = matches[0]
     const title = name || (match.summary || shortId).slice(0, 40)
     let topicId: string
     try {
@@ -530,7 +540,7 @@ export class TelegramBot {
 
     // Settings
     const sdm = /^m:sdm:(\w+)$/.exec(data)
-    if (sdm && isModelKey(catalog, sdm[1])) {
+    if (sdm && isEnabledModelKey(catalog, sdm[1])) {
       store.prefs.defaultModel = catalog.ids[sdm[1]]
       store.savePrefs()
       await ack(`Default: ${sdm[1]}`)
@@ -605,7 +615,7 @@ export class TelegramBot {
     if (!topicId) return void ack()
     const b = store.registry[topicId]
     const tm = /^m:tm:(\w+)$/.exec(data)
-    if (tm && isModelKey(catalog, tm[1])) {
+    if (tm && isEnabledModelKey(catalog, tm[1])) {
       if (!b) return void ack('No session here')
       b.model = catalog.ids[tm[1]]
       store.saveRegistry()
@@ -657,7 +667,11 @@ export class TelegramBot {
     }
     if (data === 'm:tdelete') {
       await ack()
-      return this.paint(topicId, '🗑 Delete this topic and its session permanently?\nThis cannot be undone.', new InlineKeyboard().text('🗑 Yes, delete', 'm:tdelyes').text('↩️ Cancel', 'm:ctl'))
+      return this.paint(
+        topicId,
+        '🗑 Delete this topic and forget its session here?\nThe transcript stays on disk and can be reopened later from 📋 My sessions or /attach. To remove everything, use 🧹 instead.',
+        new InlineKeyboard().text('🗑 Yes, delete', 'm:tdelyes').text('↩️ Cancel', 'm:ctl'),
+      )
     }
     if (data === 'm:tdelyes') {
       this.removeTopic(topicId, false)
@@ -750,6 +764,10 @@ export class TelegramBot {
     if (typed.kind === 'use' || typed.kind === 'effort' || typed.kind === 'feed') {
       if (!b) return void this.say(topicId, 'No session bound here.')
       if (typed.kind === 'use') {
+        const label = MODEL_MENU[typed.model].short
+        if (!isEnabledModelKey(this.d.cfg.catalog, typed.model)) {
+          return void this.say(topicId, `${label} is not enabled on this install (ENABLED_MODELS=${this.d.cfg.catalog.enabled.join(',')}).`)
+        }
         b.model = this.d.cfg.catalog.ids[typed.model]
         if (typed.effort) b.effort = typed.effort
         this.d.store.saveRegistry()

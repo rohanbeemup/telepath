@@ -52,6 +52,11 @@ export function isModelKey(c: Catalog, k: string): k is ModelKey {
   return (MODEL_KEYS as readonly string[]).includes(k) && Object.hasOwn(c.ids, k)
 }
 
+/** A key the menus offer. A known-but-disabled package is refused: the plan cannot reach it. */
+export function isEnabledModelKey(c: Catalog, k: string): k is ModelKey {
+  return isModelKey(c, k) && c.enabled.includes(k)
+}
+
 export function modelKeyOf(c: Catalog, modelId: string): ModelKey | undefined {
   return MODEL_KEYS.find(k => c.ids[k] === modelId)
 }

@@ -140,6 +140,21 @@ describe('TopicManager', () => {
     h.tm.evictIdle()
     expect(h.tm.isLive('idle')).toBe(false)
     expect(h.tm.isLive('busy')).toBe(true)
+
+    // two messages queued: the first result does not make the session idle
+    h.bind('queued')
+    await h.tm.sendToTopic('queued', 'first')
+    await h.tm.sendToTopic('queued', 'second')
+    h.backend.last().emit(result())
+    await h.tick()
+    t += 5 * 60_000
+    h.tm.evictIdle()
+    expect(h.tm.isLive('queued')).toBe(true)
+    h.backend.last().emit(result())
+    await h.tick()
+    t += 5 * 60_000
+    h.tm.evictIdle()
+    expect(h.tm.isLive('queued')).toBe(false)
   })
 
   test('a model or effort switch closes the live session so the next message resumes with the new options', async () => {

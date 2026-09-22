@@ -2,7 +2,7 @@ import { test, expect, describe, beforeEach, afterEach } from 'bun:test'
 import { mkdtempSync, rmSync, readdirSync, readFileSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import { loadStore } from './state'
+import { loadStore, StateError } from './state'
 import { buildCatalog } from './models'
 
 const catalog = buildCatalog({
@@ -48,6 +48,17 @@ describe('registry', () => {
     s.saveRegistry()
     expect(JSON.parse(readFileSync(join(dir, 'registry.json'), 'utf8'))['1'].title).toBe('t')
     expect(readdirSync(dir).filter(n => n.endsWith('.tmp'))).toEqual([])
+  })
+
+  test('refuses to start on a malformed registry instead of overwriting it', () => {
+    const file = join(dir, 'registry.json')
+    writeFileSync(file, '{"1": {"cwd": "/w", "model": "claude-opus-5", "title": "a", "lastActive": 1')
+    expect(() => loadStore(dir, defaults, catalog)).toThrow(StateError)
+    // the file is untouched, so the bindings can still be repaired by hand
+    expect(readFileSync(file, 'utf8')).toContain('"title": "a"')
+    // a missing file is not an error: a fresh install starts empty
+    rmSync(file)
+    expect(Object.keys(loadStore(dir, defaults, catalog).registry)).toEqual([])
   })
 
   test('migrates bindings off a disabled model at load', () => {

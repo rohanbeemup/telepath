@@ -1,5 +1,5 @@
 import { test, expect, describe } from 'bun:test'
-import { summarizeToolUse, feedLines, describeTask, FeedBatcher } from './feed'
+import { summarizeToolUse, feedLines, describeTask, FeedBatcher, packLines } from './feed'
 
 describe('describeTask', () => {
   test('describes a started background task and a settled one', () => {
@@ -21,6 +21,18 @@ describe('FeedBatcher', () => {
     fb.add('1', []) // nothing to add, nothing scheduled twice
     await new Promise(r => setTimeout(r, 60))
     expect(sent).toEqual([['1', 'a\nb\nc'], ['2', 'x']])
+  })
+
+  test('splits an oversized batch into several sends instead of truncating it', () => {
+    const sent: string[] = []
+    const fb = new FeedBatcher((_t, text) => void sent.push(text), 10_000, 50)
+    const lines = Array.from({ length: 12 }, (_, i) => `line-${i}-${'x'.repeat(10)}`)
+    fb.add('1', lines)
+    fb.fire('1')
+    expect(sent.length).toBeGreaterThan(1)
+    for (const s of sent) expect(s.length).toBeLessThanOrEqual(50)
+    expect(sent.join('\n').split('\n')).toEqual(lines) // every line arrives, in order
+    expect(packLines(['a'.repeat(80)], 50)[0].length).toBe(50) // a single over-long line is capped, not dropped
   })
 
   test('fire sends what is waiting at once and drop discards it', async () => {

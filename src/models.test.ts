@@ -1,5 +1,5 @@
 import { test, expect, describe } from 'bun:test'
-import { parseEffort, supportsEffort, effortFor, isModelKey, buildCatalog, EFFORT_LEVELS } from './models'
+import { parseEffort, supportsEffort, effortFor, isModelKey, isEnabledModelKey, buildCatalog, EFFORT_LEVELS } from './models'
 
 const catalog = buildCatalog({
   ids: { haiku: 'claude-haiku-4-5', sonnet: 'claude-sonnet-5', opus: 'claude-opus-5', fable: 'claude-fable-5-1' },
@@ -32,5 +32,13 @@ describe('model keys', () => {
     for (const k of ['constructor', '__proto__', 'toString', 'hasOwnProperty']) expect(isModelKey(catalog, k)).toBe(false)
     expect(isModelKey(catalog, 'fable')).toBe(true)
     expect(isModelKey(catalog, 'FABLE')).toBe(false)
+  })
+
+  test('a known package that is not enabled is refused where a switch is requested', () => {
+    const partial = buildCatalog({ ...catalog, enabled: ['sonnet', 'opus'] })
+    expect(isEnabledModelKey(partial, 'opus')).toBe(true)
+    expect(isEnabledModelKey(partial, 'haiku')).toBe(false)
+    expect(isEnabledModelKey(partial, 'constructor')).toBe(false)
+    expect(isModelKey(partial, 'haiku')).toBe(true) // still a known key, so the message can name it
   })
 })

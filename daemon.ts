@@ -23,8 +23,8 @@ import { ErrorRing, Logger, Metrics } from './src/log'
 import { bundledClaudePath, checkClaudeVersion, MIN_CLAUDE_VERSION, readClaudeVersion } from './src/preflight'
 import { handOffToRotator, rotatorActive, rotatorEnabled, waitForRotation } from './src/rotator'
 import { SdkBackend } from './src/session'
-import { loadStore } from './src/state'
-import { TopicManager } from './src/topics'
+import { loadStore, StateError } from './src/state'
+import { TopicManager, isBusy } from './src/topics'
 
 const VERSION = (JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')) as { version: string }).version
 const SDK_VERSION = (JSON.parse(readFileSync(new URL('./node_modules/@anthropic-ai/claude-agent-sdk/package.json', import.meta.url), 'utf8')) as { version: string }).version
@@ -64,7 +64,17 @@ process.on('uncaughtException', e => {
 })
 
 // ── state ───────────────────────────────────────────────────────────────────
-const store = loadStore(stateDir, { defaultModel: cfg.defaultModel, defaultCwd: cfg.defaultCwd, defaultEffort: cfg.defaultEffort }, cfg.catalog)
+let store: ReturnType<typeof loadStore>
+try {
+  store = loadStore(stateDir, { defaultModel: cfg.defaultModel, defaultCwd: cfg.defaultCwd, defaultEffort: cfg.defaultEffort }, cfg.catalog)
+} catch (e) {
+  if (e instanceof StateError) {
+    // A registry that does not parse is preserved, never replaced: exit and say so.
+    log.error('state.unreadable', { file: e.file, message: e.message })
+    process.exit(2)
+  }
+  throw e
+}
 const files = new Files(stateDir)
 
 // ── preflight ───────────────────────────────────────────────────────────────
@@ -82,7 +92,7 @@ const CHILD_ENV: Record<string, string | undefined> = { ...process.env }
 function statusText(): string {
   const up = Math.round((Date.now() - STARTED) / 60000)
   const snap = metrics.snapshot()
-  const liveList = [...topics.live.values()].map(l => `• ${store.registry[l.topicId]?.title ?? l.topicId} — ${l.model}${l.busy ? ' (running)' : ''}`)
+  const liveList = [...topics.live.values()].map(l => `• ${store.registry[l.topicId]?.title ?? l.topicId} — ${l.model}${isBusy(l) ? ` (running, ${l.inFlight} in flight)` : ''}`)
   const errors = ring.list().slice(-5).map(e => `• ${new Date(e.at).toISOString().slice(11, 19)} ${e.ev}${e.message ? `: ${e.message.slice(0, 120)}` : ''}`)
   const counters = Object.entries(snap).map(([k, v]) => `${k}=${v}`).join('  ')
   return (
