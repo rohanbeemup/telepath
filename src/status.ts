@@ -35,8 +35,11 @@ export type TurnState = {
   /** Turns in flight: 1 = the one running; more = queued behind it. */
   inFlight: number
   frame: number
-  /** Set while a rate limit holds the turn: replaces the spinner line. */
-  waiting: string | undefined
+  /** A rate limit holds the turn: replaces the spinner line. The note (reset time) is optional. */
+  waiting: boolean
+  waitNote: string | undefined
+  /** The most severe outcome seen so far across the queued turns this status spans. */
+  worst: 'ok' | 'limited' | 'error'
 }
 
 type Active = TurnState & {
@@ -80,7 +83,7 @@ function plural(n: number, one: string, many = one + 's'): string {
 /** The live text. Pure, capped to one Telegram message. */
 export function renderStatus(st: TurnState, elapsedMs: number, opts: { showItems?: boolean; maxChars?: number } = {}): string {
   const head = st.waiting
-    ? `⏸ Rate limit hit · ${st.waiting} · ${fmtElapsed(elapsedMs)}`
+    ? `⏸ Rate limit hit${st.waitNote ? ` · ${st.waitNote}` : ''} · ${fmtElapsed(elapsedMs)}`
     : `${FRAMES[st.frame % FRAMES.length]} Working · ${fmtElapsed(elapsedMs)}` +
       (st.toolCalls ? ` · ${plural(st.toolCalls, 'tool call')}` : '') +
       (st.inFlight > 1 ? ` · ${plural(st.inFlight - 1, 'message')} queued` : '')
@@ -96,7 +99,7 @@ export type Outcome = 'ok' | 'error' | 'stopped' | 'limited'
 /** The closing line. */
 export function renderSummary(st: TurnState, elapsedMs: number, outcome: Outcome): string {
   const icon =
-    outcome === 'ok' ? '✅ Done' : outcome === 'error' ? '⚠️ Ended with an error' : outcome === 'limited' ? `⏸ Rate limit hit${st.waiting ? ` · ${st.waiting}` : ''}` : '⏹ Stopped'
+    outcome === 'ok' ? '✅ Done' : outcome === 'error' ? '⚠️ Ended with an error' : outcome === 'limited' ? `⏸ Rate limit hit${st.waitNote ? ` · ${st.waitNote}` : ''}` : '⏹ Stopped'
   const edits = new Set(st.items.filter(i => i.kind === 'edit').map(i => i.label)).size
   const parts = [icon, fmtElapsed(elapsedMs)]
   if (st.toolCalls) parts.push(plural(st.toolCalls, 'tool call'))
@@ -104,8 +107,11 @@ export function renderSummary(st: TurnState, elapsedMs: number, outcome: Outcome
   return parts.join(' · ')
 }
 
+type Closing = { topicId: string; messageId: number; text: string; nextAt: number; attempts: number }
+
 export class TurnStatus {
   private readonly active = new Map<string, Active>()
+  private readonly closing = new Map<number, Closing>()
   private readonly now: () => number
   private readonly editEveryMs: number
   private readonly firstEditAfterMs: number
@@ -144,7 +150,9 @@ export class TurnStatus {
       toolCalls: 0,
       inFlight,
       frame: 0,
-      waiting: undefined,
+      waiting: false,
+      waitNote: undefined,
+      worst: 'ok',
       messageId: undefined,
       creating: undefined,
       lastText: '',
@@ -185,12 +193,27 @@ export class TurnStatus {
 
   waiting(topicId: string, note: string | undefined): void {
     const a = this.active.get(topicId)
-    if (a) a.waiting = note
+    if (!a) return
+    a.waiting = true
+    a.waitNote = note
+  }
+
+  /**
+   * One status spans every turn queued behind the first. A turn that ended in an error
+   * or a rate limit is recorded here so a later successful turn cannot summarize the
+   * whole run as done.
+   */
+  noteOutcome(topicId: string, outcome: 'ok' | 'error' | 'limited'): void {
+    const a = this.active.get(topicId)
+    if (!a) return
+    const rank = { ok: 0, limited: 1, error: 2 }
+    if (rank[outcome] > rank[a.worst]) a.worst = outcome
   }
 
   /** Drive from a 1 s interval: typing while in flight, an edit when due and changed. */
   async tick(): Promise<void> {
     const now = this.now()
+    for (const c of [...this.closing.values()]) if (now >= c.nextAt) await this.tryClose(c)
     for (const a of [...this.active.values()]) {
       if (now - a.lastTypingAt >= this.typingEveryMs) {
         a.lastTypingAt = now
@@ -216,7 +239,11 @@ export class TurnStatus {
     }
   }
 
-  /** The turn ended: a one-line summary, or nothing for a short quiet turn. */
+  /**
+   * The turn ended: a one-line summary, or nothing for a short quiet turn. The summary
+   * edit is retried from tick() when Telegram answers 429, so a status never stays on
+   * "Working" because the last edit was throttled.
+   */
   async finish(topicId: string, outcome: Outcome): Promise<void> {
     const a = this.active.get(topicId)
     if (!a) return
@@ -224,12 +251,31 @@ export class TurnStatus {
     if (a.creating) await a.creating.catch(() => {})
     if (a.messageId === undefined) return
     const elapsed = this.now() - a.startedAt
-    if (outcome === 'ok' && elapsed < this.minKeepMs && a.toolCalls === 0) {
+    // A later turn's success does not erase an earlier turn's failure in the same run.
+    const final: Outcome = outcome === 'stopped' ? 'stopped' : ({ ok: 0, limited: 1, error: 2 }[outcome] >= { ok: 0, limited: 1, error: 2 }[a.worst] ? outcome : a.worst)
+    if (final === 'ok' && elapsed < this.minKeepMs && a.toolCalls === 0) {
       await this.transport.remove(topicId, a.messageId).catch(() => {})
       return
     }
     if (a.editsDisabled) return
-    await this.transport.edit(topicId, a.messageId, renderSummary(a, elapsed, outcome)).catch(() => {})
+    const closing: Closing = { topicId, messageId: a.messageId, text: renderSummary(a, elapsed, final), nextAt: this.now(), attempts: 0 }
+    await this.tryClose(closing)
+  }
+
+  private async tryClose(c: Closing): Promise<void> {
+    c.attempts++
+    const r = await this.transport.edit(c.topicId, c.messageId, c.text).catch(() => ({ ok: false }) as { ok: boolean; retryAfterMs?: number; gone?: boolean })
+    if (r.ok || r.gone || c.attempts >= 10) {
+      this.closing.delete(c.messageId)
+      return
+    }
+    c.nextAt = this.now() + (r.retryAfterMs ?? 5_000) + 500
+    this.closing.set(c.messageId, c)
+  }
+
+  /** Summaries still waiting for their edit to land (a 429 on the final edit). */
+  pendingClosings(): number {
+    return this.closing.size
   }
 
   /** The topic is gone (deleted/wiped): drop the message and forget the turn. */

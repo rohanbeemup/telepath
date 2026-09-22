@@ -268,6 +268,26 @@ describe('TopicManager', () => {
     expect(turns().some(t => t.phase === 'waiting')).toBe(true)
   })
 
+  test('a stale pump does not report idle once a replacement session is live', async () => {
+    const h = harness()
+    h.bind('1')
+    await h.tm.sendToTopic('1', 'x')
+    const old = h.backend.sessions[0]
+    // model switch: close, then the next message opens a replacement before the old
+    // pump's stream has finished unwinding
+    h.tm.closeLive('1', 'model switch')
+    await h.tm.sendToTopic('1', 'y')
+    expect(h.backend.opens.length).toBe(2)
+    old.inbox.close() // the old stream now ends
+    await h.tick()
+    const idles = h.events.filter(([t, ev]) => t === '1' && ev.kind === 'state' && ev.state === 'idle')
+    expect(idles.length).toBe(0)
+    // when the replacement itself ends and nothing is live, idle IS reported
+    h.backend.last().inbox.close()
+    await h.tick()
+    expect(h.events.filter(([t, ev]) => t === '1' && ev.kind === 'state' && ev.state === 'idle').length).toBe(1)
+  })
+
   test('never leaks the bot token into a session environment', async () => {
     const h = harness()
     h.bind('1')

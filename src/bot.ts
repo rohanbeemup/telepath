@@ -209,8 +209,11 @@ export class TelegramBot {
       case 'turn':
         if (ev.phase === 'start') this.status.begin(topicId, ev.inFlight, b ? feedOn(b) : false)
         else if (ev.phase === 'waiting') this.status.waiting(topicId, ev.note)
-        else if (ev.inFlight > 0) this.status.setInFlight(topicId, ev.inFlight)
-        else await this.status.finish(topicId, ev.outcome)
+        else if (ev.inFlight > 0) {
+          // more turns queued behind this one: remember how it went, keep the status open
+          this.status.noteOutcome(topicId, ev.outcome)
+          this.status.setInFlight(topicId, ev.inFlight)
+        } else await this.status.finish(topicId, ev.outcome)
         return
       case 'turnEnd':
         await this.flushOutbox(topicId)

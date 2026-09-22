@@ -55,15 +55,18 @@ describe('renderStatus', () => {
       toolCalls: 4,
       inFlight: 2,
       frame: 0,
-      waiting: undefined,
+      waiting: false,
+      waitNote: undefined,
+      worst: 'ok',
     }
     const text = renderStatus(st, 192_000)
     expect(text.split('\n')[0]).toBe('⏳ Working · 3:12 · 4 tool calls · 1 message queued')
     expect(text).toContain('🖥 Typecheck and run the unit tests')
     expect(text).toContain('✏️ edited 2 files: a.ts, b.ts')
     expect(text).toContain('📖 1 read')
-    // a rate-limit wait replaces the spinner line
-    expect(renderStatus({ ...st, waiting: 'resets at 07:10' }, 192_000).split('\n')[0]).toBe('⏸ Rate limit hit · resets at 07:10 · 3:12')
+    // a rate-limit wait replaces the spinner line, with or without a known reset time
+    expect(renderStatus({ ...st, waiting: true, waitNote: 'resets at 07:10' }, 192_000).split('\n')[0]).toBe('⏸ Rate limit hit · resets at 07:10 · 3:12')
+    expect(renderStatus({ ...st, waiting: true, waitNote: undefined }, 192_000).split('\n')[0]).toBe('⏸ Rate limit hit · 3:12')
     // the render never exceeds a Telegram message
     const huge: TurnState = { ...st, items: Array.from({ length: 500 }, (_, i) => ({ kind: 'command' as const, label: `c${i} ${'x'.repeat(150)}` })) }
     expect(renderStatus(huge, 1000).length).toBeLessThanOrEqual(3500)
@@ -172,6 +175,43 @@ describe('TurnStatus', () => {
     expect(h.t.edits[0][2].startsWith('⏸ Rate limit hit · resets at 07:10')).toBe(true)
     await h.s.finish('7', 'limited')
     expect(h.t.edits[h.t.edits.length - 1][2]).toBe('⏸ Rate limit hit · resets at 07:10 · 0:04')
+  })
+
+  test('an earlier failure in a queued run is not summarized as done', async () => {
+    const h = harness()
+    h.s.begin('7', 2)
+    await h.settle()
+    h.s.addItems('7', [{ kind: 'command', label: 'x' }])
+    h.s.noteOutcome('7', 'error') // the first queued turn failed
+    h.s.setInFlight('7', 1)
+    await h.advance(10_000)
+    await h.s.finish('7', 'ok') // the second succeeded
+    expect(h.t.edits[h.t.edits.length - 1][2].startsWith('⚠️ Ended with an error')).toBe(true)
+    // a rate-limited first turn is likewise kept, and an explicit stop still reads stopped
+    h.s.begin('8', 2)
+    await h.settle()
+    h.s.addItems('8', [{ kind: 'command', label: 'x' }])
+    h.s.noteOutcome('8', 'limited')
+    await h.advance(10_000)
+    await h.s.finish('8', 'ok')
+    expect(h.t.edits[h.t.edits.length - 1][2].startsWith('⏸ Rate limit hit')).toBe(true)
+  })
+
+  test('the closing summary is retried after a 429 until it lands', async () => {
+    const h = harness()
+    h.s.begin('7', 1)
+    await h.settle()
+    h.s.addItems('7', [{ kind: 'command', label: 'x' }])
+    await h.advance(10_000)
+    h.t.failEditWith = 20_000 // the final edit is throttled
+    await h.s.finish('7', 'ok')
+    expect(h.t.edits.some(e => e[2].startsWith('✅ Done'))).toBe(false)
+    expect(h.s.pendingClosings()).toBe(1)
+    await h.advance(10_000) // inside the retry window: no attempt
+    expect(h.s.pendingClosings()).toBe(1)
+    await h.advance(11_000) // past it: the summary lands and the closing is forgotten
+    expect(h.t.edits[h.t.edits.length - 1][2]).toBe('✅ Done · 0:10 · 1 tool call')
+    expect(h.s.pendingClosings()).toBe(0)
   })
 
   test('queued messages are counted while a turn runs and the count falls as results arrive', async () => {

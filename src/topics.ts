@@ -9,7 +9,6 @@ import { interpret, newPumpState, type Event } from './interpret'
 import type { Effort } from './models'
 import { effortFor, type Catalog } from './models'
 import type { Store } from './state'
-import { feedOn } from './state'
 import type { Logger, Metrics } from './log'
 
 export type SessionExtras = {
@@ -265,7 +264,7 @@ export class TopicManager {
     try {
       for await (const msg of l.session.stream()) {
         const b = this.d.store.registry[topicId]
-        for (const ev of interpret(msg, st, { feed: b ? feedOn(b) : false })) {
+        for (const ev of interpret(msg, st)) {
           switch (ev.kind) {
             case 'sessionId': {
               if (b && !b.sessionId) {
@@ -330,7 +329,10 @@ export class TopicManager {
         this.live.delete(topicId)
         this.d.log.info('session.ended', { topic: topicId })
       }
-      await this.d.onEvent(topicId, { kind: 'state', state: 'idle' })
+      // Report idle only when the topic has no live session now. After a model switch the
+      // old pump unwinds while the replacement is already running; an unconditional idle
+      // here would close the replacement's fresh status as "stopped".
+      if (!this.live.has(topicId)) await this.d.onEvent(topicId, { kind: 'state', state: 'idle' })
     }
   }
 }

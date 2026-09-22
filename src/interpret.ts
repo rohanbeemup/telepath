@@ -36,9 +36,12 @@ export function newPumpState(sessionId: string | undefined): PumpState {
   return { sessionId, alerted: false }
 }
 
-export type InterpretOptions = { feed: boolean }
-
-export function interpret(msg: any, st: PumpState, opts: InterpretOptions): Event[] {
+/**
+ * Tool-call items are always emitted: the status message counts them and decides from
+ * them whether a turn was "quiet"; whether they are DISPLAYED is the feed toggle, applied
+ * where the status is rendered.
+ */
+export function interpret(msg: any, st: PumpState): Event[] {
   const out: Event[] = []
   if (!msg || typeof msg !== 'object') return out
 
@@ -58,10 +61,8 @@ export function interpret(msg: any, st: PumpState, opts: InterpretOptions): Even
         ? content.filter((b: any) => b?.type === 'text').map((b: any) => String(b.text ?? '')).join('').trim()
         : ''
       if (text) out.push({ kind: 'say', text })
-      if (opts.feed) {
-        const items = feedItems(content, !!msg.parent_tool_use_id)
-        if (items.length) out.push({ kind: 'feed', items })
-      }
+      const items = feedItems(content, !!msg.parent_tool_use_id)
+      if (items.length) out.push({ kind: 'feed', items })
       return out
     }
     case 'rate_limit_event': {

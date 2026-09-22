@@ -110,6 +110,13 @@ what turned out false or true:
   status are redacted for well-known secret shapes, because the message is edited and
   stays visible. The core is transport-agnostic (create/edit/remove/type), the same three
   calls Slack and Discord offer.
+- **Found by Copilot's review of the status push (five findings, all confirmed):** an old
+  pump's unconditional `idle` closed a replacement session's fresh status as "stopped"
+  after a model switch; a status spanning queued turns summarized an early failure as
+  "Done" when the last turn succeeded; feed-off turns produced no items, so the status
+  counted zero tool calls and could delete a busy turn's message as "quiet"; a rejection
+  without a reset time never showed the paused header; and a 429 on the final summary edit
+  left "Working" behind forever. Each has a case below.
 - **Found by the same smoke: breaking out of `for await` on the stream ends the session.**
   Returning the SDK's generator closes the query. The daemon's pump never breaks; the smoke
   script now mirrors it with one reader per session.
@@ -190,7 +197,7 @@ binary's version against the minimum the current models need, and the bot's iden
 | `a message without tool calls yields no items` | text-only and undefined content yield `[]` | a placeholder item for every message |
 | `describes a started background task and a settled one` | `task_started` with `is_backgrounded` and `task_notification` each yield one line carrying status and description | showing only completions, so a start is invisible |
 | `assistant text becomes one say event` | text blocks in one message concatenate into a single say | one message per block |
-| `tool calls become feed items and subagent calls are marked` | `parent_tool_use_id` set yields items flagged `sub`, rendered with ↳ | subagent internals indistinguishable from the main thread |
+| `tool calls become feed items and subagent calls are marked` | items are emitted for every tool call whatever the display toggle; `parent_tool_use_id` set yields items flagged `sub`, rendered with ↳ | gating the items on the toggle, so a feed-off turn counts zero tool calls and its status is deleted as quiet |
 | `captures the session id on the first assistant or result, never on init` | the id event fires once, only after a turn produced output | saving an id from `init` for a session closed before its first turn, which then fails every resume |
 | `a rejected rate limit yields one rate-limit event and later allowed events yield none` | status `rejected` → one hit event ordered BEFORE the relay, so the rotation baseline is read before the hand-off spawns the rotator; `allowed`/`allowed_warning` → relay only | alerting on every status change, or relaying first and reading a baseline the rotator has already moved |
 | `resets the rate-limit alert at the end of the turn` | after a `result`, the next `rejected` alerts again | a flag that stays set and silences every later turn |
@@ -211,6 +218,7 @@ binary's version against the minimum the current models need, and the bot's iden
 | `schedules a resume nudge for a usable resetsAt and cancels it when the user takes over` | a future reset schedules; a user message cancels | a nudge that fires into a topic the user already continued |
 | `a rotation with the topic untouched closes the session and continues` | with no takeover, the session closes and a continuation is sent | waiting out a reset the rotator already solved |
 | `a stale rate-limit alert does not suppress the next turn's error notice` | an error in the turn after a rejection is reported | a per-session flag that never resets |
+| `a stale pump does not report idle once a replacement session is live` | an old stream ending while a replacement runs emits no idle; the replacement's own end does | closing the new session's status as stopped from the old pump's finally |
 | `emits turn start and end with the number of turns in flight` | `turn/start` per send with the count, `turn/end` per result with the count after decrement and the outcome, `turn/waiting` on a rejection | a status that cannot tell one running turn from three queued ones |
 | `pinned controls show only enabled models and mark the current one` | buttons for enabled keys only, ✓ on the binding's model | every key in the catalog, or no mark |
 | `effort rows appear only for models with effort levels` | no effort row for a Haiku binding | sending Haiku an effort |
@@ -234,7 +242,9 @@ binary's version against the minimum the current models need, and the bot's iden
 | `typing indicator is refreshed only while a turn is in flight` | typing actions while active, none after finish | a typing loop that outlives the turn |
 | `finish edits the message into a summary, or deletes it after a short quiet turn` | a long turn ends as `✅ Done · time · calls · files`; a short turn with no tool call is deleted; an error ends as a warning | a "Working" message left behind under every answer |
 | `a stopped session finishes the status even without a result` | closing a session mid-turn closes its status as stopped | a status stuck on "Working" forever after a model switch or eviction |
-| `a rate limit shows as waiting in the status` | the header reads the reset time while the limit holds, and the summary keeps it | a spinner that keeps spinning through a limit nothing will lift |
+| `a rate limit shows as waiting in the status` | the header reads paused while the limit holds, with the reset time when known and without it otherwise; the summary keeps it | a truthiness check on the note, so a rejection without `resetsAt` keeps spinning |
+| `an earlier failure in a queued run is not summarized as done` | the most severe outcome across the queued turns wins the summary; an explicit stop still reads stopped | the last turn's outcome overwriting an earlier error or rate limit |
+| `the closing summary is retried after a 429 until it lands` | a throttled final edit is retried from the tick after the retry-after and then forgotten | discarding the final edit's result and leaving "Working" behind |
 | `queued messages are counted while a turn runs and the count falls as results arrive` | `N messages queued` while more than one turn is in flight; gone at one | a user unsure whether a second message was taken |
 | `compares dotted versions numerically` | `2.1.278 > 2.1.99 > 2.0.1000` | a string comparison |
 | `flags a binary older than the minimum` | 2.1.117 against minimum 2.1.251 is a failure with both numbers in the message | a boot that proceeds to the first 400 |
