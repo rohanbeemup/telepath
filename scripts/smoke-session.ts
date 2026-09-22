@@ -51,7 +51,7 @@ class Driver {
   private async read(): Promise<void> {
     try {
       for await (const msg of this.session.stream()) {
-        const evs = interpret(msg, this.st, { feed: true })
+        const evs = interpret(msg, this.st)
         this.events.push(...evs)
         for (const ev of evs) if (ev.kind === 'say') this.text += ev.text
         if (evs.some(e => e.kind === 'turnEnd' || e.kind === 'turnError') && this.waiter) {

@@ -18,9 +18,23 @@ Rewrite on the current Agent SDK, in tested modules, with observability.
 - **Idle eviction works.** The previous `pumping` flag was true for a session's whole
   life, so idle sessions were never evicted; a session is now idle when no turn is in
   flight and nothing happened for `IDLE_MINUTES`.
-- **Feed and task events.** Background task starts and completions come from the SDK's
-  own `task_started` / `task_notification` events; the activity feed batches lines per
-  topic within Telegram's rate limit.
+- **A live status message per turn.** `⏳ Working · 1:42 · 9 tool calls`, edited in place
+  at most every 12 s and only when changed, typing indicator alongside, queue count when
+  more messages arrive, the rate-limit wait while it holds, and a one-line summary (or
+  nothing, for a short quiet turn) when the turn ends. It stays the last message of the
+  topic: content posted below it moves it to the bottom, once per burst. All status
+  operations across all topics share one budget (12/min; Telegram's ~20/min limit is per
+  group, and topics share a group), the interval stretches with the number of active
+  topics, typing slows above three, and grammy's `auto-retry` waits out any 429 on any
+  API call. Answers stay new messages because an edit sends no notification. Commands
+  shown in it are masked for well-known secret shapes (bearer headers, `KEY=value`
+  credentials, token prefixes, a bot token in a URL).
+- **The activity feed is a digest** inside that status message. About every 15 seconds, and before any text or task
+  completion so chronology holds: commands, subagents and task starts by their
+  description, edits collapsed to one counted line, reads and searches as a count. The
+  first version's one message per tool call read as spam on a phone (file names of a
+  machine the reader cannot reach, one message per edit) and let "done" arrive before
+  "started". Task starts and completions come from the SDK's own events.
 - **Configuration errors are reported together**, not one restart at a time; an unknown
   `DEFAULT_EFFORT` or `LOG_LEVEL` is an error rather than a silent default.
 
@@ -32,6 +46,13 @@ Rewrite on the current Agent SDK, in tested modules, with observability.
   `allowedTools` is no longer passed. Found by the new Ring 2 smoke.
 - The outbox contract was also registered as a SessionStart hook that never ran under the
   SDK; the first-prompt priming (which did) is now the only channel.
+- From the third review round: every status operation (create, edit, both halves of a
+  move, the closing summary and its retries) reserves budget first and is deferred, never
+  skipped past, when the budget is full; ticks are serialized so a slow API call cannot
+  double an edit; the user's own message moves the status below it; a rate-limit wait
+  clears when the next queued turn runs; a deleted topic cancels its pending summary;
+  "edited N files" counts distinct files; model-written descriptions are redacted too,
+  and redaction requires `=`/`:` after a keyword so prose like "the auth routes" is left alone.
 - From review: `/attach` and the sessions list refuse an ambiguous prefix instead of
   binding the first match; a registry that does not parse stops the boot (exit 2) and is
   never overwritten; the unformatted fallback is split as plain text; `use <key>` and the

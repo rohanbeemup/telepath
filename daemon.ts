@@ -126,6 +126,8 @@ bot.attachTopics(topics)
 
 // ── periodic work ───────────────────────────────────────────────────────────
 setInterval(() => topics.evictIdle(), 60_000).unref()
+// The live status messages: typing while a turn runs, an edit at most every 12 s per topic.
+setInterval(() => void bot.status.tick().catch(e => log.warn('status.tick_failed', { error: e })), 1_000).unref()
 
 function writeHealth(): void {
   try {

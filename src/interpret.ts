@@ -4,11 +4,11 @@
  * how it is delivered. The bot maps events to Telegram calls; tests feed messages in
  * and read events out, with no process and no network.
  */
-import { feedLines, describeTask } from './feed'
+import { feedItems, describeTask, type FeedItem } from './feed'
 
 export type Event =
   | { kind: 'say'; text: string }
-  | { kind: 'feed'; lines: string[] }
+  | { kind: 'feed'; items: FeedItem[] }
   | { kind: 'sessionId'; id: string }
   /** Every rate-limit event, for the rotator hand-off (it judges thresholds itself). */
   | { kind: 'limitRelay'; raw: unknown }
@@ -20,6 +20,14 @@ export type Event =
   | { kind: 'denied'; tool: string; message: string }
   | { kind: 'assistantError'; error: string }
   | { kind: 'state'; state: 'idle' | 'running' | 'requires_action' }
+  /**
+   * Emitted by TopicManager, not by interpret(): the turn lifecycle as the daemon sees
+   * it. `start` when a user message is sent (inFlight counts it), `end` when its result
+   * arrives (inFlight already decremented), `waiting` while a rate limit holds it.
+   */
+  | { kind: 'turn'; phase: 'start'; inFlight: number }
+  | { kind: 'turn'; phase: 'end'; inFlight: number; outcome: 'ok' | 'error' | 'limited' }
+  | { kind: 'turn'; phase: 'waiting'; inFlight: number; note: string | undefined }
 
 /** Per live session. `alerted` is the once-per-turn latch for rate-limit alerts. */
 export type PumpState = { sessionId?: string; alerted: boolean }
@@ -28,9 +36,12 @@ export function newPumpState(sessionId: string | undefined): PumpState {
   return { sessionId, alerted: false }
 }
 
-export type InterpretOptions = { feed: boolean }
-
-export function interpret(msg: any, st: PumpState, opts: InterpretOptions): Event[] {
+/**
+ * Tool-call items are always emitted: the status message counts them and decides from
+ * them whether a turn was "quiet"; whether they are DISPLAYED is the feed toggle, applied
+ * where the status is rendered.
+ */
+export function interpret(msg: any, st: PumpState): Event[] {
   const out: Event[] = []
   if (!msg || typeof msg !== 'object') return out
 
@@ -50,10 +61,8 @@ export function interpret(msg: any, st: PumpState, opts: InterpretOptions): Even
         ? content.filter((b: any) => b?.type === 'text').map((b: any) => String(b.text ?? '')).join('').trim()
         : ''
       if (text) out.push({ kind: 'say', text })
-      if (opts.feed) {
-        const lines = feedLines(content)
-        if (lines.length) out.push({ kind: 'feed', lines: msg.parent_tool_use_id ? lines.map(s => '  ↳ ' + s) : lines })
-      }
+      const items = feedItems(content, !!msg.parent_tool_use_id)
+      if (items.length) out.push({ kind: 'feed', items })
       return out
     }
     case 'rate_limit_event': {

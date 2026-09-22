@@ -248,6 +248,46 @@ describe('TopicManager', () => {
     expect(h.rotator.handedOff.length).toBe(1)
   })
 
+  test('emits turn start and end with the number of turns in flight', async () => {
+    const h = harness()
+    h.bind('1')
+    await h.tm.sendToTopic('1', 'first')
+    await h.tm.sendToTopic('1', 'second')
+    const turns = () => h.events.filter(([, ev]) => ev.kind === 'turn').map(([, ev]) => ev as Extract<Event, { kind: 'turn' }>)
+    expect(turns().map(t => [t.phase, t.inFlight])).toEqual([['start', 1], ['start', 2]])
+    const s = h.backend.last()
+    s.emit(result())
+    await h.tick()
+    s.emit({ type: 'result', subtype: 'error_during_execution', is_error: true, errors: ['x'], session_id: 's' })
+    await h.tick()
+    const ends = turns().filter(t => t.phase === 'end') as Extract<Event, { kind: 'turn'; phase: 'end' }>[]
+    expect(ends.map(t => [t.inFlight, t.outcome])).toEqual([[1, 'ok'], [0, 'error']])
+    // a rejection reports the wait to the status
+    s.emit({ type: 'rate_limit_event', rate_limit_info: { status: 'rejected' } })
+    await h.tick()
+    expect(turns().some(t => t.phase === 'waiting')).toBe(true)
+  })
+
+  test('a stale pump does not report idle once a replacement session is live', async () => {
+    const h = harness()
+    h.bind('1')
+    await h.tm.sendToTopic('1', 'x')
+    const old = h.backend.sessions[0]
+    // model switch: close, then the next message opens a replacement before the old
+    // pump's stream has finished unwinding
+    h.tm.closeLive('1', 'model switch')
+    await h.tm.sendToTopic('1', 'y')
+    expect(h.backend.opens.length).toBe(2)
+    old.inbox.close() // the old stream now ends
+    await h.tick()
+    const idles = h.events.filter(([t, ev]) => t === '1' && ev.kind === 'state' && ev.state === 'idle')
+    expect(idles.length).toBe(0)
+    // when the replacement itself ends and nothing is live, idle IS reported
+    h.backend.last().inbox.close()
+    await h.tick()
+    expect(h.events.filter(([t, ev]) => t === '1' && ev.kind === 'state' && ev.state === 'idle').length).toBe(1)
+  })
+
   test('never leaks the bot token into a session environment', async () => {
     const h = harness()
     h.bind('1')

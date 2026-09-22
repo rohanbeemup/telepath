@@ -14,6 +14,7 @@ suite:
   - src/commands.test.ts
   - src/preflight.test.ts
   - src/gate.test.ts
+  - src/status.test.ts
   - src/rotator.test.ts
 gate: bun test
 ---
@@ -90,6 +91,51 @@ what turned out false or true:
   prompt claimed permanence the operation does not have. Each has a case below or a
   wording fix, and the SDK's peer dependency `@anthropic-ai/sdk >=0.93.0` was unmet by the
   lockfile (0.81.0) and is now a direct dependency.
+- **False, found on the phone after the first evening: "one line per tool call is
+  readable."** Screenshot 22 Sep 19:48: each Write arrived as its own message (calls come
+  seconds apart, so a 2.5 s window batches nothing), the names were files on a machine the
+  reader cannot reach, and "✅ done" preceded "🤖 started" because completions were sent at
+  once while starts waited in the batch. The feed is now a digest: commands, subagents and
+  task lines by description, edits as one counted line, reads as a count, a 15 s window,
+  flushed before any text or completion so chronology holds.
+- **Requested after the digest: "a loading bar so I know Claude is busy."** Two Telegram
+  facts decide the shape. An edit sends no notification, so the answer can never be an
+  edit of the working message: answers, questions and approvals stay new messages and the
+  status only reports progress. And edits are throttled, so one message per turn is edited
+  at most every 12 s, only when its text changed, with the exact `retry_after` honoured
+  on a 429. No percentage is shown because none exists for open-ended agentic work:
+  elapsed time, tool-call count and the digest are honest; the spinner frame changes so
+  the message visibly lives. The typing indicator runs alongside while a turn is in
+  flight. A short turn with nothing done leaves no message behind. Commands shown in the
+  status are redacted for well-known secret shapes, because the message is edited and
+  stays visible. The core is transport-agnostic (create/edit/remove/type), the same three
+  calls Slack and Discord offer.
+- **Asked after the first evening with the status: "does this hit rate limits with several
+  topics, and why is the timer buried above the answers?"** Telegram's limit of about
+  twenty operations a minute is per GROUP, and every topic is a thread of one group, so
+  five topics at one edit per 12 s would already exceed it on their own. All status
+  operations now draw from one shared budget (12/min by default, the rest is left for real
+  messages), the per-topic interval stretches with the number of active topics, typing
+  halves above three topics, and grammy's `auto-retry` waits out any 429 the bot still
+  meets instead of dropping the call. A message cannot be moved on Telegram, so when
+  something is posted below the status it is deleted and re-posted silently at the bottom,
+  once per burst; a turn's verdict is posted at the bottom too when content arrived after
+  the last move. The last message in a topic is therefore the timer or the verdict.
+- **Found by Copilot's third round (nine findings, all confirmed):** overlapping ticks could
+  double an edit; a model-written description escaped redaction; "edited 5 files: a.ts"
+  counted calls, not files; the user's own message buried the status without a move;
+  `begin()`, the final edit and its retries ignored the budget's answer; a move spent two
+  operations on one reservation; a rate-limit wait survived into the next queued turn;
+  and a deleted topic kept retrying its summary. Each has a case below; the rule that
+  came out of it is that EVERY transport operation reserves budget first and what the
+  budget refuses is owed, never skipped past.
+- **Found by Copilot's review of the status push (five findings, all confirmed):** an old
+  pump's unconditional `idle` closed a replacement session's fresh status as "stopped"
+  after a model switch; a status spanning queued turns summarized an early failure as
+  "Done" when the last turn succeeded; feed-off turns produced no items, so the status
+  counted zero tool calls and could delete a busy turn's message as "quiet"; a rejection
+  without a reset time never showed the paused header; and a 429 on the final summary edit
+  left "Working" behind forever. Each has a case below.
 - **Found by the same smoke: breaking out of `for await` on the stream ends the session.**
   Returning the SDK's generator closes the query. The daemon's pump never breaks; the smoke
   script now mirrors it with one reader per session.
@@ -105,7 +151,8 @@ src/log.ts            structured JSON-lines logger, counters, error ring, health
 src/mailbox.ts        push-based AsyncIterable that keeps a query() resident
 src/session.ts        the only module that imports SDK runtime: query(), listSessions()
 src/interpret.ts      SDKMessage → typed events (pure; the pump's decisions)
-src/feed.ts           tool-call and task summaries (pure)
+src/feed.ts           tool-call items, secret redaction, the digest (pure)
+src/status.ts         one live status message per turn: elapsed, digest, queue; edits rate-limited (pure core)
 src/topics.ts         live sessions, cap, idle eviction, rate-limit resume, rotation watch
 src/commands.ts       typed-text command grammar (pure)
 src/ui/keyboards.ts   every keyboard and panel text (pure)
@@ -156,20 +203,20 @@ binary's version against the minimum the current models need, and the bot's iden
 | `keeps the last errors in a bounded ring` | after 30 errors the ring holds the newest 20 in order | an unbounded array that grows for the process lifetime |
 | `Bash prefers the human description over the command` | the feed line shows the description when present | showing raw commands the phone cannot read |
 | `Bash without a description shows the command, trimmed to one line` | newlines collapse, length is capped | a multi-line command spilling over the feed |
-| `background Bash is marked, so a later "Background task completed" has a referent` | `run_in_background` adds the ⏳ mark | a completion notice with nothing it can refer to |
+| `background Bash is marked, so a later "done" line has a referent` | `run_in_background` sets the item's background flag, rendered as ⏳ | a completion notice with nothing it can refer to |
 | `file tools name the file, not the whole payload` | Read/Edit/Write show the basename only | dumping `old_string`/`content` into the chat |
 | `search tools show the pattern` | Grep and Glob show the pattern | a bare tool name |
 | `subagents show their brief` | Agent shows its description | the full prompt |
 | `unknown tools fall back to name plus a short input` | an MCP tool yields `🔧 name {…}` within the cap | throwing on an unknown name |
-| `every line is single-line and capped` | class-level: no feed line contains a newline or exceeds the cap | a cap applied before the newline collapse |
-| `turns an assistant message into one line per tool call, nothing for text or thinking` | `feedLines` yields one line per `tool_use` block | counting text blocks as activity |
-| `a message without tool calls yields no lines` | text-only and undefined content yield `[]` | a placeholder line for every message |
+| `every label is single-line and capped` | class-level: no item label contains a newline or exceeds the cap | a cap applied before the newline collapse |
+| `turns an assistant message into one item per tool call, nothing for text or thinking` | `feedItems` yields one item per `tool_use` block, marked `sub` for a subagent | counting text blocks as activity |
+| `a digest lists commands and subagents, collapses edits into one line and counts reads` | commands, subagents and web calls keep a line each in call order; edits become one counted line of DISTINCT files; reads and searches are a count | one message per file the machine touched, or "edited 5 files: a.ts" for five edits to one file |
+| `labels never leak obvious secrets` | bearer headers, `KEY=value` credentials, known token prefixes and a bot token in a URL are masked in command labels AND in the model's own descriptions and briefs; a git sha is not | showing commands verbatim, or trusting the description because it is prose while it echoes the command's credential |
+| `a digest never lists more than a handful of lines and says how many it left out` | at most five listed lines plus a `+N more` line | a burst of thirty commands as thirty lines |
+| `a message without tool calls yields no items` | text-only and undefined content yield `[]` | a placeholder item for every message |
 | `describes a started background task and a settled one` | `task_started` with `is_backgrounded` and `task_notification` each yield one line carrying status and description | showing only completions, so a start is invisible |
-| `batches lines within the window into one message per topic` | lines added within the window leave as one message per topic, in order | one Telegram message per tool call, tripping the twenty-a-minute limit |
-| `splits an oversized batch into several sends instead of truncating it` | a burst larger than one message leaves as several bounded messages with every line, in order | slicing the joined batch at the cap and dropping the tail |
-| `fire sends what is waiting at once and drop discards it` | `fire` flushes immediately (before a close); `drop` discards without sending | a close that loses the last lines, or a wipe that posts into a deleted topic |
 | `assistant text becomes one say event` | text blocks in one message concatenate into a single say | one message per block |
-| `tool calls become feed lines and subagent calls are indented` | `parent_tool_use_id` set yields lines prefixed as subagent work | subagent internals indistinguishable from the main thread |
+| `tool calls become feed items and subagent calls are marked` | items are emitted for every tool call whatever the display toggle; `parent_tool_use_id` set yields items flagged `sub`, rendered with ↳ | gating the items on the toggle, so a feed-off turn counts zero tool calls and its status is deleted as quiet |
 | `captures the session id on the first assistant or result, never on init` | the id event fires once, only after a turn produced output | saving an id from `init` for a session closed before its first turn, which then fails every resume |
 | `a rejected rate limit yields one rate-limit event and later allowed events yield none` | status `rejected` → one hit event ordered BEFORE the relay, so the rotation baseline is read before the hand-off spawns the rotator; `allowed`/`allowed_warning` → relay only | alerting on every status change, or relaying first and reading a baseline the rotator has already moved |
 | `resets the rate-limit alert at the end of the turn` | after a `result`, the next `rejected` alerts again | a flag that stays set and silences every later turn |
@@ -190,6 +237,8 @@ binary's version against the minimum the current models need, and the bot's iden
 | `schedules a resume nudge for a usable resetsAt and cancels it when the user takes over` | a future reset schedules; a user message cancels | a nudge that fires into a topic the user already continued |
 | `a rotation with the topic untouched closes the session and continues` | with no takeover, the session closes and a continuation is sent | waiting out a reset the rotator already solved |
 | `a stale rate-limit alert does not suppress the next turn's error notice` | an error in the turn after a rejection is reported | a per-session flag that never resets |
+| `a stale pump does not report idle once a replacement session is live` | an old stream ending while a replacement runs emits no idle; the replacement's own end does | closing the new session's status as stopped from the old pump's finally |
+| `emits turn start and end with the number of turns in flight` | `turn/start` per send with the count, `turn/end` per result with the count after decrement and the outcome, `turn/waiting` on a rejection | a status that cannot tell one running turn from three queued ones |
 | `pinned controls show only enabled models and mark the current one` | buttons for enabled keys only, ✓ on the binding's model | every key in the catalog, or no mark |
 | `effort rows appear only for models with effort levels` | no effort row for a Haiku binding | sending Haiku an effort |
 | `the activity feed toggle reflects the effective default in auto and approvals` | auto with no explicit choice reads ON; approvals reads OFF | a label that reads the raw undefined flag |
@@ -206,6 +255,23 @@ binary's version against the minimum the current models need, and the bot's iden
 | `plain text is chat` | anything else is a chat message | a grammar that swallows ordinary sentences |
 | `forces the permission callback for every tool that is not read-only` | the PreToolUse decision is `ask` for Bash, Write, Web, Agent, questions, plans and MCP tools | relying on settings allow rules or `allowedTools`, which approve before any callback |
 | `lets read-only tools through without a prompt` | Read/Glob/Grep/LS/NotebookRead/TodoWrite pass with an empty hook output; the list is exactly the documented one | a write tool slipping into the auto-allow list |
+| `the status text shows elapsed time, tool lines and queued messages` | header with spinner, elapsed, tool-call count and queue; the digest below; a rate-limit wait replaces the spinner; never longer than one message | a fake percentage bar, or a text that outgrows 4096 characters |
+| `begin posts one working message and edits it at most once per interval` | one create per turn; the first edit after the short delay; further edits at most every interval even when news arrives sooner; a second begin creates nothing | an edit per tool call, which Telegram throttles |
+| `edits back off after a 429 and resume when the retry-after has passed` | a 429 with retry-after suspends edits for exactly that long | retrying every tick into a flood ban |
+| `typing indicator is refreshed only while a turn is in flight` | typing actions while active, none after finish | a typing loop that outlives the turn |
+| `finish edits the message into a summary, or deletes it after a short quiet turn` | a long turn ends as `✅ Done · time · calls · files`; a short turn with no tool call is deleted; an error ends as a warning | a "Working" message left behind under every answer |
+| `a stopped session finishes the status even without a result` | closing a session mid-turn closes its status as stopped | a status stuck on "Working" forever after a model switch or eviction |
+| `a rate limit shows as waiting in the status` | the header reads paused while the limit holds, with the reset time when known and without it otherwise; the summary keeps it | a truthiness check on the note, so a rejection without `resetsAt` keeps spinning |
+| `an earlier failure in a queued run is not summarized as done` | the most severe outcome across the queued turns wins the summary; an explicit stop still reads stopped | the last turn's outcome overwriting an earlier error or rate limit |
+| `the closing summary is retried after a 429 until it lands` | a throttled final edit is retried from the tick after the retry-after and then forgotten | discarding the final edit's result and leaving "Working" behind |
+| `the status moves below new messages so the last message in a topic is always the timer` | after content is posted the status is deleted and re-posted at the bottom, once per burst (debounced), carrying its text; later edits go to the new message; a finish right after a post puts the verdict at the bottom | a status buried under the answers, which tells the reader nothing about whether Claude is still busy |
+| `edits across all topics share one budget and slow down as topics multiply` | with N active topics no more than the shared per-minute budget is spent — creates, edits, and both operations of a move counted — every topic still gets edits, and the per-topic interval stretches to fit | per-topic intervals that add up past the per-group limit, or a move that reserves one slot and spends two |
+| `typing slows down when many topics are active` | the typing cadence halves above three active topics and never stops | a typing loop per topic that scales linearly into Telegram's limits |
+| `a rate-limit wait is cleared when the next queued turn starts running` | when a limited turn ends with more queued, the header returns to Working while the run's verdict still records the limit | a paused header shown throughout a turn that is in fact running |
+| `ticks never overlap, so a slow edit is not doubled` | a tick still awaiting the API makes the next tick return at once; one edit, not two | overlapping intervals each firing the same due edit |
+| `a status is not posted while the budget is exhausted and is posted once it frees` | a begin() the budget refuses is owed to a later tick; a status never posted finishes with no API call | creating past the cap because the budget's answer was discarded |
+| `drop cancels a pending closing for that topic` | deleting a topic forgets its queued summary edit | ten retries against a topic that no longer exists |
+| `queued messages are counted while a turn runs and the count falls as results arrive` | `N messages queued` while more than one turn is in flight; gone at one | a user unsure whether a second message was taken |
 | `compares dotted versions numerically` | `2.1.278 > 2.1.99 > 2.0.1000` | a string comparison |
 | `flags a binary older than the minimum` | 2.1.117 against minimum 2.1.251 is a failure with both numbers in the message | a boot that proceeds to the first 400 |
 | `UTC stamp to whole seconds, one space, the raw JSON` | the limit-events line matches the shim's format | a line the rotator dashboard cannot parse |
