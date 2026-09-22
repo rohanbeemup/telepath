@@ -1,9 +1,9 @@
 # Running telepath on Windows
 
 telepath runs on Windows with Bun — no WSL needed. The only platform-specific
-pieces are the installer (`install.ps1`), the start scripts (`start.ps1` /
-`start.bat`), and the SDK binary resolution (handled in `daemon.ts`). The Linux
-`install.sh` + systemd service are still there for Linux users.
+pieces are the installer (`install.ps1`) and the start scripts (`start.ps1` /
+`start.bat`); the SDK resolves its bundled Claude Code binary per platform itself.
+The Linux `install.sh` + systemd service are still there for Linux users.
 
 This setup runs telepath **manually** — you start it when you want it, and stop
 it with Ctrl+C. That's the safest mode for a bot that can run shell commands.
@@ -59,42 +59,27 @@ powershell -ExecutionPolicy Bypass -File .\start.ps1
 
 or just **double-click `start.bat`**.
 
-On a healthy boot you'll see:
+On a healthy boot you'll see (pretty format on a terminal; JSON when stderr is a file):
 
 ```
-telepath up - chat <FORUM_CHAT_ID>, user <ALLOWED_USER_ID>, default claude-sonnet-5 @ effort default, models sonnet,opus, ...
-  claude binary: ...\node_modules\@anthropic-ai\claude-agent-sdk-win32-x64\claude.exe
-polling as @<your-bot>
+10:31:02 info  preflight.claude_version message="claude binary 2.1.278" binary=...\node_modules\@anthropic-ai\claude-agent-sdk-win32-x64\claude.exe
+10:31:03 info  telepath.up version=0.2.0 sdk=0.3.278 bot=<your-bot> chat=<FORUM_CHAT_ID> user=<ALLOWED_USER_ID> defaultModel=claude-sonnet-5 ...
+10:31:03 info  telegram.polling as=<your-bot>
 ```
 
-If `claude binary:` shows just `claude.exe` (the PATH fallback) instead of a full
-`...win32-x64\claude.exe` path, the SDK's bundled binary wasn't found — set
-`CLAUDE_BINARY` in `.env` to your installed Claude Code executable, e.g.:
+The SDK bundles its own Claude Code, so nothing has to be on PATH for the sessions.
+Two lines to know:
 
-```
-CLAUDE_BINARY=C:\Users\<you>\.bun\bin\claude.exe
-```
+- `preflight.claude_version` at level **warn** means the bundled binary is older than
+  the Claude 5 models require (they answer `claude_code_version_too_old`). The fix is a
+  newer SDK: bump `@anthropic-ai/claude-agent-sdk` in `package.json`, `bun install`, then
+  `bun run smoke`. `CLAUDE_BINARY` in `.env` overrides the bundled binary for experiments.
+- `telepath.boot_failed` means Telegram rejected the token or the network is down; the
+  daemon exits with code 3 so a supervisor notices.
 
-(Find it with `where.exe claude` in PowerShell.)
-
-If a topic's first message comes back with
-
-```
-API Error: 400 ... "Claude Code 2.1.117 does not support this model; version 2.1.251 or newer is required" ... claude_code_version_too_old
-```
-
-the bundled binary is too old for that model (the Claude 5 generation needs
-2.1.251+), and the pinned SDK cannot simply be upgraded: newer SDK releases dropped
-the `unstable_v2_*` session API this daemon is built on. Set `CLAUDE_BINARY` to a
-newer Claude Code instead. Any of these work:
-
-- a native install (`irm https://claude.ai/install.ps1 | iex`), which lands at
-  `C:\Users\<you>\.local\bin\claude.exe` and keeps itself current — the durable option;
-- the copy inside the VS Code extension,
-  `C:\Users\<you>\.vscode\extensions\anthropic.claude-code-<version>-win32-x64\resources\native-binary\claude.exe`
-  — works today, but the path carries the version, so re-point it when the extension updates.
-
-An older SDK driving a newer binary is fine: the protocol is owned by the binary.
+`/status` in the General topic (or 📊 Status in the menu) shows the same versions plus
+live sessions, counters and the last errors while it runs; `health.json` next to the
+daemon holds the same snapshot, rewritten every minute.
 
 ## Smoke test
 

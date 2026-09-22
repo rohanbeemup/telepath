@@ -1,5 +1,22 @@
 import { test, expect, describe } from 'bun:test'
-import { mdToTelegramHtml, chunkHtml, htmlToPlain, renderWithDeadline } from './markdown'
+import { mdToTelegramHtml, chunkHtml, chunkPlain, htmlToPlain, renderWithDeadline } from './markdown'
+
+describe('chunkPlain', () => {
+  test('splits unformatted text between lines without touching a character', () => {
+    const lines = Array.from({ length: 40 }, (_, i) => `line ${i} <not-a-tag> & "quotes" ${'x'.repeat(60)}`)
+    const text = lines.join('\n')
+    const parts = chunkPlain(text, 500)
+    expect(parts.length).toBeGreaterThan(1)
+    for (const p of parts) expect(p.length).toBeLessThanOrEqual(500)
+    // every part ends at a line boundary and the text re-joins exactly
+    expect(parts.join('\n')).toBe(text)
+    // a single over-long line with no whitespace is hard-cut, never dropped
+    const long = 'y'.repeat(1200)
+    expect(chunkPlain(long, 500).join('')).toBe(long)
+    // the HTML splitter would have mangled the angle brackets; the plain one keeps them
+    expect(parts[0]).toContain('<not-a-tag>')
+  })
+})
 
 // Three backticks, written as escapes. Spelled literally they appear in a regex
 // below, where the lexer in the test-plan checker reads them as an unterminated

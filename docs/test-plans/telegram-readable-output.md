@@ -1,8 +1,8 @@
 ---
 feature: Tables Claude writes arrive in Telegram as readable labelled blocks instead of a pipe grid
 suite:
-  - markdown.test.ts
-gate: bun test markdown.test.ts
+  - src/markdown.test.ts
+gate: bun test src/markdown.test.ts
 ---
 
 # Telegram-readable table output
@@ -137,6 +137,7 @@ What was checked, and what turned out false:
 | `renders an ordinary message well inside the deadline` | the bound costs ordinary messages their formatting in no case | a deadline so tight that normal output degrades |
 | `bounds parsing cost across many lines, not just one` | hostile text spread over many lines is bounded too, whether the lines form one paragraph or many | capping each line, which reshapes the attack instead of blocking it |
 | `chunks a very long line without quadratic work` | scanning is bounded by the chunk budget, not by what remains, so cost grows with input rather than with its square | rebuilding the unsafe map over the whole remainder on every cut |
+| `splits unformatted text between lines without touching a character` | the plain fallback is cut at line or space boundaries and re-joins to the original text, so angle brackets in prose survive | routing the unrendered fallback through the HTML splitter, which reads `<…>` as tags |
 | `does not split inside a tag or an entity` | a cut inside `<a href=...>` or `&amp;` never happens, at any limit | cutting at a fixed offset once a line exceeds the budget |
 
 ### Negative cases
@@ -170,7 +171,7 @@ What was checked, and what turned out false:
 
 ## Ring
 
-Ring 1 (unit): `bun test markdown.test.ts` covers the whole conversion, since
+Ring 1 (unit): `bun test src/markdown.test.ts` covers the whole conversion, since
 `mdToTelegramHtml` is a pure string-to-string function once extracted into
 `markdown.ts`.
 

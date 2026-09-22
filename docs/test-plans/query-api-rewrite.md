@@ -1,0 +1,255 @@
+---
+feature: telepath runs on the current Agent SDK, in modules whose logic is tested without Telegram or a claude process, and reports what it is doing
+suite:
+  - src/config.test.ts
+  - src/models.test.ts
+  - src/state.test.ts
+  - src/log.test.ts
+  - src/feed.test.ts
+  - src/interpret.test.ts
+  - src/mailbox.test.ts
+  - src/topics.test.ts
+  - src/ui/keyboards.test.ts
+  - src/ui/wizard.test.ts
+  - src/commands.test.ts
+  - src/preflight.test.ts
+  - src/gate.test.ts
+  - src/rotator.test.ts
+gate: bun test
+---
+
+# Rewrite on the query() API, in testable modules
+
+## Premise
+
+The request: make telepath professional end to end, no patches. What was checked, and
+what turned out false or true:
+
+- **True: the daemon runs on a removed API.** `daemon.ts` imports `unstable_v2_createSession`
+  / `unstable_v2_resumeSession` from `@anthropic-ai/claude-agent-sdk@0.2.117`. The current
+  release (0.3.278, checked by unpacking the tarball and grepping `sdk.d.ts`) exports no
+  `unstable_v2_*` symbol at all. The supported shape is `query({ prompt: AsyncIterable<SDKUserMessage>, options })`,
+  which stays resident while the iterable is open, with `resume`, `effort`, `canUseTool`,
+  `hooks`, `settingSources`, `permissionMode`, `env` and `cwd` as first-class options.
+- **True: two of the current features are workarounds for that API.** `CLAUDE_BINARY`
+  points at a VS Code extension's binary because the pinned SDK bundles Claude Code 2.1.117,
+  which the Claude 5 models refuse (`claude_code_version_too_old`); and effort travels as
+  `CLAUDE_CODE_EFFORT_LEVEL` in the child environment because `SDKSessionOptions` had no
+  `effort`. Both disappear with the upgrade: the SDK bundles 2.1.278 and `effort` is an
+  option.
+- **False: "the daemon drops assistant text."** Profiled the webshopNick transcript
+  (`~/.claude/projects/C--Bots-webshopNick/d937ef24….jsonl`, 6618 entries): between 04:00 and
+  05:00 the model made 277 tool calls and wrote one text block. The daemon forwarded what
+  existed. What the user lost was the approval prompts, which are the only per-tool
+  visibility and vanish in auto mode. The activity feed (`feed.ts`) is the deterministic
+  replacement; this plan carries it into the new structure and adds the SDK's own task
+  events to it.
+- **True: nothing in the daemon is testable.** One 1776-line module creates the bot at
+  import time, exits the process when a setting is missing, and interleaves Telegram calls
+  with the logic that decides them. The existing suites cover the two pure corners that were
+  extracted (`markdown.ts`, `rotator.ts`, `feed.ts`); the pump, the registry, the wizard, the
+  command parsing, the eviction and rate-limit logic have no test. That is the structural
+  reason every earlier fix here was verified by hand.
+- **True: there is no observability.** Diagnostics are `process.stderr.write` strings with
+  no level, no structure and no counters. The user discovers a silent failure by noticing
+  silence. The four questions asked in this session (is text being dropped, is the binary
+  too old, is a session live, why did the turn end) each needed a transcript or a process
+  list to answer.
+- **Checked and kept:** the existing behaviours are the contract. Topic per session,
+  Allow/Deny prompts as buttons, clarifying questions as options, plan approval, auto mode,
+  idle eviction and the live-session cap, rate-limit auto-resume, rotator hand-off and
+  rotation resume, outbox delivery and inbox for photos and documents, close/delete/wipe,
+  the pinned control panel, the wizard, and the markdown rendering. Every one is preserved;
+  the rewrite changes where they live and how they are verified.
+- **Decided, not measured:** a model or effort switch keeps the existing close-and-resume
+  design rather than using `Query.setModel()` mid-session. One code path, and the takeover
+  logic already exists for it. Revisit if the restart cost is felt.
+- **False, found by the Ring 2 smoke against SDK 0.3.278: "`canUseTool` is the permission
+  gate."** With the machine's `~/.claude/settings.json` allowing `Bash`, a session ran
+  `echo smoke` and the callback was never invoked (`denied=0`). The SDK itself warns that
+  bare `allowedTools` entries and settings allow rules approve a tool before the callback
+  is consulted. A PreToolUse hook answering `permissionDecision: 'ask'` forces the prompt,
+  which in SDK mode is the callback: measured, the same request then reached `canUseTool`
+  and the deny was honoured. The gate is therefore two halves (`src/gate.ts` + the
+  callback), and `allowedTools` is not passed at all so one gate sees every call.
+- **False, found by the same smoke: "the SessionStart hook delivers the outbox
+  contract."** With `includeHookEvents` on, a PreToolUse callback ran and a SessionStart
+  callback registered the same way never did; the model answered with its own scratchpad
+  path. The old daemon's comment ("not reliably plumbed") still holds, so the contract is
+  prepended to the topic's first prompt (which was already the guaranteed channel) and the
+  hook is gone rather than kept as decoration. The smoke now tests the channel the daemon
+  actually uses.
+- **Found by Copilot's review of the first push (nine findings, all confirmed against the
+  code):** a `/attach` prefix bound the first of several matches; a registry that failed to
+  parse was overwritten with `{}` (my own boot-time "repair"); the unformatted fallback went
+  through the HTML-aware splitter, which reads `<…>` as tags; `use haiku` switched to a
+  package the config had disabled; an oversized feed burst was truncated at the tail; a
+  closed mailbox still drained queued prompts; the rotation baseline was read after the
+  hand-off had spawned the rotator (the same race fixed in PR #6, reintroduced by event
+  ordering); a boolean `busy` let a queued second turn be evicted as idle; and the 🗑 delete
+  prompt claimed permanence the operation does not have. Each has a case below or a
+  wording fix, and the SDK's peer dependency `@anthropic-ai/sdk >=0.93.0` was unmet by the
+  lockfile (0.81.0) and is now a direct dependency.
+- **Found by the same smoke: breaking out of `for await` on the stream ends the session.**
+  Returning the SDK's generator closes the query. The daemon's pump never breaks; the smoke
+  script now mirrors it with one reader per session.
+
+## Architecture
+
+```
+daemon.ts             bootstrap only: config → log → state → preflight → backend → topics → bot
+src/config.ts         .env parsing and validation into a typed Config; every error at once
+src/models.ts         model packages, effort levels, labels
+src/state.ts          registry.json / prefs.json, atomic writes, migration at load
+src/log.ts            structured JSON-lines logger, counters, error ring, health snapshot
+src/mailbox.ts        push-based AsyncIterable that keeps a query() resident
+src/session.ts        the only module that imports SDK runtime: query(), listSessions()
+src/interpret.ts      SDKMessage → typed events (pure; the pump's decisions)
+src/feed.ts           tool-call and task summaries (pure)
+src/topics.ts         live sessions, cap, idle eviction, rate-limit resume, rotation watch
+src/commands.ts       typed-text command grammar (pure)
+src/ui/keyboards.ts   every keyboard and panel text (pure)
+src/ui/wizard.ts      the new-session wizard as a state machine (pure)
+src/bot.ts            grammy handlers: the glue between Telegram and the modules above
+src/files.ts          outbox / inbox / transcript removal
+src/preflight.ts      boot checks: binary version, Telegram identity, state dir
+src/markdown.ts       unchanged, moved; render-worker.ts beside it
+src/rotator.ts        unchanged, moved
+scripts/smoke-session.ts  Ring 2: one real session against the SDK, no Telegram
+```
+
+Dependency rule: only `src/bot.ts` talks to the Telegram API (`src/ui/keyboards.ts` uses
+grammy's `InlineKeyboard` as a data builder, nothing more); only `src/session.ts` imports
+SDK runtime values (other modules import SDK *types* only). Everything under test runs
+without a network, a bot token or a claude binary.
+
+Observability: every log line is one JSON object (`ts`, `lvl`, `ev`, fields; `LOG_LEVEL`
+filters, `LOG_FORMAT=pretty` for a terminal), counters accumulate per process, the last
+twenty errors are kept, and all three are readable from the phone (📊 Status / `/status`)
+and from disk (`health.json`, rewritten every minute). Boot runs a preflight: the claude
+binary's version against the minimum the current models need, and the bot's identity.
+
+## Cases
+
+| Case | Asserts | Mutant it kills |
+|---|---|---|
+| `parses KEY=value lines and ignores comments and blanks` | the .env reader yields exactly the assignments, trimmed, and skips `#` lines and empty lines | a split on `=` that keeps the comment text as a value |
+| `does not overwrite a variable the shell already set` | a key present in the process environment wins over the file | the file clobbering the shell, so a per-run override is impossible |
+| `reports every missing required setting at once, not just the first` | three missing settings produce one error naming all three | exiting on the first missing key, so the user fixes them one restart at a time |
+| `rejects an effort level it does not know` | `DEFAULT_EFFORT=turbo` is a configuration error, not a silent default | `parseEffort` returning undefined and the boot proceeding with no effort |
+| `applies defaults for optional settings` | idle minutes, cap, model ids and log level take their documented defaults when unset | a required-everything config that a fresh clone cannot boot |
+| `keeps only enabled models it knows and never ends with none` | `ENABLED_MODELS=fable,unicorn` yields `[fable]`; an all-garbage list yields the fallback | an empty menu when the list is mistyped |
+| `falls back to the first enabled model when the default is disabled` | `DEFAULT_MODEL` pointing at a disabled package resolves to the first enabled one | booting with a default the menus cannot show |
+| `a known package that is not enabled is refused where a switch is requested` | `isEnabledModelKey` is false for a known key outside `ENABLED_MODELS`; the wizard, the panel, Settings and `use` all consult it | accepting any known key, so a disabled model a plan cannot reach is selectable |
+| `parses the five effort levels case-insensitively and nothing else` | `LOW`…`max` parse; `""`, `turbo`, `default` do not | a comparison that accepts any string |
+| `haiku accepts no effort level, the other packages accept all five` | `supportsEffort` is false for haiku and true for sonnet, opus, fable | sending an effort the model rejects |
+| `a binding on a model without effort levels runs without one but keeps its choice` | `effortFor` is undefined for a Haiku binding whose stored effort is `max`; the stored value survives a switch back | clearing the stored effort on a model switch |
+| `persists a cleared default effort as null so it survives a restart` | clearing the default writes an explicit null and reloading yields no effort even with `DEFAULT_EFFORT` set | `JSON.stringify` dropping the undefined key so the .env default returns on boot |
+| `an absent effort key falls back to the configured default` | a prefs file from before the field existed inherits `DEFAULT_EFFORT` | treating absence as a deliberate clear |
+| `drops a garbage effort value from an old prefs file` | `defaultEffort: "turbo"` on disk loads as undefined | trusting the file over the parser |
+| `refuses to start on a malformed registry instead of overwriting it` | a registry that does not parse throws `StateError` and the file is untouched; a missing file starts empty | treating "could not parse" as "empty" and saving `{}` over every binding |
+| `writes atomically through a temp file and rename` | after save the final file holds the new content and no temp file remains | writing in place, which a crash mid-write turns into a truncated registry |
+| `migrates bindings off a disabled model at load` | a binding on a model no longer enabled is moved to the default and the store is marked dirty | a topic that keeps failing on a model the plan cannot reach |
+| `emits one JSON line per event with ts, level, event and fields` | a log call produces parseable JSON carrying exactly those keys | free-form strings that nothing can filter or count |
+| `filters below the configured level` | at level `warn`, `info` and `debug` events are not written | a level that is stored but never consulted |
+| `counters increment and snapshot` | `inc` twice reads 2 in the snapshot; unknown names start at 0 | a snapshot that returns live references the caller can corrupt |
+| `keeps the last errors in a bounded ring` | after 30 errors the ring holds the newest 20 in order | an unbounded array that grows for the process lifetime |
+| `Bash prefers the human description over the command` | the feed line shows the description when present | showing raw commands the phone cannot read |
+| `Bash without a description shows the command, trimmed to one line` | newlines collapse, length is capped | a multi-line command spilling over the feed |
+| `background Bash is marked, so a later "Background task completed" has a referent` | `run_in_background` adds the ⏳ mark | a completion notice with nothing it can refer to |
+| `file tools name the file, not the whole payload` | Read/Edit/Write show the basename only | dumping `old_string`/`content` into the chat |
+| `search tools show the pattern` | Grep and Glob show the pattern | a bare tool name |
+| `subagents show their brief` | Agent shows its description | the full prompt |
+| `unknown tools fall back to name plus a short input` | an MCP tool yields `🔧 name {…}` within the cap | throwing on an unknown name |
+| `every line is single-line and capped` | class-level: no feed line contains a newline or exceeds the cap | a cap applied before the newline collapse |
+| `turns an assistant message into one line per tool call, nothing for text or thinking` | `feedLines` yields one line per `tool_use` block | counting text blocks as activity |
+| `a message without tool calls yields no lines` | text-only and undefined content yield `[]` | a placeholder line for every message |
+| `describes a started background task and a settled one` | `task_started` with `is_backgrounded` and `task_notification` each yield one line carrying status and description | showing only completions, so a start is invisible |
+| `batches lines within the window into one message per topic` | lines added within the window leave as one message per topic, in order | one Telegram message per tool call, tripping the twenty-a-minute limit |
+| `splits an oversized batch into several sends instead of truncating it` | a burst larger than one message leaves as several bounded messages with every line, in order | slicing the joined batch at the cap and dropping the tail |
+| `fire sends what is waiting at once and drop discards it` | `fire` flushes immediately (before a close); `drop` discards without sending | a close that loses the last lines, or a wipe that posts into a deleted topic |
+| `assistant text becomes one say event` | text blocks in one message concatenate into a single say | one message per block |
+| `tool calls become feed lines and subagent calls are indented` | `parent_tool_use_id` set yields lines prefixed as subagent work | subagent internals indistinguishable from the main thread |
+| `captures the session id on the first assistant or result, never on init` | the id event fires once, only after a turn produced output | saving an id from `init` for a session closed before its first turn, which then fails every resume |
+| `a rejected rate limit yields one rate-limit event and later allowed events yield none` | status `rejected` → one hit event ordered BEFORE the relay, so the rotation baseline is read before the hand-off spawns the rotator; `allowed`/`allowed_warning` → relay only | alerting on every status change, or relaying first and reading a baseline the rotator has already moved |
+| `resets the rate-limit alert at the end of the turn` | after a `result`, the next `rejected` alerts again | a flag that stays set and silences every later turn |
+| `a non-success result yields a turn-error event and success yields a quiet turn-end` | `error_during_execution` → error event with the subtype; `success` → turn-end only | a notice on every turn, or none on failures |
+| `a background task notice carries status and summary` | `task_notification` yields status and summary verbatim | dropping the summary the user needs to tell tasks apart |
+| `a task_started event announces a background task once` | `task_started` yields one task event with its description and whether it runs in the background | announcing only completions, so a start is invisible |
+| `permission_denied surfaces as a notice` | the tool name and message reach the user | a silent denial the model works around |
+| `delivers pushed messages in order to a single consumer` | three pushes are read as three items in order | a Set or a map that reorders |
+| `waits for the next push instead of ending` | with the queue empty, `next()` stays pending until a push | returning `done` on an empty queue, which ends the session |
+| `ends the iteration when closed and rejects pushes after close` | `close()` resolves the pending `next()` as done; a later push throws | a push into a closed mailbox that is silently lost |
+| `drops queued items on close instead of draining them afterwards` | after `close()`, a previously pushed item is never yielded | checking the queue before the closed flag |
+| `wraps text as a user message with parent_tool_use_id null` | `userMessage(text)` has the exact shape the SDK types require | a message the CLI rejects as malformed |
+| `opens a session on first message and reuses it while live` | two messages open one backend session | a new process per message |
+| `evicts the least recently active session when the cap is reached and tells that topic` | the oldest topic is closed and notified; the new one opens | evicting the newest, or evicting silently |
+| `evicts idle sessions and leaves a session mid-turn alone` | idle past the limit closes; a turn in flight protects the session, and a second message queued during a turn keeps it busy until its own result | a boolean that the first result clears while a queued turn still runs |
+| `a model or effort switch closes the live session so the next message resumes with the new options` | after the switch the backend sees a new open with the new model and effort | a live process that keeps the old model until eviction |
+| `resumes with the recorded session id and records it once produced` | `open` receives `resume` when the binding has an id; the id from the stream is stored | a resume that starts a blank session |
+| `schedules a resume nudge for a usable resetsAt and cancels it when the user takes over` | a future reset schedules; a user message cancels | a nudge that fires into a topic the user already continued |
+| `a rotation with the topic untouched closes the session and continues` | with no takeover, the session closes and a continuation is sent | waiting out a reset the rotator already solved |
+| `a stale rate-limit alert does not suppress the next turn's error notice` | an error in the turn after a rejection is reported | a per-session flag that never resets |
+| `pinned controls show only enabled models and mark the current one` | buttons for enabled keys only, ✓ on the binding's model | every key in the catalog, or no mark |
+| `effort rows appear only for models with effort levels` | no effort row for a Haiku binding | sending Haiku an effort |
+| `the activity feed toggle reflects the effective default in auto and approvals` | auto with no explicit choice reads ON; approvals reads OFF | a label that reads the raw undefined flag |
+| `pages a long list two per row with prev and next only where they lead somewhere` | page 0 has Next only, the last page has Prev only | arrows that lead off the ends |
+| `callback data never exceeds telegram's 64-byte limit` | class-level: every callback string produced by every builder is under 64 bytes | a long model id in callback data that Telegram rejects |
+| `folder then model then effort then approvals for a model with effort levels` | the transitions run in that order and finish with all four choices | skipping effort for every model |
+| `skips the effort step for a model without effort levels` | Haiku goes from model to approvals | a Haiku session created with an effort |
+| `back from the effort step returns to the model step keeping the folder` | the folder survives the back step | restarting the wizard |
+| `default effort in the wizard means the settings default` | choosing default leaves the wizard's effort unset so the caller applies prefs | writing `undefined` over a configured default |
+| `use with a model and optional effort` | `use fable high` → model fable, effort high; `use opus` → no effort | a grammar that needs both |
+| `effort default clears` | `effort default` → effort undefined; `effort max` → max | treating `default` as an unknown level |
+| `feed on and off` | `feed on`/`feed off` parse case-insensitively | a toggle with no explicit state |
+| `slash commands with args` | `/new x cwd=/p auto` → command `new` with the raw args | splitting args the command cannot rejoin |
+| `plain text is chat` | anything else is a chat message | a grammar that swallows ordinary sentences |
+| `forces the permission callback for every tool that is not read-only` | the PreToolUse decision is `ask` for Bash, Write, Web, Agent, questions, plans and MCP tools | relying on settings allow rules or `allowedTools`, which approve before any callback |
+| `lets read-only tools through without a prompt` | Read/Glob/Grep/LS/NotebookRead/TodoWrite pass with an empty hook output; the list is exactly the documented one | a write tool slipping into the auto-allow list |
+| `compares dotted versions numerically` | `2.1.278 > 2.1.99 > 2.0.1000` | a string comparison |
+| `flags a binary older than the minimum` | 2.1.117 against minimum 2.1.251 is a failure with both numbers in the message | a boot that proceeds to the first 400 |
+| `UTC stamp to whole seconds, one space, the raw JSON` | the limit-events line matches the shim's format | a line the rotator dashboard cannot parse |
+| `honours env set after the module was imported` | the rotator switch reads the environment at call time | a module constant frozen before .env loads |
+| `no script at the configured path means no rotator` | a missing script disables the hand-off | spawning a python that does not exist on every event |
+| `returns the new account once .active changes` | the watch resolves with the changed marker | resolving on an unchanged marker |
+| `gives up when nothing changes within the attempts` | undefined after the attempts | waiting forever |
+| `a missing marker is not a rotation` | undefined stays undefined | treating absence as a switch |
+| `no marker before, one after, is a switch` | undefined → account resolves | requiring a previous value |
+
+### Negative cases
+
+| Case | Must not happen | Mutant it kills |
+|---|---|---|
+| `does not let a prototype name pass as a model key` | `constructor` or `__proto__` accepted as a model key anywhere a key is looked up | `in MODELS` instead of an own-property check |
+| `does not repeat the rate-limit alert twice in one turn` | a second `rejected` in the same turn producing a second alert and a second rotation watch | a per-message alert with no latch |
+| `unknown message types yield nothing` | `stream_event`, `status`, `tool_use_summary` or an unknown type reaching the chat as text | a default branch that stringifies the message |
+| `never leaks the bot token into a session environment` | `TELEGRAM_BOT_TOKEN` present in the environment handed to any session | spreading `process.env` unfiltered |
+| `a rotation while the user took over does not interrupt the topic` | the user's live turn closed and a continuation injected after they already continued | a watch that ignores the takeover generation |
+| `an unknown model key is refused and leaves the state unchanged` | forged callback data advancing the wizard or finishing it before a folder is chosen | accepting any key, or finishing from any step |
+| `prototype names are not commands` | `use constructor` or `use __proto__` treated as a model switch | `in` on the catalog |
+
+## Out of scope
+
+- **Telegram itself.** `src/bot.ts` is glue over grammy and is verified at Ring 2 by
+  restarting and using the bot. Its decisions are all in tested modules; what remains is
+  API plumbing that a fake would only mirror.
+- **The claude process.** `src/session.ts` wraps `query()` and is verified by
+  `scripts/smoke-session.ts` against the real SDK, because a fake SDK would test the fake.
+- **`Query.setModel()` for live switches.** Kept as close-and-resume (see Premise).
+- **The rotator itself and the markdown renderer.** Both move to `src/` unchanged; markdown
+  keeps its own plan (`telegram-readable-output.md`), whose suite path is updated.
+- **Prompting Fable to narrate.** The feed shows what happens; making the model say why is a
+  prompt decision with a model-dependent outcome, not a gate this plan can hold.
+
+## Ring
+
+Ring 1 (unit): `bun test` runs every suite above without a network, a token or a binary.
+`bun run typecheck` runs `tsc --noEmit` over the whole tree under a real `tsconfig.json`
+with Bun types, so the check is no longer filtered by hand.
+
+Ring 2 is the handoff: `bun run smoke` opens one real session through the new backend
+with the production settings sources (text turn, a risky tool through the PreToolUse gate
+into `canUseTool` with a deny honoured, the primed outbox contract, session id capture,
+resume by id) and prints a verdict per check; it found three defects in this plan's first
+implementation (see Premise). Then restart the bot and walk the wizard, an approval, a
+question, the feed and `/status` from the phone. Green here is a handoff, not done.
