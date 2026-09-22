@@ -143,11 +143,12 @@ export class TelegramBot {
     const b = this.d.store.registry[topicId]
     switch (ev.kind) {
       case 'say':
+        this.feed.fire(topicId) // what was done comes before what is said about it
         await this.say(topicId, ev.text)
         return
       case 'feed':
-        this.d.metrics.inc('feed_lines', ev.lines.length)
-        this.feed.add(topicId, ev.lines)
+        this.d.metrics.inc('feed_items', ev.items.length)
+        this.feed.add(topicId, ev.items)
         return
       case 'sessionId': {
         const cwd = b?.cwd ?? this.d.cfg.defaultCwd
@@ -169,11 +170,13 @@ export class TelegramBot {
       case 'task': {
         const line = describeTask(ev.status, ev.description, ev.background)
         if (ev.status === 'started') {
-          if (b && feedOn(b)) this.feed.add(topicId, [line])
+          if (b && feedOn(b)) this.feed.add(topicId, [{ kind: 'task', label: line }])
         } else {
           // A settled background task is always surfaced: the SDK re-invokes the model with
           // the result, but if that continuation is rate-limited the user would never hear.
-          await this.say(topicId, line)
+          // The pending digest goes first, so "started" never arrives after "done".
+          this.feed.fire(topicId)
+          await this.send(topicId, line)
         }
         return
       }
@@ -951,7 +954,8 @@ every session topic with:
 • 🐇 Haiku / ⚡ Sonnet / 🧠 Opus / ✨ Fable — switch model (applies next message)
 • 🎚 low / med / high / xhigh / max / ↺ default — how hard it thinks (Haiku has none)
 • 🔐 Approvals ↔ ⚡ Auto — toggle whether tools ask before running
-• 🔎 Activity feed — one line per tool call (🖥 command, 📖 read, ✏️ edit, 🤖 subagent);
+• 🔎 Activity feed — a digest every ~15 s of what the session did: 🖥 commands and
+   🤖 subagents by their description, ✏️ edits as one counted line, reads as a count;
    on by default in ⚡ auto, where nothing else shows what the session is doing
 • 💾 Close & keep — stop the session + close the topic, keep everything
    (a ♻️ Reopen button appears to resume later with full context)

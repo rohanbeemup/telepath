@@ -1,16 +1,20 @@
 /**
- * Activity feed: what a session is DOING, one short line per tool call.
+ * Activity feed: what a session is DOING, as a compact digest.
  *
- * A topic in auto mode posts no approval prompts, and a model working through a long
- * autonomous task (Fable at high effort, background commands) can go an hour with a
- * single sentence of text. Measured on a real transcript: 277 tool calls, 1 text
- * block, in one hour — the topic showed only "Background task completed" notices.
- * The feed is the deterministic substitute for the running commentary the model
- * does not give: pure functions here, the batching and the toggle live in daemon.ts.
+ * A topic in auto mode posts no approval prompts, and a model deep in a long autonomous
+ * task can go an hour with a single sentence of text. Measured on a real transcript: 277
+ * tool calls, 1 text block, in one hour. The feed is the deterministic substitute for the
+ * commentary the model does not give.
+ *
+ * The first version sent one line per tool call and was read on a phone as spam: file
+ * names of a machine the reader cannot reach, one message per edit because calls arrive
+ * seconds apart. So the feed is now a digest: commands and subagent briefs are readable
+ * and kept as lines; edits collapse to one line with a count; reads and searches are a
+ * count only. Pure functions here; the batching window and the toggle live elsewhere.
  */
 import { basename } from 'path'
 
-const MAX = 140
+const MAX = 160
 
 function oneLine(s: string, max = MAX): string {
   const t = s.replace(/\s*\n\s*/g, ' ').replace(/\s+/g, ' ').trim()
@@ -21,59 +25,63 @@ function fileName(p: unknown): string {
   return typeof p === 'string' && p ? basename(p.replace(/\\/g, '/')) : '?'
 }
 
-/** One phone-readable line for a tool call. Never the raw input. */
-export function summarizeToolUse(name: string, input: Record<string, unknown> | undefined): string {
+export type FeedItem = {
+  kind: 'command' | 'edit' | 'read' | 'search' | 'web' | 'agent' | 'task' | 'other'
+  /** Short human label: a command's description, a file's basename, a brief. */
+  label: string
+  /** Runs in the background (a later "done" line refers to it). */
+  background?: boolean
+  /** Issued by a subagent, not the main thread. */
+  sub?: boolean
+}
+
+/** One item for a tool call. Never the raw input. */
+export function toolItem(name: string, input: Record<string, unknown> | undefined): FeedItem {
   const i = input ?? {}
   switch (name) {
-    case 'Bash': {
+    case 'Bash':
+    case 'PowerShell': {
       const what = typeof i.description === 'string' && i.description ? i.description : String(i.command ?? '')
-      return oneLine(`🖥 ${what}${i.run_in_background ? ' ⏳' : ''}`)
+      return { kind: 'command', label: oneLine(what), background: !!i.run_in_background }
     }
     case 'Read':
-      return oneLine(`📖 ${fileName(i.file_path)}`)
+      return { kind: 'read', label: fileName(i.file_path) }
     case 'Edit':
     case 'MultiEdit':
     case 'NotebookEdit':
-      return oneLine(`✏️ ${fileName(i.file_path ?? i.notebook_path)}`)
     case 'Write':
-      return oneLine(`📝 ${fileName(i.file_path)}`)
+      return { kind: 'edit', label: fileName(i.file_path ?? i.notebook_path) }
     case 'Grep':
     case 'Glob':
-      return oneLine(`🔍 ${String(i.pattern ?? '')}`)
+      return { kind: 'search', label: oneLine(String(i.pattern ?? ''), 60) }
     case 'WebFetch':
-      return oneLine(`🌐 ${String(i.url ?? '')}`)
+      return { kind: 'web', label: oneLine(String(i.url ?? ''), 100) }
     case 'WebSearch':
-      return oneLine(`🌐 ${String(i.query ?? '')}`)
+      return { kind: 'web', label: oneLine(String(i.query ?? ''), 100) }
     case 'Agent':
     case 'Task':
-      return oneLine(`🤖 ${String(i.description ?? i.prompt ?? '')}`)
-    case 'AskUserQuestion':
-    case 'ExitPlanMode':
-    case 'EnterPlanMode':
-    case 'TodoWrite':
-      return oneLine(`📋 ${name}`)
+      return { kind: 'agent', label: oneLine(String(i.description ?? i.prompt ?? '')) }
     default: {
       let brief = ''
       try {
         brief = JSON.stringify(i)
       } catch {}
-      return oneLine(`🔧 ${name} ${brief}`)
+      return { kind: 'other', label: oneLine(`${name} ${brief}`, 100) }
     }
   }
 }
 
-/** Feed lines for one assistant message's content blocks: tool calls only. */
-export function feedLines(content: unknown): string[] {
+/** Items for one assistant message's content blocks: tool calls only. */
+export function feedItems(content: unknown, sub = false): FeedItem[] {
   if (!Array.isArray(content)) return []
   return content
     .filter((b: any) => b?.type === 'tool_use')
-    .map((b: any) => summarizeToolUse(String(b.name ?? '?'), b.input))
+    .map((b: any) => ({ ...toolItem(String(b.name ?? '?'), b.input), ...(sub ? { sub: true } : {}) }))
 }
 
 /**
  * One line for a task event the SDK reports itself: a subagent or background command
- * starting, or a background task settling. The start line is what lets a later
- * "done" line be read; without it the completion refers to nothing.
+ * starting, or a background task settling.
  */
 export function describeTask(status: 'started' | 'completed' | 'failed' | 'stopped', description: string, background: boolean): string {
   const what = description || 'task'
@@ -87,6 +95,71 @@ export function describeTask(status: 'started' | 'completed' | 'failed' | 'stopp
     case 'stopped':
       return oneLine(`⏹ stopped: ${what}`)
   }
+}
+
+const LIST_CAP = 5
+const NAMES_CAP = 3
+
+function listOf(labels: string[], cap = NAMES_CAP): string {
+  const uniq = [...new Set(labels)]
+  const shown = uniq.slice(0, cap).join(', ')
+  return uniq.length > cap ? `${shown} +${uniq.length - cap}` : shown
+}
+
+/**
+ * The digest: commands, subagents, web calls and task lines stay one per line (their
+ * labels are what a reader can act on); edits collapse to one line naming a few files
+ * and counting the rest; reads and searches are a count only. Order of the kept lines
+ * follows the order the calls were made. Empty input → no lines.
+ */
+export function digest(items: FeedItem[]): string[] {
+  if (!items.length) return []
+  const lines: string[] = []
+  const edits: string[] = []
+  let reads = 0
+  let searches = 0
+  let hidden = 0
+  const sub = (it: FeedItem) => (it.sub ? '↳ ' : '')
+  for (const it of items) {
+    switch (it.kind) {
+      case 'command':
+        if (lines.length < LIST_CAP) lines.push(`${sub(it)}🖥 ${it.label}${it.background ? ' ⏳' : ''}`)
+        else hidden++
+        break
+      case 'agent':
+        if (lines.length < LIST_CAP) lines.push(`${sub(it)}🤖 ${it.label}`)
+        else hidden++
+        break
+      case 'web':
+        if (lines.length < LIST_CAP) lines.push(`${sub(it)}🌐 ${it.label}`)
+        else hidden++
+        break
+      case 'task':
+        if (lines.length < LIST_CAP) lines.push(`${sub(it)}${it.label}`)
+        else hidden++
+        break
+      case 'other':
+        if (lines.length < LIST_CAP) lines.push(`${sub(it)}🔧 ${it.label}`)
+        else hidden++
+        break
+      case 'edit':
+        edits.push(it.label)
+        break
+      case 'read':
+        reads++
+        break
+      case 'search':
+        searches++
+        break
+    }
+  }
+  if (hidden) lines.push(`… +${hidden} more`)
+  if (edits.length) lines.push(`✏️ ${edits.length === 1 ? 'edited' : `edited ${edits.length} files:`} ${listOf(edits)}`)
+  const counts: string[] = []
+  if (reads) counts.push(`📖 ${reads} read${reads === 1 ? '' : 's'}`)
+  if (searches) counts.push(`🔍 ${searches} search${searches === 1 ? '' : 'es'}`)
+  if (counts.length) lines.push(counts.join(' · '))
+  return lines
 }
 
 /** Pack lines into messages of at most `max` characters, splitting only between lines. */
@@ -107,40 +180,36 @@ export function packLines(lines: string[], max: number): string[] {
 }
 
 /**
- * Batches feed lines per topic. A turn often fires several tools within a second and
- * Telegram allows a bot about twenty messages a minute per group, so lines wait a
- * short window and go out as one message. `flush` is injected: the batcher knows
+ * Collects feed items per topic and sends one digest per window (or on demand, before
+ * something else is posted so chronology holds). `flush` is injected: the batcher knows
  * nothing about Telegram, and a test reads what it would have sent.
  */
 export class FeedBatcher {
-  private readonly buf = new Map<string, { lines: string[]; timer: ReturnType<typeof setTimeout> }>()
+  private readonly buf = new Map<string, { items: FeedItem[]; timer: ReturnType<typeof setTimeout> }>()
   constructor(
     private readonly flush: (topicId: string, text: string) => void,
-    private readonly windowMs = 2500,
+    private readonly windowMs = 15_000,
     private readonly maxChars = 3900,
   ) {}
 
-  add(topicId: string, lines: string[]): void {
-    if (!lines.length) return
+  add(topicId: string, items: FeedItem[]): void {
+    if (!items.length) return
     const cur = this.buf.get(topicId)
     if (cur) {
-      cur.lines.push(...lines)
+      cur.items.push(...items)
       return
     }
     const timer = setTimeout(() => this.fire(topicId), this.windowMs)
-    this.buf.set(topicId, { lines: [...lines], timer })
+    this.buf.set(topicId, { items: [...items], timer })
   }
 
-  /** Send whatever is waiting for a topic now (used before a close). */
+  /** Send the digest of what is waiting for a topic now. */
   fire(topicId: string): void {
     const b = this.buf.get(topicId)
     if (!b) return
     clearTimeout(b.timer)
     this.buf.delete(topicId)
-    // A burst larger than one message becomes several, never a truncated one: the
-    // feed promises a line per tool call, and the tail of a burst is where the
-    // interesting call usually is.
-    for (const chunk of packLines(b.lines, this.maxChars)) this.flush(topicId, chunk)
+    for (const chunk of packLines(digest(b.items), this.maxChars)) this.flush(topicId, chunk)
   }
 
   drop(topicId: string): void {

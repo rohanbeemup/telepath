@@ -18,12 +18,12 @@ describe('interpret', () => {
     expect(evs).toEqual([{ kind: 'say', text: 'Hello there.' }])
   })
 
-  test('tool calls become feed lines and subagent calls are indented', () => {
+  test('tool calls become feed items and subagent calls are marked', () => {
     const st = newPumpState('s1')
     const main = interpret(assistant([{ type: 'tool_use', name: 'Read', input: { file_path: '/r/a.ts' } }]), st, feedOn)
-    expect(main).toEqual([{ kind: 'feed', lines: ['📖 a.ts'] }])
+    expect(main).toEqual([{ kind: 'feed', items: [{ kind: 'read', label: 'a.ts' }] }])
     const sub = interpret(assistant([{ type: 'tool_use', name: 'Read', input: { file_path: '/r/b.ts' } }], { parent_tool_use_id: 'tu1' }), st, feedOn)
-    expect(sub).toEqual([{ kind: 'feed', lines: ['  ↳ 📖 b.ts'] }])
+    expect(sub).toEqual([{ kind: 'feed', items: [{ kind: 'read', label: 'b.ts', sub: true }] }])
     expect(interpret(assistant([{ type: 'tool_use', name: 'Read', input: { file_path: '/r/a.ts' } }]), st, feedOff)).toEqual([])
   })
 

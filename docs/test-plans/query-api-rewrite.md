@@ -90,6 +90,13 @@ what turned out false or true:
   prompt claimed permanence the operation does not have. Each has a case below or a
   wording fix, and the SDK's peer dependency `@anthropic-ai/sdk >=0.93.0` was unmet by the
   lockfile (0.81.0) and is now a direct dependency.
+- **False, found on the phone after the first evening: "one line per tool call is
+  readable."** Screenshot 22 Sep 19:48: each Write arrived as its own message (calls come
+  seconds apart, so a 2.5 s window batches nothing), the names were files on a machine the
+  reader cannot reach, and "✅ done" preceded "🤖 started" because completions were sent at
+  once while starts waited in the batch. The feed is now a digest: commands, subagents and
+  task lines by description, edits as one counted line, reads as a count, a 15 s window,
+  flushed before any text or completion so chronology holds.
 - **Found by the same smoke: breaking out of `for await` on the stream ends the session.**
   Returning the SDK's generator closes the query. The daemon's pump never breaks; the smoke
   script now mirrors it with one reader per session.
@@ -156,20 +163,22 @@ binary's version against the minimum the current models need, and the bot's iden
 | `keeps the last errors in a bounded ring` | after 30 errors the ring holds the newest 20 in order | an unbounded array that grows for the process lifetime |
 | `Bash prefers the human description over the command` | the feed line shows the description when present | showing raw commands the phone cannot read |
 | `Bash without a description shows the command, trimmed to one line` | newlines collapse, length is capped | a multi-line command spilling over the feed |
-| `background Bash is marked, so a later "Background task completed" has a referent` | `run_in_background` adds the ⏳ mark | a completion notice with nothing it can refer to |
+| `background Bash is marked, so a later "done" line has a referent` | `run_in_background` sets the item's background flag, rendered as ⏳ | a completion notice with nothing it can refer to |
 | `file tools name the file, not the whole payload` | Read/Edit/Write show the basename only | dumping `old_string`/`content` into the chat |
 | `search tools show the pattern` | Grep and Glob show the pattern | a bare tool name |
 | `subagents show their brief` | Agent shows its description | the full prompt |
 | `unknown tools fall back to name plus a short input` | an MCP tool yields `🔧 name {…}` within the cap | throwing on an unknown name |
-| `every line is single-line and capped` | class-level: no feed line contains a newline or exceeds the cap | a cap applied before the newline collapse |
-| `turns an assistant message into one line per tool call, nothing for text or thinking` | `feedLines` yields one line per `tool_use` block | counting text blocks as activity |
-| `a message without tool calls yields no lines` | text-only and undefined content yield `[]` | a placeholder line for every message |
+| `every label is single-line and capped` | class-level: no item label contains a newline or exceeds the cap | a cap applied before the newline collapse |
+| `turns an assistant message into one item per tool call, nothing for text or thinking` | `feedItems` yields one item per `tool_use` block, marked `sub` for a subagent | counting text blocks as activity |
+| `a digest lists commands and subagents, collapses edits into one line and counts reads` | commands, subagents and web calls keep a line each in call order; edits become one counted line naming a few files; reads and searches are a count | one message per file the machine touched, which a phone reader cannot use |
+| `a digest never lists more than a handful of lines and says how many it left out` | at most five listed lines plus a `+N more` line | a burst of thirty commands as thirty lines |
+| `a message without tool calls yields no items` | text-only and undefined content yield `[]` | a placeholder item for every message |
 | `describes a started background task and a settled one` | `task_started` with `is_backgrounded` and `task_notification` each yield one line carrying status and description | showing only completions, so a start is invisible |
-| `batches lines within the window into one message per topic` | lines added within the window leave as one message per topic, in order | one Telegram message per tool call, tripping the twenty-a-minute limit |
+| `batches items within the window into one digest per topic` | items added within the window leave as one digest per topic | one Telegram message per tool call: calls arrive seconds apart, so a short window sends each alone |
 | `splits an oversized batch into several sends instead of truncating it` | a burst larger than one message leaves as several bounded messages with every line, in order | slicing the joined batch at the cap and dropping the tail |
 | `fire sends what is waiting at once and drop discards it` | `fire` flushes immediately (before a close); `drop` discards without sending | a close that loses the last lines, or a wipe that posts into a deleted topic |
 | `assistant text becomes one say event` | text blocks in one message concatenate into a single say | one message per block |
-| `tool calls become feed lines and subagent calls are indented` | `parent_tool_use_id` set yields lines prefixed as subagent work | subagent internals indistinguishable from the main thread |
+| `tool calls become feed items and subagent calls are marked` | `parent_tool_use_id` set yields items flagged `sub`, rendered with ↳ | subagent internals indistinguishable from the main thread |
 | `captures the session id on the first assistant or result, never on init` | the id event fires once, only after a turn produced output | saving an id from `init` for a session closed before its first turn, which then fails every resume |
 | `a rejected rate limit yields one rate-limit event and later allowed events yield none` | status `rejected` → one hit event ordered BEFORE the relay, so the rotation baseline is read before the hand-off spawns the rotator; `allowed`/`allowed_warning` → relay only | alerting on every status change, or relaying first and reading a baseline the rotator has already moved |
 | `resets the rate-limit alert at the end of the turn` | after a `result`, the next `rejected` alerts again | a flag that stays set and silences every later turn |

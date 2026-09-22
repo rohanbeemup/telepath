@@ -83,7 +83,7 @@ In a **session topic**: just type. A 📌 **pinned control panel** sits at the t
 | 🐇 Haiku / ⚡ Sonnet / 🧠 Opus / ✨ Fable | Switch this topic's model (applies on the next message). Only the packages in `ENABLED_MODELS` are shown. |
 | 🎚 low / med / high / xhigh / max / ↺ default | How hard this topic's model thinks (Claude Code's effort level; applies on the next message). Hidden for Haiku, which has no levels. |
 | 🔐 Approvals ↔ ⚡ Auto | Toggle whether risky tools ask before running. |
-| 🔎 Activity feed | One short line per tool call (🖥 command, 📖 read, ✏️ edit, 🔍 search, 🤖 subagent), batched every few seconds. On by default in ⚡ auto, where no approval prompts show what the session is doing and a model deep in a long task may not narrate for an hour; off by default under approvals. Typed: `feed on` / `feed off`. |
+| 🔎 Activity feed | A digest of what the session did, about every 15 seconds and at the end of each turn: 🖥 commands and 🤖 subagents by their description, ✏️ edits collapsed to one line with a count and a few file names, reads and searches as a count. On by default in ⚡ auto, where no approval prompts show what the session is doing and a model deep in a long task may not narrate for an hour; off by default under approvals. Typed: `feed on` / `feed off`. |
 | 💾 Close & keep | Stop the session and close the topic; context is kept and a ♻️ **Reopen** button resumes it. |
 | 🗑 Close & delete | Remove the topic + binding. The transcript stays on disk (still `claude --resume`-able). |
 | 🧹 Close, delete & remove all | Full wipe: topic, binding, delivered files **and** the transcript — no longer resumable. Asks to confirm first. |

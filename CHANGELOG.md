@@ -18,9 +18,12 @@ Rewrite on the current Agent SDK, in tested modules, with observability.
 - **Idle eviction works.** The previous `pumping` flag was true for a session's whole
   life, so idle sessions were never evicted; a session is now idle when no turn is in
   flight and nothing happened for `IDLE_MINUTES`.
-- **Feed and task events.** Background task starts and completions come from the SDK's
-  own `task_started` / `task_notification` events; the activity feed batches lines per
-  topic within Telegram's rate limit.
+- **The activity feed is a digest.** About every 15 seconds, and before any text or task
+  completion so chronology holds: commands, subagents and task starts by their
+  description, edits collapsed to one counted line, reads and searches as a count. The
+  first version's one message per tool call read as spam on a phone (file names of a
+  machine the reader cannot reach, one message per edit) and let "done" arrive before
+  "started". Task starts and completions come from the SDK's own events.
 - **Configuration errors are reported together**, not one restart at a time; an unknown
   `DEFAULT_EFFORT` or `LOG_LEVEL` is an error rather than a silent default.
 

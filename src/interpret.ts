@@ -4,11 +4,11 @@
  * how it is delivered. The bot maps events to Telegram calls; tests feed messages in
  * and read events out, with no process and no network.
  */
-import { feedLines, describeTask } from './feed'
+import { feedItems, describeTask, type FeedItem } from './feed'
 
 export type Event =
   | { kind: 'say'; text: string }
-  | { kind: 'feed'; lines: string[] }
+  | { kind: 'feed'; items: FeedItem[] }
   | { kind: 'sessionId'; id: string }
   /** Every rate-limit event, for the rotator hand-off (it judges thresholds itself). */
   | { kind: 'limitRelay'; raw: unknown }
@@ -51,8 +51,8 @@ export function interpret(msg: any, st: PumpState, opts: InterpretOptions): Even
         : ''
       if (text) out.push({ kind: 'say', text })
       if (opts.feed) {
-        const lines = feedLines(content)
-        if (lines.length) out.push({ kind: 'feed', lines: msg.parent_tool_use_id ? lines.map(s => '  ↳ ' + s) : lines })
+        const items = feedItems(content, !!msg.parent_tool_use_id)
+        if (items.length) out.push({ kind: 'feed', items })
       }
       return out
     }
