@@ -1,8 +1,8 @@
 ---
 feature: Tables Claude writes arrive in Telegram as readable labelled blocks instead of a pipe grid
 suite:
-  - markdown.test.ts
-gate: bun test markdown.test.ts
+  - src/markdown.test.ts
+gate: bun test src/markdown.test.ts
 ---
 
 # Telegram-readable table output
@@ -170,7 +170,7 @@ What was checked, and what turned out false:
 
 ## Ring
 
-Ring 1 (unit): `bun test markdown.test.ts` covers the whole conversion, since
+Ring 1 (unit): `bun test src/markdown.test.ts` covers the whole conversion, since
 `mdToTelegramHtml` is a pure string-to-string function once extracted into
 `markdown.ts`.
 

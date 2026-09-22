@@ -30,6 +30,7 @@ Telegram allows exactly **one poller per bot token**, and the Claude Agent SDK i
 - 🖼️ **Files both ways** — send a photo or document into a topic and the session reads it; anything the session drops in its `TELEPATH_OUTBOX` folder is delivered back to the topic (images as photos, the rest as documents).
 - ✍️ **Formatted replies** — Claude's Markdown is rendered as Telegram HTML (bold, headings, lists, code, links), with a plain-text fallback so a message is never dropped. Tables become one labelled block per row, because Telegram never wraps a `<pre>` grid and a phone shows you a sliver of it.
 - 🆔 **Resumable** — each new topic prints its session id + a `claude --resume …` command so you can pick it up on your laptop.
+- 📊 **Observable** — structured JSON logs, per-process counters, a Status screen and a `health.json` on disk, so a silent failure is a number you can read rather than a silence you have to notice.
 - 🪟 **Linux, macOS and Windows** — Bun everywhere; `install.sh` + systemd on Linux, `install.ps1` / `start.bat` on Windows (see [`WINDOWS.md`](WINDOWS.md)).
 - 🔒 **Single-user** — only your Telegram user id can talk to it or approve anything.
 
@@ -82,6 +83,7 @@ In a **session topic**: just type. A 📌 **pinned control panel** sits at the t
 | 🐇 Haiku / ⚡ Sonnet / 🧠 Opus / ✨ Fable | Switch this topic's model (applies on the next message). Only the packages in `ENABLED_MODELS` are shown. |
 | 🎚 low / med / high / xhigh / max / ↺ default | How hard this topic's model thinks (Claude Code's effort level; applies on the next message). Hidden for Haiku, which has no levels. |
 | 🔐 Approvals ↔ ⚡ Auto | Toggle whether risky tools ask before running. |
+| 🔎 Activity feed | One short line per tool call (🖥 command, 📖 read, ✏️ edit, 🔍 search, 🤖 subagent), batched every few seconds. On by default in ⚡ auto, where no approval prompts show what the session is doing and a model deep in a long task may not narrate for an hour; off by default under approvals. Typed: `feed on` / `feed off`. |
 | 💾 Close & keep | Stop the session and close the topic; context is kept and a ♻️ **Reopen** button resumes it. |
 | 🗑 Close & delete | Remove the topic + binding. The transcript stays on disk (still `claude --resume`-able). |
 | 🧹 Close, delete & remove all | Full wipe: topic, binding, delivered files **and** the transcript — no longer resumable. Asks to confirm first. |
@@ -143,14 +145,48 @@ All via `.env` (see [`.env.example`](.env.example)). Key options: `DEFAULT_MODEL
 
 - **Model packages.** Four keys — `haiku`, `sonnet`, `opus`, `fable` — each mapped to a model id by its `*_MODEL` variable (defaults: Haiku 4.5, Sonnet 5, Opus 5, Fable 5.1). Pin an older generation by changing the id, e.g. `OPUS_MODEL=claude-opus-4-8`. The menus show the friendly name; the wizard and Settings also print which id each key resolves to.
 - **`ENABLED_MODELS`** (default `sonnet,opus`) decides which packages the menus offer — list only what your auth can actually use; a model your plan lacks fails on the first message of a topic. Fable is premium and not on every plan, so it is off by default. Topics still pinned to a now-disabled model are migrated to the default on boot, so a session can't get stuck failing on a model you can't reach.
-- **`CLAUDE_BINARY`.** The SDK pin ships its own `claude` binary, and that binary decides which models exist: the Claude 5 generation needs Claude Code 2.1.251+, and an older bundled one answers `claude_code_version_too_old` on a topic's first message. Point `CLAUDE_BINARY` at an up-to-date Claude Code install (the native installer keeps itself current); a newer SDK is not the fix, because later SDK releases removed the `unstable_v2_*` session API this daemon uses. See [WINDOWS.md](WINDOWS.md) for the Windows paths.
-- **Effort.** Claude Code's effort level (`low`, `medium`, `high`, `xhigh`, `max`) is chosen per topic: in the 🆕 wizard, on the pinned panel, or by typing `effort xhigh`. `DEFAULT_EFFORT` seeds new topics; unset means Claude Code decides (its `settings.json` `effortLevel` or built-in default). The level travels to the session's `claude` process as `CLAUDE_CODE_EFFORT_LEVEL`, which overrides the settings file for that process only — so switching effort restarts the topic's process, and the change applies on the next message. Haiku 4.5 has no effort levels, so the buttons are hidden for it.
+- **Claude binary.** The SDK bundles its own Claude Code (0.3.278 ships 2.1.278), and that binary decides which models exist: the Claude 5 generation needs 2.1.251 or newer, and an older one answers `claude_code_version_too_old` on a topic's first message. Boot reads the version and logs a warning when it is below the minimum. `CLAUDE_BINARY` overrides the bundled binary for experiments; the normal fix for an old binary is `bun install` after bumping the SDK.
+- **Effort.** Claude Code's effort level (`low`, `medium`, `high`, `xhigh`, `max`) is chosen per topic: in the 🆕 wizard, on the pinned panel, or by typing `effort xhigh`. `DEFAULT_EFFORT` seeds new topics; unset means Claude Code decides (its `settings.json` `effortLevel` or built-in default). It is passed to the session as the SDK's `effort` option, so switching effort restarts the topic's process and applies on the next message. Haiku 4.5 has no effort levels, so the buttons are hidden for it.
+- **Logging and status.** Every log line is one JSON object on stderr (`ts`, `lvl`, `ev`, fields), so `journalctl` output can be filtered and counted; `LOG_LEVEL` (default `info`, `debug` adds every send and the claude process's stderr) and `LOG_FORMAT=pretty` (default on a terminal) control it. 📊 **Status** in the menu, `/status`, and `<state-dir>/health.json` (rewritten every minute) show uptime, versions, live sessions, counters and the last errors.
 - **`REPOS_DIR`** (default: the parent of `DEFAULT_CWD`) is the root the folder picker scans. Git repos sort first, then other project folders by recency.
-- Runtime state lives next to the daemon (or in `TG_CLAUDE_STATE_DIR`): `registry.json` (topic → session), `prefs.json` (menu defaults), `outbox/<topic>/` (files awaiting delivery). All gitignored.
+- Runtime state lives next to the daemon (or in `TG_CLAUDE_STATE_DIR`): `registry.json` (topic → session), `prefs.json` (menu defaults), `outbox/<topic>/` (files awaiting delivery), `health.json`. All gitignored. Note that **Bun preloads `./.env` from the working directory** before the daemon reads `TG_CLAUDE_STATE_DIR/.env`, and the shell wins over the file: to run a second state directory from the repo folder, pass `bun --env-file=<state-dir>/.env run daemon.ts`, or you will start a second poller on the first `.env`'s token.
 
 ## How it works
 
-The daemon (`daemon.ts`) holds the bot token and routes by `message_thread_id`. Each topic gets a resident session via the SDK's `unstable_v2_createSession` / `unstable_v2_resumeSession`, with a `canUseTool` callback that posts approval/question prompts into that topic. Read-only tools auto-run; sessions idle-evict and resume from their persisted transcript, so context survives restarts.
+`daemon.ts` is the bootstrap: it loads and validates `.env`, opens the state files, runs a preflight (claude binary version, bot identity) and wires the modules under `src/`. Each topic gets a resident session through the Agent SDK's `query()` with streaming input: a per-topic mailbox feeds user messages in for as long as the topic lives, and one reader consumes the session's output. A `canUseTool` callback posts approval and question prompts into that topic; read-only tools auto-run; sessions idle-evict and resume from their persisted transcript by id, so context survives restarts.
+
+```
+daemon.ts             bootstrap: config → log → state → preflight → backend → topics → bot
+src/config.ts         .env parsing and validation; every problem reported at once
+src/models.ts         model packages, effort levels, labels
+src/state.ts          registry.json / prefs.json (atomic writes, migrations at load)
+src/log.ts            JSON-lines logger, counters, error ring
+src/mailbox.ts        the push iterable that keeps a query() resident
+src/session.ts        the SDK boundary: query(), listSessions()
+src/interpret.ts      SDK message → typed events (what a message means for the topic)
+src/feed.ts           tool-call and task lines, batched
+src/topics.ts         live sessions, cap, idle eviction, rate-limit resume, rotation watch
+src/commands.ts       the typed-text grammar (use / effort / feed / slash)
+src/ui/               keyboards, panel texts, the wizard state machine
+src/bot.ts            grammy handlers: Telegram in, Telegram out
+src/files.ts          outbox / inbox / transcript removal
+src/markdown.ts       markdown → Telegram HTML, rendered on a worker with a deadline
+src/rotator.ts        hand-off to claude-rotator
+```
+
+Everything that decides something is a pure module with a test; `src/bot.ts` and `src/session.ts` are the two edges that touch Telegram and the claude process.
+
+## Development
+
+```bash
+bun install
+bun run check          # tsc --noEmit over the whole tree, then every test
+bun test               # 117 tests, no network, no token, no claude process
+bun run typecheck
+bun run smoke          # Ring 2: one real session through the SDK (spends a few tokens)
+```
+
+Behaviour changes are planned test-first under [`docs/test-plans/`](docs/test-plans/): each plan names every test case verbatim and the wrong implementation it rejects, and `scripts/audit/test_plan_check.py` in the yom-spine repo holds plan and suite to each other in both directions.
 
 ## Cost & billing
 
@@ -181,6 +217,7 @@ Claude Code ships a built-in [**Remote Control**](https://code.claude.com/docs/e
 This bot can run shell commands and edit files on your machine, so treat it accordingly.
 
 - **Single-user gate.** Every inbound message *and* every Allow/Deny tap is checked against **both** your `ALLOWED_USER_ID` and the `FORUM_CHAT_ID`; everything else is dropped.
+- **The Allow/Deny prompt cannot be bypassed by your settings files.** A permissive `~/.claude/settings.json` (an allow rule for `Bash`, say) approves a tool before the SDK's permission callback is ever consulted. telepath registers a PreToolUse hook that forces the prompt for every tool that is not read-only, so the Telegram button is the decision on every machine, whatever the local settings allow. Measured against SDK 0.3.278; `bun run smoke` re-checks it.
 - **Keep the group private / solo.** Anyone *in* the forum group can read the bot's output (session content, tool results) even though only you can drive it. Don't add others.
 - **Auto mode = remote code execution.** A topic in `/auto` runs tools with no prompt. That's the point, but it means a single Telegram message can run arbitrary commands. It's per-topic, off by default — enable it only for topics/work you trust, and be aware that untrusted content a session fetches (web pages, files) could attempt prompt-injection.
 - **Bot token handling.** The `TELEGRAM_BOT_TOKEN` is scrubbed from the environment passed to child sessions (so a prompt-injected session can't read it from *its env*), and `.env` is force-chmod'd to `600` on load. This is **not** a sandbox, though: a session running tools (`Bash`/`Read`) — especially in `/auto` — can still read the `.env` file on disk like any other local file. The real protections are the single-user gate and keeping auto-mode off for untrusted work.
@@ -190,7 +227,7 @@ This bot can run shell commands and edit files on your machine, so treat it acco
 
 ## Caveats
 
-- Built on the SDK's **`unstable_v2_*` (@alpha)** API — pinned to a specific version; it may change between SDK releases.
+- Built on the Agent SDK's `query()` with streaming input, pinned to an exact SDK version; bump deliberately and run `bun run smoke` afterwards.
 - **One bot = one instance = one user.** Each teammate runs their own (own bot, own group, own `claude login`).
 
 ## License
