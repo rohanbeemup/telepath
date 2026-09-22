@@ -121,6 +121,14 @@ what turned out false or true:
   something is posted below the status it is deleted and re-posted silently at the bottom,
   once per burst; a turn's verdict is posted at the bottom too when content arrived after
   the last move. The last message in a topic is therefore the timer or the verdict.
+- **Found by Copilot's third round (nine findings, all confirmed):** overlapping ticks could
+  double an edit; a model-written description escaped redaction; "edited 5 files: a.ts"
+  counted calls, not files; the user's own message buried the status without a move;
+  `begin()`, the final edit and its retries ignored the budget's answer; a move spent two
+  operations on one reservation; a rate-limit wait survived into the next queued turn;
+  and a deleted topic kept retrying its summary. Each has a case below; the rule that
+  came out of it is that EVERY transport operation reserves budget first and what the
+  budget refuses is owed, never skipped past.
 - **Found by Copilot's review of the status push (five findings, all confirmed):** an old
   pump's unconditional `idle` closed a replacement session's fresh status as "stopped"
   after a model switch; a status spanning queued turns summarized an early failure as
@@ -202,8 +210,8 @@ binary's version against the minimum the current models need, and the bot's iden
 | `unknown tools fall back to name plus a short input` | an MCP tool yields `🔧 name {…}` within the cap | throwing on an unknown name |
 | `every label is single-line and capped` | class-level: no item label contains a newline or exceeds the cap | a cap applied before the newline collapse |
 | `turns an assistant message into one item per tool call, nothing for text or thinking` | `feedItems` yields one item per `tool_use` block, marked `sub` for a subagent | counting text blocks as activity |
-| `a digest lists commands and subagents, collapses edits into one line and counts reads` | commands, subagents and web calls keep a line each in call order; edits become one counted line naming a few files; reads and searches are a count | one message per file the machine touched, which a phone reader cannot use |
-| `labels never leak obvious secrets` | bearer headers, `KEY=value` credentials, known token prefixes and a bot token in a URL are masked in command labels; a git sha is not | showing commands verbatim in a message that stays on the phone |
+| `a digest lists commands and subagents, collapses edits into one line and counts reads` | commands, subagents and web calls keep a line each in call order; edits become one counted line of DISTINCT files; reads and searches are a count | one message per file the machine touched, or "edited 5 files: a.ts" for five edits to one file |
+| `labels never leak obvious secrets` | bearer headers, `KEY=value` credentials, known token prefixes and a bot token in a URL are masked in command labels AND in the model's own descriptions and briefs; a git sha is not | showing commands verbatim, or trusting the description because it is prose while it echoes the command's credential |
 | `a digest never lists more than a handful of lines and says how many it left out` | at most five listed lines plus a `+N more` line | a burst of thirty commands as thirty lines |
 | `a message without tool calls yields no items` | text-only and undefined content yield `[]` | a placeholder item for every message |
 | `describes a started background task and a settled one` | `task_started` with `is_backgrounded` and `task_notification` each yield one line carrying status and description | showing only completions, so a start is invisible |
@@ -257,8 +265,12 @@ binary's version against the minimum the current models need, and the bot's iden
 | `an earlier failure in a queued run is not summarized as done` | the most severe outcome across the queued turns wins the summary; an explicit stop still reads stopped | the last turn's outcome overwriting an earlier error or rate limit |
 | `the closing summary is retried after a 429 until it lands` | a throttled final edit is retried from the tick after the retry-after and then forgotten | discarding the final edit's result and leaving "Working" behind |
 | `the status moves below new messages so the last message in a topic is always the timer` | after content is posted the status is deleted and re-posted at the bottom, once per burst (debounced), carrying its text; later edits go to the new message; a finish right after a post puts the verdict at the bottom | a status buried under the answers, which tells the reader nothing about whether Claude is still busy |
-| `edits across all topics share one budget and slow down as topics multiply` | with N active topics no more than the shared per-minute budget is spent, every topic still gets edits, and the per-topic interval stretches to fit | per-topic intervals that add up past the per-group limit when several topics run |
+| `edits across all topics share one budget and slow down as topics multiply` | with N active topics no more than the shared per-minute budget is spent — creates, edits, and both operations of a move counted — every topic still gets edits, and the per-topic interval stretches to fit | per-topic intervals that add up past the per-group limit, or a move that reserves one slot and spends two |
 | `typing slows down when many topics are active` | the typing cadence halves above three active topics and never stops | a typing loop per topic that scales linearly into Telegram's limits |
+| `a rate-limit wait is cleared when the next queued turn starts running` | when a limited turn ends with more queued, the header returns to Working while the run's verdict still records the limit | a paused header shown throughout a turn that is in fact running |
+| `ticks never overlap, so a slow edit is not doubled` | a tick still awaiting the API makes the next tick return at once; one edit, not two | overlapping intervals each firing the same due edit |
+| `a status is not posted while the budget is exhausted and is posted once it frees` | a begin() the budget refuses is owed to a later tick; a status never posted finishes with no API call | creating past the cap because the budget's answer was discarded |
+| `drop cancels a pending closing for that topic` | deleting a topic forgets its queued summary edit | ten retries against a topic that no longer exists |
 | `queued messages are counted while a turn runs and the count falls as results arrive` | `N messages queued` while more than one turn is in flight; gone at one | a user unsure whether a second message was taken |
 | `compares dotted versions numerically` | `2.1.278 > 2.1.99 > 2.0.1000` | a string comparison |
 | `flags a binary older than the minimum` | 2.1.117 against minimum 2.1.251 is a failure with both numbers in the message | a boot that proceeds to the first 400 |

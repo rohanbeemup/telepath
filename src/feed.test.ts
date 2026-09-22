@@ -57,11 +57,17 @@ describe('toolItem', () => {
     for (const [input, expected] of cases) expect(redactSecrets(input)).toBe(expected)
     // a git sha and a device id are identifiers, not secrets: they keep their face
     expect(redactSecrets('git show f6f7e9d0c1fb5fa1789ebe7867d2f4e3a1b2c3d4')).toBe('git show f6f7e9d0c1fb5fa1789ebe7867d2f4e3a1b2c3d4')
+    // and prose that merely contains a keyword is not a credential
+    expect(redactSecrets('Audit the auth routes and the token refresh flow')).toBe('Audit the auth routes and the token refresh flow')
+    expect(redactSecrets('curl -H "Authorization: Bearer abcdef123456"')).toBe('curl -H "Authorization: [redacted]"')
+    expect(redactSecrets('header Bearer abcdef123456 only')).toBe('header Bearer [redacted] only')
     // the redaction applies to command labels and to the fallback for unknown tools
     expect(toolItem('Bash', { command: 'curl -H "Authorization: Bearer abcdef123456" https://x' }).label).toContain('[redacted]')
     expect(toolItem('mcp__x__y', { password: 'hunter22' }).label).toContain('[redacted]')
-    // a description written by the model is shown as-is: it is prose, not a command
+    // a description written by the model is prose, but it can echo the credential, so it is masked too
     expect(toolItem('Bash', { command: 'x', description: 'Rotate the token' }).label).toBe('Rotate the token')
+    expect(toolItem('Bash', { command: 'x', description: 'Deploy with token=sk-live-0123456789abcdef' }).label).toBe('Deploy with token=[redacted]')
+    expect(toolItem('Agent', { description: 'Use password: hunter22 to log in' }).label).toBe('Use password: [redacted] to log in')
   })
 })
 
@@ -107,6 +113,9 @@ describe('digest', () => {
     ])
     expect(digest([])).toEqual([])
     expect(digest([{ kind: 'edit', label: 'one.ts' }])).toEqual(['✏️ edited one.ts'])
+    // five edits to one file are one file edited, in the count and in the list
+    expect(digest(Array.from({ length: 5 }, () => ({ kind: 'edit' as const, label: 'same.ts' })))).toEqual(['✏️ edited same.ts'])
+    expect(digest([{ kind: 'edit', label: 'a.ts' }, { kind: 'edit', label: 'a.ts' }, { kind: 'edit', label: 'b.ts' }])).toEqual(['✏️ edited 2 files: a.ts, b.ts'])
   })
 
   test('a digest never lists more than a handful of lines and says how many it left out', () => {

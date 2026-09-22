@@ -36,7 +36,11 @@ function fileName(p: unknown): string {
  */
 // key, optional closing quote of a JSON key, separator, optional opening quote, value
 // (optionally prefixed by the word Bearer), matching closing quote.
-const KEYED_SECRET = /\b(token|secret|password|passwd|pwd|api[_-]?key|apikey|auth|authorization|bearer|client[_-]?secret|access[_-]?key)\b(["']?)(\s*[=:]\s*|\s+)(["']?)(?:Bearer\s+)?[^\s"']{4,}\4/gi
+// The separator must be `=` or `:`: a bare space would turn ordinary prose such as
+// "audit the auth routes" into a redaction. A bearer token after "Bearer " is caught
+// by its own pattern below.
+const KEYED_SECRET = /\b(token|secret|password|passwd|pwd|api[_-]?key|apikey|authorization|client[_-]?secret|access[_-]?key)\b(["']?)(\s*[=:]\s*)(["']?)(?:Bearer\s+)?[^\s"']{4,}\4/gi
+const BEARER = /\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/g
 const SHAPED_SECRET =
   /\b(sk-[A-Za-z0-9_-]{8,}|ghp_[A-Za-z0-9]{20,}|gho_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|glsa_[A-Za-z0-9_]{20,}|FlyV1\s+\S+|AIza[0-9A-Za-z_-]{30,})/g
 // A Telegram bot token (`<digits>:<35 chars>`) usually follows "bot" in a URL, so no word
@@ -46,6 +50,7 @@ const BOT_TOKEN = /\d{6,}:[A-Za-z0-9_-]{30,}/g
 export function redactSecrets(s: string): string {
   return s
     .replace(KEYED_SECRET, (_m, key: string, q: string, sep: string) => `${key}${q}${sep}[redacted]`)
+    .replace(BEARER, 'Bearer [redacted]')
     .replace(SHAPED_SECRET, '[redacted]')
     .replace(BOT_TOKEN, '[redacted]')
 }
@@ -66,8 +71,10 @@ export function toolItem(name: string, input: Record<string, unknown> | undefine
   switch (name) {
     case 'Bash':
     case 'PowerShell': {
-      const what = typeof i.description === 'string' && i.description ? i.description : redactSecrets(String(i.command ?? ''))
-      return { kind: 'command', label: oneLine(what), background: !!i.run_in_background }
+      // The description is the model's prose, but it can echo the command's credential
+      // ("Deploy with token sk-…"), so it is masked the same way.
+      const what = typeof i.description === 'string' && i.description ? i.description : String(i.command ?? '')
+      return { kind: 'command', label: oneLine(redactSecrets(what)), background: !!i.run_in_background }
     }
     case 'Read':
       return { kind: 'read', label: fileName(i.file_path) }
@@ -82,10 +89,10 @@ export function toolItem(name: string, input: Record<string, unknown> | undefine
     case 'WebFetch':
       return { kind: 'web', label: oneLine(redactSecrets(String(i.url ?? '')), 100) }
     case 'WebSearch':
-      return { kind: 'web', label: oneLine(String(i.query ?? ''), 100) }
+      return { kind: 'web', label: oneLine(redactSecrets(String(i.query ?? '')), 100) }
     case 'Agent':
     case 'Task':
-      return { kind: 'agent', label: oneLine(String(i.description ?? i.prompt ?? '')) }
+      return { kind: 'agent', label: oneLine(redactSecrets(String(i.description ?? i.prompt ?? ''))) }
     default: {
       let brief = ''
       try {
@@ -179,7 +186,9 @@ export function digest(items: FeedItem[]): string[] {
     }
   }
   if (hidden) lines.push(`… +${hidden} more`)
-  if (edits.length) lines.push(`✏️ ${edits.length === 1 ? 'edited' : `edited ${edits.length} files:`} ${listOf(edits)}`)
+  // Distinct files, not edit calls: five edits to one file are one file edited.
+  const files = [...new Set(edits)]
+  if (files.length) lines.push(`✏️ ${files.length === 1 ? 'edited' : `edited ${files.length} files:`} ${listOf(files)}`)
   const counts: string[] = []
   if (reads) counts.push(`📖 ${reads} read${reads === 1 ? '' : 's'}`)
   if (searches) counts.push(`🔍 ${searches} search${searches === 1 ? '' : 'es'}`)

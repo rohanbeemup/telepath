@@ -190,8 +190,7 @@ describe('TurnStatus', () => {
     h.s.begin('7', 2)
     await h.settle()
     h.s.addItems('7', [{ kind: 'command', label: 'x' }])
-    h.s.noteOutcome('7', 'error') // the first queued turn failed
-    h.s.setInFlight('7', 1)
+    h.s.turnEnded('7', 1, 'error') // the first queued turn failed
     await h.advance(10_000)
     await h.s.finish('7', 'ok') // the second succeeded
     expect(h.t.edits[h.t.edits.length - 1][2].startsWith('⚠️ Ended with an error')).toBe(true)
@@ -199,7 +198,7 @@ describe('TurnStatus', () => {
     h.s.begin('8', 2)
     await h.settle()
     h.s.addItems('8', [{ kind: 'command', label: 'x' }])
-    h.s.noteOutcome('8', 'limited')
+    h.s.turnEnded('8', 1, 'limited')
     await h.advance(10_000)
     await h.s.finish('8', 'ok')
     expect(h.t.edits[h.t.edits.length - 1][2].startsWith('⏸ Rate limit hit')).toBe(true)
@@ -254,18 +253,21 @@ describe('TurnStatus', () => {
   })
 
   test('edits across all topics share one budget and slow down as topics multiply', async () => {
-    const h = harness({ maxOpsPerMinute: 6, editEveryMs: 1_000 })
+    // budget 8: three creates, one move (two operations), leaves three for edits
+    const h = harness({ maxOpsPerMinute: 8, editEveryMs: 1_000 })
     for (const t of ['1', '2', '3']) h.s.begin(t, 1)
     await h.settle()
     for (const t of ['1', '2', '3']) h.s.addItems(t, [{ kind: 'command', label: 'go ' + t }])
-    const opsBefore = h.t.created.length // the three creates already spent budget
+    expect(h.t.created.length).toBe(3) // the three creates already spent budget
+    h.s.bump('1') // a move costs two operations and must be paid for as two
     for (let i = 0; i < 59; i++) await h.advance(1_000) // the whole first minute, before the creates leave the window
-    const spent = opsBefore + h.t.edits.length + h.t.removed.length
-    expect(spent).toBeLessThanOrEqual(6) // never more than the budget within one minute
-    // every topic got at least one edit: the budget is shared fairly, not hogged by one
-    for (const t of ['1', '2', '3']) expect(h.t.edits.some(e => e[0] === t)).toBe(true)
-    // and the per-topic interval stretched: with 3 topics and 6/min, 30 s apart, so ≤ 2 edits each in a minute
-    for (const t of ['1', '2', '3']) expect(h.t.edits.filter(e => e[0] === t).length).toBeLessThanOrEqual(2)
+    const spent = h.t.created.length + h.t.edits.length + h.t.removed.length
+    expect(spent).toBeLessThanOrEqual(8) // never more than the budget within one minute, moves included
+    expect(h.t.removed.length).toBe(1) // the move happened and was paid for
+    // every topic got at least one edit or its move: the budget is shared, not hogged by one
+    for (const t of ['2', '3']) expect(h.t.edits.some(e => e[0] === t)).toBe(true)
+    // and the per-topic interval stretched: with 3 topics and 8/min, 22.5 s apart, so ≤ 3 edits each in a minute
+    for (const t of ['1', '2', '3']) expect(h.t.edits.filter(e => e[0] === t).length).toBeLessThanOrEqual(3)
   })
 
   test('typing slows down when many topics are active', async () => {
@@ -290,8 +292,87 @@ describe('TurnStatus', () => {
     h.s.setInFlight('7', 3)
     await h.advance(4_000)
     expect(h.t.edits[0][2]).toContain('2 messages queued')
-    h.s.setInFlight('7', 1)
+    h.s.turnEnded('7', 1, 'ok')
     await h.advance(13_000)
     expect(h.t.edits[1][2]).not.toContain('queued')
+  })
+
+  test('a rate-limit wait is cleared when the next queued turn starts running', async () => {
+    const h = harness()
+    h.s.begin('7', 2)
+    await h.settle()
+    h.s.waiting('7', 'resets at 07:10')
+    await h.advance(4_000)
+    expect(h.t.edits[0][2].startsWith('⏸')).toBe(true)
+    h.s.turnEnded('7', 1, 'limited') // the limited turn ended; the queued one is now running
+    await h.advance(13_000)
+    expect(h.t.edits[1][2].startsWith('⏳') || h.t.edits[1][2].startsWith('⌛')).toBe(true)
+    // but the run's verdict still remembers the limit
+    await h.s.finish('7', 'ok')
+    expect(h.t.edits[h.t.edits.length - 1][2].startsWith('⏸ Rate limit hit')).toBe(true)
+  })
+
+  test('ticks never overlap, so a slow edit is not doubled', async () => {
+    let now = 1_000_000
+    let release: () => void = () => {}
+    const t = new FakeTransport()
+    const slowEdit = t.edit.bind(t)
+    let edits = 0
+    t.edit = async (topicId, id, text) => {
+      edits++
+      await new Promise<void>(r => (release = r)) // the API hangs until the test releases it
+      return slowEdit(topicId, id, text)
+    }
+    const s = new TurnStatus(t, { now: () => now, editEveryMs: 1_000, firstEditAfterMs: 0, maxOpsPerMinute: 60 })
+    s.begin('7', 1)
+    await new Promise(r => setTimeout(r, 5))
+    s.addItems('7', [{ kind: 'command', label: 'x' }])
+    now += 2_000
+    const first = s.tick() // starts the slow edit
+    await new Promise(r => setTimeout(r, 5))
+    now += 2_000
+    await s.tick() // returns at once: the previous tick is still in flight
+    await s.tick()
+    expect(edits).toBe(1)
+    release()
+    await first
+    expect(edits).toBe(1)
+  })
+
+  test('a status is not posted while the budget is exhausted and is posted once it frees', async () => {
+    const h = harness({ maxOpsPerMinute: 2, editEveryMs: 60_000 })
+    h.s.begin('1', 1)
+    h.s.begin('2', 1)
+    h.s.begin('3', 1) // the third exceeds the budget: owed, not posted
+    await h.settle()
+    expect(h.t.created.map(c => c[0])).toEqual(['1', '2'])
+    await h.advance(30_000)
+    expect(h.t.created.length).toBe(2) // still no budget
+    await h.advance(31_000) // the first two creates left the window
+    expect(h.t.created.map(c => c[0])).toEqual(['1', '2', '3'])
+    // and a status that was never posted closes without any API call
+    const removedBefore = h.t.removed.length
+    const editsBefore = h.t.edits.length
+    h.s.begin('4', 1)
+    await h.settle()
+    await h.s.finish('4', 'ok')
+    expect(h.t.removed.length).toBe(removedBefore)
+    expect(h.t.edits.length).toBe(editsBefore)
+  })
+
+  test('drop cancels a pending closing for that topic', async () => {
+    const h = harness()
+    h.s.begin('7', 1)
+    await h.settle()
+    h.s.addItems('7', [{ kind: 'command', label: 'x' }])
+    await h.advance(10_000)
+    h.t.failEditWith = 20_000
+    await h.s.finish('7', 'ok')
+    expect(h.s.pendingClosings()).toBe(1)
+    await h.s.drop('7') // the topic was deleted
+    expect(h.s.pendingClosings()).toBe(0)
+    const editsBefore = h.t.edits.length
+    await h.advance(30_000)
+    expect(h.t.edits.length).toBe(editsBefore) // no retry against a removed topic
   })
 })

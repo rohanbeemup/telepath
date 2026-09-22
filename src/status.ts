@@ -13,16 +13,17 @@
  * - An edit sends NO notification, so the answer itself is never an edit of this message:
  *   answers, questions and approvals stay new messages and this one only reports.
  * - Every message, edit and delete counts against one budget of roughly twenty per minute
- *   PER GROUP, and all topics live in one group. So all status operations across all
- *   topics draw from one shared budget (`maxOpsPerMinute`, default 12, leaving the rest
- *   for real messages), the per-topic edit interval stretches as topics multiply, and a
- *   429's `retry_after` is honoured exactly.
+ *   PER GROUP, and all topics live in one group. So EVERY operation this module performs,
+ *   across every topic, draws from one shared budget (`maxOpsPerMinute`, default 12,
+ *   leaving the rest for real messages): creates, edits, the two operations of a move,
+ *   closings and their retries. What the budget refuses is deferred, never skipped past.
  * - A message cannot be moved. When something is posted below the status it is deleted
  *   and re-posted silently at the bottom, debounced so a burst of posts costs one move,
  *   because a status the reader cannot see answers nothing.
  *
  * Everything here is transport-agnostic: create/edit/remove/type, the same shape on
- * Slack and Discord. The tick is driven from outside so tests control time.
+ * Slack and Discord. The tick is driven from outside so tests control time, and ticks
+ * never overlap: a slow API call cannot make the next tick double an edit.
  */
 import { digest, type FeedItem } from './feed'
 
@@ -52,7 +53,10 @@ export type TurnState = {
 type Active = TurnState & {
   topicId: string
   messageId?: number
-  creating: Promise<void> | undefined
+  /** The create is still owed: the budget refused it at begin(); tick() posts it when it can. */
+  pendingCreate: boolean
+  /** A create or move in progress; edits wait for it. */
+  busy: Promise<void> | undefined
   lastText: string
   nextEditAt: number
   lastTypingAt: number
@@ -73,7 +77,7 @@ export type TurnStatusOptions = {
   /** A turn shorter than this with no tool call leaves nothing behind. */
   minKeepMs?: number
   maxChars?: number
-  /** Shared across every topic: edits, moves and closings per minute. */
+  /** Shared across every topic and every operation this module performs, per minute. */
   maxOpsPerMinute?: number
   /** A burst of posts moves the status once, this long after the last post. */
   moveDebounceMs?: number
@@ -121,7 +125,7 @@ export function renderSummary(st: TurnState, elapsedMs: number, outcome: Outcome
   return parts.join(' · ')
 }
 
-type Closing = { topicId: string; messageId: number; text: string; nextAt: number; attempts: number }
+type Closing = { topicId: string; messageId: number; text: string; nextAt: number; attempts: number; inFlight: boolean }
 type EditResult = { ok: boolean; retryAfterMs?: number; gone?: boolean }
 
 export class TurnStatus {
@@ -129,6 +133,7 @@ export class TurnStatus {
   private readonly closing = new Map<number, Closing>()
   /** Timestamps of the operations spent in the last minute, across every topic. */
   private readonly ops: number[] = []
+  private ticking = false
   private readonly now: () => number
   private readonly editEveryMs: number
   private readonly firstEditAfterMs: number
@@ -160,17 +165,18 @@ export class TurnStatus {
     return this.active.size
   }
 
-  /** Summaries still waiting for their edit to land (a 429 on the final edit). */
+  /** Summaries still waiting for their edit to land (a 429 on the final edit, or no budget). */
   pendingClosings(): number {
     return this.closing.size
   }
 
   // ── the shared budget ──────────────────────────────────────────────────────
 
-  private spend(now: number): boolean {
+  /** Reserve `n` operations now, or none: a move needs both its delete and its create. */
+  private spend(now: number, n = 1): boolean {
     while (this.ops.length && this.ops[0] <= now - 60_000) this.ops.shift()
-    if (this.ops.length >= this.maxOpsPerMinute) return false
-    this.ops.push(now)
+    if (this.ops.length + n > this.maxOpsPerMinute) return false
+    for (let i = 0; i < n; i++) this.ops.push(now)
     return true
   }
 
@@ -185,7 +191,10 @@ export class TurnStatus {
 
   // ── lifecycle ──────────────────────────────────────────────────────────────
 
-  /** A turn started (or another message was queued behind a running one). */
+  /**
+   * A turn started (or another message was queued behind a running one). The message is
+   * posted now when the budget allows and otherwise owed to the next tick that can pay.
+   */
   begin(topicId: string, inFlight: number, showItems = true): void {
     const cur = this.active.get(topicId)
     if (cur) {
@@ -204,7 +213,8 @@ export class TurnStatus {
       waitNote: undefined,
       worst: 'ok',
       messageId: undefined,
-      creating: undefined,
+      pendingCreate: true,
+      busy: undefined,
       lastText: '',
       nextEditAt: now + this.firstEditAfterMs,
       lastTypingAt: 0,
@@ -214,20 +224,24 @@ export class TurnStatus {
       lastBumpAt: 0,
     }
     this.active.set(topicId, a)
-    const text = renderStatus(a, 0, { showItems, maxChars: this.maxChars })
-    a.lastText = text
-    this.spend(now) // the create counts too
-    a.creating = this.transport
-      .create(topicId, text)
+    if (this.spend(now)) this.create(a, now)
+  }
+
+  private create(a: Active, now: number): void {
+    a.pendingCreate = false
+    const text = renderStatus(a, now - a.startedAt, { showItems: a.showItems, maxChars: this.maxChars })
+    a.busy = this.transport
+      .create(a.topicId, text)
       .then(id => {
         a.messageId = id
+        a.lastText = text
         if (id === undefined) a.editsDisabled = true
       })
       .catch(() => {
         a.editsDisabled = true
       })
       .finally(() => {
-        a.creating = undefined
+        a.busy = undefined
       })
   }
 
@@ -251,16 +265,20 @@ export class TurnStatus {
   }
 
   /**
-   * One status spans every turn queued behind the first. A turn that ended in an error
-   * or a rate limit is recorded here so a later successful turn cannot summarize the
-   * whole run as done.
+   * One queued turn ended while others remain. Records how it went (a later success must
+   * not summarize the run as done), advances the count, and clears a rate-limit wait: the
+   * next turn is running, whatever held the previous one.
    */
-  noteOutcome(topicId: string, outcome: 'ok' | 'error' | 'limited'): void {
+  turnEnded(topicId: string, inFlight: number, outcome: 'ok' | 'error' | 'limited'): void {
     const a = this.active.get(topicId)
-    if (a && RANK[outcome] > RANK[a.worst]) a.worst = outcome
+    if (!a) return
+    if (RANK[outcome] > RANK[a.worst]) a.worst = outcome
+    a.inFlight = inFlight
+    a.waiting = false
+    a.waitNote = undefined
   }
 
-  /** Something else was posted in the topic: the status must move below it. */
+  /** Something else was posted in the topic (by the bot OR the user): the status must move below it. */
   bump(topicId: string): void {
     const a = this.active.get(topicId)
     if (!a) return
@@ -271,13 +289,24 @@ export class TurnStatus {
   // ── the tick ───────────────────────────────────────────────────────────────
 
   /**
-   * Drive from a 1 s interval. Order of spending: closings (a turn that ended must not
-   * read "Working"), then moves (a buried status answers nothing), then edits, oldest
-   * due first. Typing costs no budget.
+   * Drive from a 1 s interval. Serialized: a tick that is still awaiting the API returns
+   * the next caller at once, so nothing is edited twice. Order of spending: owed creates
+   * (a turn with no status at all), closings (a turn that ended must not read "Working"),
+   * moves (a buried status answers nothing), then edits, oldest due first. Typing costs
+   * no budget.
    */
   async tick(): Promise<void> {
+    if (this.ticking) return
+    this.ticking = true
+    try {
+      await this.tickInner()
+    } finally {
+      this.ticking = false
+    }
+  }
+
+  private async tickInner(): Promise<void> {
     const now = this.now()
-    for (const c of [...this.closing.values()]) if (now >= c.nextAt) await this.tryClose(c)
 
     const typingEvery = this.typingInterval()
     for (const a of this.active.values()) {
@@ -287,11 +316,21 @@ export class TurnStatus {
       }
     }
 
-    const ready = [...this.active.values()].filter(a => !a.editsDisabled && a.messageId !== undefined && !a.creating)
+    for (const a of [...this.active.values()].filter(x => x.pendingCreate)) {
+      if (!this.spend(now)) return
+      this.create(a, now)
+    }
+
+    for (const c of [...this.closing.values()].filter(x => !x.inFlight && now >= x.nextAt)) {
+      if (!this.spend(now)) return
+      await this.tryClose(c)
+    }
+
+    const ready = [...this.active.values()].filter(a => !a.editsDisabled && a.messageId !== undefined && !a.busy && !a.pendingCreate)
     const interval = this.editInterval()
 
     for (const a of ready.filter(x => x.needsMove && now - x.lastBumpAt >= this.moveDebounceMs)) {
-      if (!this.spend(now)) return
+      if (!this.spend(now, 2)) return // a move is a delete AND a create
       await this.move(a, now, interval)
     }
     for (const a of ready.filter(x => !x.needsMove && now >= x.nextEditAt).sort((x, y) => x.nextEditAt - y.nextEditAt)) {
@@ -302,7 +341,7 @@ export class TurnStatus {
         continue
       }
       if (!this.spend(now)) return
-      a.nextEditAt = now + interval // set before the await so a slow edit cannot double-fire
+      a.nextEditAt = now + interval
       const r = await this.transport.edit(a.topicId, a.messageId as number, text).catch((): EditResult => ({ ok: false }))
       if (r.ok) a.lastText = text
       else if (r.gone) a.editsDisabled = true
@@ -316,7 +355,7 @@ export class TurnStatus {
     a.needsMove = false
     a.frame++
     const text = renderStatus(a, now - a.startedAt, { showItems: a.showItems, maxChars: this.maxChars })
-    a.creating = (async () => {
+    a.busy = (async () => {
       void this.transport.remove(a.topicId, old).catch(() => {})
       const id = await this.transport.create(a.topicId, text).catch(() => undefined)
       if (id === undefined) {
@@ -327,62 +366,70 @@ export class TurnStatus {
       a.lastText = text
       a.nextEditAt = now + interval
     })().finally(() => {
-      a.creating = undefined
+      a.busy = undefined
     })
-    await a.creating
+    await a.busy
   }
 
   /**
    * The turn ended: a one-line summary, or nothing for a short quiet turn. If content was
    * posted below the status since its last move, the summary is posted at the bottom
    * instead of edited in place, so the last message of the topic is the verdict. The
-   * summary edit is retried from tick() when Telegram answers 429, so a status never
-   * stays on "Working" because the last edit was throttled.
+   * closing is queued and paid for from the budget like everything else, and retried
+   * from tick() when Telegram answers 429, so a status never stays on "Working".
    */
   async finish(topicId: string, outcome: Outcome): Promise<void> {
     const a = this.active.get(topicId)
     if (!a) return
     this.active.delete(topicId)
-    if (a.creating) await a.creating.catch(() => {})
-    if (a.messageId === undefined) return
+    if (a.busy) await a.busy.catch(() => {})
+    if (a.messageId === undefined) return // never posted (budget) or could not be: nothing to close
     const now = this.now()
     const elapsed = now - a.startedAt
     // A later turn's success does not erase an earlier turn's failure in the same run.
     const final: Outcome = outcome === 'stopped' ? 'stopped' : RANK[outcome] >= RANK[a.worst] ? outcome : a.worst
     if (final === 'ok' && elapsed < this.minKeepMs && a.toolCalls === 0) {
-      this.spend(now)
-      await this.transport.remove(topicId, a.messageId).catch(() => {})
+      // Removing a short quiet turn's message costs one operation; a refused budget here
+      // just leaves a "Working · 0:03" line, which is harmless and self-explanatory.
+      if (this.spend(now)) await this.transport.remove(topicId, a.messageId).catch(() => {})
       return
     }
     if (a.editsDisabled) return
     const text = renderSummary(a, elapsed, final)
     if (a.needsMove) {
-      this.spend(now)
-      void this.transport.remove(topicId, a.messageId).catch(() => {})
-      await this.transport.create(topicId, text).catch(() => undefined)
-      return
+      if (this.spend(now, 2)) {
+        void this.transport.remove(topicId, a.messageId).catch(() => {})
+        await this.transport.create(topicId, text).catch(() => undefined)
+        return
+      }
+      // No budget to move: edit in place instead, below via the closing queue.
     }
-    this.spend(now)
-    await this.tryClose({ topicId, messageId: a.messageId, text, nextAt: now, attempts: 0 })
+    const c: Closing = { topicId, messageId: a.messageId, text, nextAt: now, attempts: 0, inFlight: false }
+    this.closing.set(c.messageId, c)
+    if (this.spend(now)) await this.tryClose(c)
   }
 
+  /** One attempt at a queued closing; budget must have been reserved by the caller. */
   private async tryClose(c: Closing): Promise<void> {
+    if (!this.closing.has(c.messageId)) return // dropped meanwhile
+    c.inFlight = true
     c.attempts++
     const r = await this.transport.edit(c.topicId, c.messageId, c.text).catch((): EditResult => ({ ok: false }))
+    c.inFlight = false
     if (r.ok || r.gone || c.attempts >= 10) {
       this.closing.delete(c.messageId)
       return
     }
     c.nextAt = this.now() + (r.retryAfterMs ?? 5_000) + 500
-    this.closing.set(c.messageId, c)
   }
 
-  /** The topic is gone (deleted/wiped): drop the message and forget the turn. */
+  /** The topic is gone (deleted/wiped): drop the message, forget the turn and any pending closing. */
   async drop(topicId: string): Promise<void> {
+    for (const [id, c] of [...this.closing.entries()]) if (c.topicId === topicId) this.closing.delete(id)
     const a = this.active.get(topicId)
     if (!a) return
     this.active.delete(topicId)
-    if (a.creating) await a.creating.catch(() => {})
+    if (a.busy) await a.busy.catch(() => {})
     if (a.messageId !== undefined) await this.transport.remove(topicId, a.messageId).catch(() => {})
   }
 }

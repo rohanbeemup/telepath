@@ -46,6 +46,13 @@ Rewrite on the current Agent SDK, in tested modules, with observability.
   `allowedTools` is no longer passed. Found by the new Ring 2 smoke.
 - The outbox contract was also registered as a SessionStart hook that never ran under the
   SDK; the first-prompt priming (which did) is now the only channel.
+- From the third review round: every status operation (create, edit, both halves of a
+  move, the closing summary and its retries) reserves budget first and is deferred, never
+  skipped past, when the budget is full; ticks are serialized so a slow API call cannot
+  double an edit; the user's own message moves the status below it; a rate-limit wait
+  clears when the next queued turn runs; a deleted topic cancels its pending summary;
+  "edited N files" counts distinct files; model-written descriptions are redacted too,
+  and redaction requires `=`/`:` after a keyword so prose like "the auth routes" is left alone.
 - From review: `/attach` and the sessions list refuse an ambiguous prefix instead of
   binding the first match; a registry that does not parse stops the boot (exit 2) and is
   never overwritten; the unformatted fallback is split as plain text; `use <key>` and the

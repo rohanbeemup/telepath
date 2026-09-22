@@ -216,11 +216,8 @@ export class TelegramBot {
       case 'turn':
         if (ev.phase === 'start') this.status.begin(topicId, ev.inFlight, b ? feedOn(b) : false)
         else if (ev.phase === 'waiting') this.status.waiting(topicId, ev.note)
-        else if (ev.inFlight > 0) {
-          // more turns queued behind this one: remember how it went, keep the status open
-          this.status.noteOutcome(topicId, ev.outcome)
-          this.status.setInFlight(topicId, ev.inFlight)
-        } else await this.status.finish(topicId, ev.outcome)
+        else if (ev.inFlight > 0) this.status.turnEnded(topicId, ev.inFlight, ev.outcome) // more turns queued: keep the status open
+        else await this.status.finish(topicId, ev.outcome)
         return
       case 'turnEnd':
         await this.flushOutbox(topicId)
@@ -862,6 +859,7 @@ export class TelegramBot {
     }
 
     if (!b) return void this.send(topicId, 'This topic has no Claude session yet.', new InlineKeyboard().text('🆕 Start a session here', 'm:newhere'))
+    this.status.bump(topicId) // the user's own message now sits below the status
     await this.typing(topicId)
     if (!(await this.topics.sendToTopic(topicId, typed.text))) await this.say(topicId, 'No session bound to this topic. Use /new (or /attach) first.')
   }
@@ -883,6 +881,7 @@ export class TelegramBot {
       if (!this.allowed(ctx)) return void this.d.metrics.inc('rejected_updates')
       const topicId = this.topicIdOf(ctx)
       if (!topicId) return void this.say(undefined, 'Send images inside a session topic.')
+      this.status.bump(topicId)
       try {
         const best = ctx.message.photo[ctx.message.photo.length - 1]
         const path = this.d.files.saveInbox(`${best.file_unique_id}.jpg`, await this.download(best.file_id))
@@ -899,6 +898,7 @@ export class TelegramBot {
       if (!this.allowed(ctx)) return void this.d.metrics.inc('rejected_updates')
       const topicId = this.topicIdOf(ctx)
       if (!topicId) return void this.say(undefined, 'Send files inside a session topic.')
+      this.status.bump(topicId)
       const doc = ctx.message.document
       try {
         if (doc.file_size && doc.file_size > 20 * 1024 * 1024) {
