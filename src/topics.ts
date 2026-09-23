@@ -227,6 +227,9 @@ export class TopicManager {
   wrapUp(topicId: string, opts: { when: 'now' | 'after-turn'; dropQueue: boolean }): boolean {
     const l = this.live.get(topicId)
     if (!l || !isBusy(l) || l.wrap) return false
+    // A wrap-up is the user taking over: a pending rate-limit nudge or rotation watch
+    // would otherwise restart the work after the hand-off, or reopen a dropped session.
+    this.userTookOver(topicId)
     l.wrap = { dropQueue: opts.dropQueue, sawHandoff: false, resultsSeen: 0, queuedAtRequest: Math.max(0, l.inFlight - 1) }
     l.inFlight++
     l.session.send(WRAP_UP_PROMPT, { priority: opts.when === 'now' ? 'now' : 'next' })

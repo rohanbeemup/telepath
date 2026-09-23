@@ -117,8 +117,9 @@ export class TelegramBot {
       },
       edit: async (topicId, messageId, text, kind) => {
         try {
-          // An edit without reply_markup drops the buttons, so the live text re-sends its own.
-          await this.bot.api.editMessageText(chat, messageId, text, kind === 'live' ? { reply_markup: statusLiveKb() } : {})
+          // The markup is stated on every edit: the live text re-sends its button, the
+          // summary clears it explicitly rather than relying on an omitted field to do so.
+          await this.bot.api.editMessageText(chat, messageId, text, { reply_markup: kind === 'live' ? statusLiveKb() : { inline_keyboard: [] } })
           this.d.metrics.inc('status_edits')
           return { ok: true }
         } catch (e) {

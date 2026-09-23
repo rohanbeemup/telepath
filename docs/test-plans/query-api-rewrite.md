@@ -139,6 +139,14 @@ what turned out false or true:
   write Done/Open/Resume, stop. The hand-off is parsed and stored on the binding, ▶️
   Resume sends it back, and the queue runs afterwards unless the user chooses to drop it
   (the session is then closed after the hand-off, and the count is reported).
+- **Found by Copilot's review of the wrap-up (two inline findings, both taken):** a wrap-up
+  did not count as a takeover, so a rate-limit nudge scheduled before it, or a rotation
+  landing after it, could restart the work behind the hand-off or reopen a dropped
+  session; and the summary edit left the keyboard to an omitted field, now cleared
+  explicitly. Two remarks in its file table were read against the code and kept as they
+  are: a hand-off with only a Resume paragraph is still resumable, so Done/Open stay
+  optional; and a `started:` line is dropped only when its command is listed in the same
+  digest, which is the dedupe wanted, not a recency bug.
 - **Found by Copilot's third round (nine findings, all confirmed):** overlapping ticks could
   double an edit; a model-written description escaped redaction; "edited 5 files: a.ts"
   counted calls, not files; the user's own message buried the status without a move;
@@ -299,6 +307,7 @@ binary's version against the minimum the current models need, and the bot's iden
 | `wrap up and stop are commands` | `wrap up`, `wrapup`, `stop` alone are the wrap command; a sentence containing stop is chat | "stop the server please" ending the session |
 | `a wrap-up sends the hand-off instruction ahead of the queue and marks the next result as wrapped` | the instruction goes with priority `now` (or `next` for after-turn), one wrap-up at a time, nothing to wrap when idle; the preempted turn's result is `ok`, the hand-off turn's result is `wrapped`, queued messages keep running | queuing the instruction behind five messages, or reporting the preempted turn as the wrap-up |
 | `a wrap-up that drops the queue closes the session after the hand-off and says how many were dropped` | with drop, the session closes once the hand-off arrived and the event carries the count | dropping before the hand-off, or dropping silently |
+| `a wrap-up cancels a pending rate-limit nudge and rotation watch` | a wrap-up counts as a takeover: the reset nudge scheduled by an earlier rejection never fires and a rotation landing afterwards neither closes the session nor injects a continuation | work restarting after the hand-off, or a dropped session reopened by a timer nobody remembers |
 | `a hand-off in the model's text is remembered for resume` | a hand-off block in any answer is stored on the binding; ordinary text does not overwrite it | Resume with nothing to send |
 | `a wrapped-up turn ends with its own summary` | the verdict reads Wrapped up whatever earlier turns did; the live text carries the button kind, the summary does not | a wrap-up summarized as an error, or a summary still carrying a Wrap up button |
 | `the wrap-up confirmation offers the drop option only when something is queued` | no drop button at zero queued; the count in the label | offering to drop nothing |

@@ -342,6 +342,26 @@ describe('TopicManager', () => {
     expect(wrapped.dropped).toBe(2)
   })
 
+  test('a wrap-up cancels a pending rate-limit nudge and rotation watch', async () => {
+    let release: (v: string) => void = () => {}
+    const rotator = fakeRotator({ enabled: () => true, active: () => 'claude_33', waitForRotation: () => new Promise(r => (release = r)) })
+    const h = harness({ rotator, resumeBufferMs: 0 })
+    h.bind('1')
+    await h.tm.sendToTopic('1', 'long job')
+    await h.tm.sendToTopic('1', 'queued one') // still busy after the rejection, so a wrap-up is possible
+    const s = h.backend.last()
+    s.emit({ type: 'rate_limit_event', rate_limit_info: { status: 'rejected', resetsAt: Date.now() + 30 } })
+    await h.tick()
+    expect(h.tm.wrapUp('1', { when: 'now', dropQueue: true })).toBe(true)
+    release('claude_36') // the rotation lands after the wrap-up was requested
+    await new Promise(r => setTimeout(r, 80)) // and the reset nudge would have fired by now
+    expect(s.closed).toBe(false)
+    expect(h.backend.opens.length).toBe(1)
+    expect(h.said.some(([, text]) => text.startsWith('🔁') || text.startsWith('▶️'))).toBe(false)
+    expect(s.sent.filter(m => m.includes('Continue with the task')).length).toBe(0)
+    expect(s.sent[s.sent.length - 1]).toContain('📋 Handoff') // the wrap instruction is the last thing sent
+  })
+
   test("a hand-off in the model's text is remembered for resume", async () => {
     const h = harness()
     h.bind('1')
