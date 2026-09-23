@@ -26,8 +26,10 @@ export type Event =
    * arrives (inFlight already decremented), `waiting` while a rate limit holds it.
    */
   | { kind: 'turn'; phase: 'start'; inFlight: number }
-  | { kind: 'turn'; phase: 'end'; inFlight: number; outcome: 'ok' | 'error' | 'limited' }
+  | { kind: 'turn'; phase: 'end'; inFlight: number; outcome: 'ok' | 'error' | 'limited' | 'wrapped' }
   | { kind: 'turn'; phase: 'waiting'; inFlight: number; note: string | undefined }
+  /** A wrap-up completed: the hand-off (if the model wrote one) and what was dropped from the queue. */
+  | { kind: 'wrapped'; handoff: string | undefined; dropped: number }
 
 /** Per live session. `alerted` is the once-per-turn latch for rate-limit alerts. */
 export type PumpState = { sessionId?: string; alerted: boolean }

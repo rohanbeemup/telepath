@@ -58,15 +58,20 @@ export class Mailbox<T> implements AsyncIterable<T> {
 }
 
 /** The SDK's user-message shape, kept local so no test needs the SDK's types. */
+export type Priority = 'now' | 'next'
+
 export type UserMessage = {
   type: 'user'
   message: { role: 'user'; content: string }
   parent_tool_use_id: null
   session_id?: string
+  /** `now` runs at the next step boundary of the running turn, `next` right after it; both ahead of anything queued plainly. */
+  priority?: Priority
 }
 
-export function userMessage(text: string, sessionId?: string): UserMessage {
+export function userMessage(text: string, sessionId?: string, priority?: Priority): UserMessage {
   const m: UserMessage = { type: 'user', message: { role: 'user', content: text }, parent_tool_use_id: null }
   if (sessionId) m.session_id = sessionId
+  if (priority) m.priority = priority
   return m
 }

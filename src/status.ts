@@ -27,11 +27,14 @@
  */
 import { digest, type FeedItem } from './feed'
 
+/** `live` texts carry the Wrap up button; a `summary` carries none. */
+export type StatusKind = 'live' | 'summary'
+
 export interface StatusTransport {
   /** Post the message; return its id, or undefined when it could not be posted. */
-  create(topicId: string, text: string): Promise<number | undefined>
+  create(topicId: string, text: string, kind: StatusKind): Promise<number | undefined>
   /** `gone` = the message no longer exists (deleted by the user); stop editing it. */
-  edit(topicId: string, messageId: number, text: string): Promise<{ ok: boolean; retryAfterMs?: number; gone?: boolean }>
+  edit(topicId: string, messageId: number, text: string, kind: StatusKind): Promise<{ ok: boolean; retryAfterMs?: number; gone?: boolean }>
   remove(topicId: string, messageId: number): Promise<void>
   type(topicId: string): Promise<void>
 }
@@ -48,7 +51,12 @@ export type TurnState = {
   waitNote: string | undefined
   /** The most severe outcome seen so far across the queued turns this status spans. */
   worst: 'ok' | 'limited' | 'error'
+  /** When the last tool call was recorded; undefined until the first. */
+  lastItemAt: number | undefined
 }
+
+/** Say how long ago the last action was once the session has been quiet a while. */
+const QUIET_AFTER_MS = 30_000
 
 type Active = TurnState & {
   topicId: string
@@ -98,12 +106,24 @@ function plural(n: number, one: string, many = one + 's'): string {
   return `${n} ${n === 1 ? one : many}`
 }
 
+export function fmtAgo(ms: number): string {
+  const s = Math.floor(ms / 1000)
+  if (s < 60) return `${s}s ago`
+  const m = Math.floor(s / 60)
+  if (m < 60) return `${m}m ago`
+  return `${Math.floor(m / 60)}h ${m % 60}m ago`
+}
+
 /** The live text. Pure, capped to one Telegram message. */
-export function renderStatus(st: TurnState, elapsedMs: number, opts: { showItems?: boolean; maxChars?: number } = {}): string {
+export function renderStatus(st: TurnState, elapsedMs: number, opts: { showItems?: boolean; maxChars?: number; now?: number } = {}): string {
+  // "last action 3m ago" is the one thing a two-hour turn must say: it separates a
+  // session that is thinking from one that is stuck.
+  const quiet = opts.now !== undefined && st.lastItemAt !== undefined && opts.now - st.lastItemAt >= QUIET_AFTER_MS ? ` · last action ${fmtAgo(opts.now - st.lastItemAt)}` : ''
   const head = st.waiting
     ? `⏸ Rate limit hit${st.waitNote ? ` · ${st.waitNote}` : ''} · ${fmtElapsed(elapsedMs)}`
     : `${FRAMES[st.frame % FRAMES.length]} Working · ${fmtElapsed(elapsedMs)}` +
       (st.toolCalls ? ` · ${plural(st.toolCalls, 'tool call')}` : '') +
+      quiet +
       (st.inFlight > 1 ? ` · ${plural(st.inFlight - 1, 'message')} queued` : '')
   const lines = opts.showItems === false ? [] : digest(st.items)
   const max = opts.maxChars ?? 3500
@@ -112,12 +132,20 @@ export function renderStatus(st: TurnState, elapsedMs: number, opts: { showItems
   return text
 }
 
-export type Outcome = 'ok' | 'error' | 'stopped' | 'limited'
+export type Outcome = 'ok' | 'error' | 'stopped' | 'limited' | 'wrapped'
 
 /** The closing line. */
 export function renderSummary(st: TurnState, elapsedMs: number, outcome: Outcome): string {
   const icon =
-    outcome === 'ok' ? '✅ Done' : outcome === 'error' ? '⚠️ Ended with an error' : outcome === 'limited' ? `⏸ Rate limit hit${st.waitNote ? ` · ${st.waitNote}` : ''}` : '⏹ Stopped'
+    outcome === 'ok'
+      ? '✅ Done'
+      : outcome === 'error'
+        ? '⚠️ Ended with an error'
+        : outcome === 'limited'
+          ? `⏸ Rate limit hit${st.waitNote ? ` · ${st.waitNote}` : ''}`
+          : outcome === 'wrapped'
+            ? '⏹ Wrapped up'
+            : '⏹ Stopped'
   const edits = new Set(st.items.filter(i => i.kind === 'edit').map(i => i.label)).size
   const parts = [icon, fmtElapsed(elapsedMs)]
   if (st.toolCalls) parts.push(plural(st.toolCalls, 'tool call'))
@@ -212,6 +240,7 @@ export class TurnStatus {
       waiting: false,
       waitNote: undefined,
       worst: 'ok',
+      lastItemAt: undefined,
       messageId: undefined,
       pendingCreate: true,
       busy: undefined,
@@ -229,9 +258,9 @@ export class TurnStatus {
 
   private create(a: Active, now: number): void {
     a.pendingCreate = false
-    const text = renderStatus(a, now - a.startedAt, { showItems: a.showItems, maxChars: this.maxChars })
+    const text = renderStatus(a, now - a.startedAt, { showItems: a.showItems, maxChars: this.maxChars, now })
     a.busy = this.transport
-      .create(a.topicId, text)
+      .create(a.topicId, text, 'live')
       .then(id => {
         a.messageId = id
         a.lastText = text
@@ -250,6 +279,7 @@ export class TurnStatus {
     if (!a || !items.length) return
     a.items.push(...items)
     a.toolCalls += items.filter(i => i.kind !== 'task').length
+    a.lastItemAt = this.now()
   }
 
   setInFlight(topicId: string, inFlight: number): void {
@@ -335,14 +365,14 @@ export class TurnStatus {
     }
     for (const a of ready.filter(x => !x.needsMove && now >= x.nextEditAt).sort((x, y) => x.nextEditAt - y.nextEditAt)) {
       a.frame++
-      const text = renderStatus(a, now - a.startedAt, { showItems: a.showItems, maxChars: this.maxChars })
+      const text = renderStatus(a, now - a.startedAt, { showItems: a.showItems, maxChars: this.maxChars, now })
       if (text === a.lastText) {
         a.nextEditAt = now + interval
         continue
       }
       if (!this.spend(now)) return
       a.nextEditAt = now + interval
-      const r = await this.transport.edit(a.topicId, a.messageId as number, text).catch((): EditResult => ({ ok: false }))
+      const r = await this.transport.edit(a.topicId, a.messageId as number, text, 'live').catch((): EditResult => ({ ok: false }))
       if (r.ok) a.lastText = text
       else if (r.gone) a.editsDisabled = true
       else if (r.retryAfterMs) a.nextEditAt = now + r.retryAfterMs + 500 // exactly what Telegram asked, plus a margin
@@ -354,10 +384,10 @@ export class TurnStatus {
     const old = a.messageId as number
     a.needsMove = false
     a.frame++
-    const text = renderStatus(a, now - a.startedAt, { showItems: a.showItems, maxChars: this.maxChars })
+    const text = renderStatus(a, now - a.startedAt, { showItems: a.showItems, maxChars: this.maxChars, now })
     a.busy = (async () => {
       void this.transport.remove(a.topicId, old).catch(() => {})
-      const id = await this.transport.create(a.topicId, text).catch(() => undefined)
+      const id = await this.transport.create(a.topicId, text, 'live').catch(() => undefined)
       if (id === undefined) {
         a.editsDisabled = true // the old one is gone and no new one exists; nothing to edit
         return
@@ -386,8 +416,9 @@ export class TurnStatus {
     if (a.messageId === undefined) return // never posted (budget) or could not be: nothing to close
     const now = this.now()
     const elapsed = now - a.startedAt
-    // A later turn's success does not erase an earlier turn's failure in the same run.
-    const final: Outcome = outcome === 'stopped' ? 'stopped' : RANK[outcome] >= RANK[a.worst] ? outcome : a.worst
+    // A later turn's success does not erase an earlier turn's failure in the same run;
+    // a stop or a wrap-up is reported as what it is.
+    const final: Outcome = outcome === 'stopped' || outcome === 'wrapped' ? outcome : RANK[outcome] >= RANK[a.worst] ? outcome : a.worst
     if (final === 'ok' && elapsed < this.minKeepMs && a.toolCalls === 0) {
       // Removing a short quiet turn's message costs one operation; a refused budget here
       // just leaves a "Working · 0:03" line, which is harmless and self-explanatory.
@@ -399,7 +430,7 @@ export class TurnStatus {
     if (a.needsMove) {
       if (this.spend(now, 2)) {
         void this.transport.remove(topicId, a.messageId).catch(() => {})
-        await this.transport.create(topicId, text).catch(() => undefined)
+        await this.transport.create(topicId, text, 'summary').catch(() => undefined)
         return
       }
       // No budget to move: edit in place instead, below via the closing queue.
@@ -414,7 +445,7 @@ export class TurnStatus {
     if (!this.closing.has(c.messageId)) return // dropped meanwhile
     c.inFlight = true
     c.attempts++
-    const r = await this.transport.edit(c.topicId, c.messageId, c.text).catch((): EditResult => ({ ok: false }))
+    const r = await this.transport.edit(c.topicId, c.messageId, c.text, 'summary').catch((): EditResult => ({ ok: false }))
     c.inFlight = false
     if (r.ok || r.gone || c.attempts >= 10) {
       this.closing.delete(c.messageId)

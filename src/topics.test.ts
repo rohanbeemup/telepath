@@ -13,10 +13,12 @@ const catalog = buildCatalog({
 
 class FakeSession implements LiveSession {
   readonly sent: string[] = []
+  readonly sentWith: { text: string; priority?: 'now' | 'next' }[] = []
   readonly inbox = new Mailbox<unknown>()
   closed = false
-  send(text: string): void {
+  send(text: string, opts?: { priority?: 'now' | 'next' }): void {
     this.sent.push(text)
+    this.sentWith.push({ text, priority: opts?.priority })
   }
   stream(): AsyncIterable<unknown> {
     return this.inbox
@@ -286,6 +288,73 @@ describe('TopicManager', () => {
     h.backend.last().inbox.close()
     await h.tick()
     expect(h.events.filter(([t, ev]) => t === '1' && ev.kind === 'state' && ev.state === 'idle').length).toBe(1)
+  })
+
+  test('a wrap-up sends the hand-off instruction ahead of the queue and marks the next result as wrapped', async () => {
+    const h = harness()
+    h.bind('1')
+    await h.tm.sendToTopic('1', 'long job')
+    await h.tm.sendToTopic('1', 'queued one')
+    const s = h.backend.last()
+    expect(h.tm.wrapUp('1', { when: 'now', dropQueue: false })).toBe(true)
+    expect(h.tm.wrapUp('1', { when: 'now', dropQueue: false })).toBe(false) // one wrap-up at a time
+    const wrap = s.sentWith[s.sentWith.length - 1]
+    expect(wrap.priority).toBe('now')
+    expect(wrap.text).toContain('📋 Handoff')
+    // the preempted turn ends first (its own result), then the wrap-up turn writes the hand-off
+    s.emit(result())
+    await h.tick()
+    s.emit({ type: 'assistant', message: { content: [{ type: 'text', text: '📋 Handoff\nDone: a\nOpen: b\nResume: continue with c' }] }, parent_tool_use_id: null, session_id: 's' })
+    s.emit(result())
+    await h.tick()
+    const ends = h.events.filter(([, ev]) => ev.kind === 'turn' && ev.phase === 'end') as [string, Extract<Event, { kind: 'turn'; phase: 'end' }>][]
+    expect(ends.map(([, e]) => e.outcome)).toEqual(['ok', 'wrapped'])
+    const wrapped = h.events.find(([, ev]) => ev.kind === 'wrapped')?.[1] as Extract<Event, { kind: 'wrapped' }>
+    expect(wrapped.dropped).toBe(0)
+    expect(wrapped.handoff).toContain('Resume: continue with c')
+    expect(h.tm.isLive('1')).toBe(true) // the queued message still runs
+    // "after this turn" uses the next-priority slot
+    h.bind('2')
+    await h.tm.sendToTopic('2', 'x')
+    h.tm.wrapUp('2', { when: 'after-turn', dropQueue: false })
+    expect(h.backend.last().sentWith[1].priority).toBe('next')
+    // not busy → nothing to wrap
+    h.bind('3')
+    expect(h.tm.wrapUp('3', { when: 'now', dropQueue: false })).toBe(false)
+  })
+
+  test('a wrap-up that drops the queue closes the session after the hand-off and says how many were dropped', async () => {
+    const h = harness()
+    h.bind('1')
+    await h.tm.sendToTopic('1', 'long job')
+    await h.tm.sendToTopic('1', 'queued one')
+    await h.tm.sendToTopic('1', 'queued two')
+    const s = h.backend.last()
+    h.tm.wrapUp('1', { when: 'now', dropQueue: true })
+    s.emit(result()) // the preempted turn
+    await h.tick()
+    s.emit({ type: 'assistant', message: { content: [{ type: 'text', text: '📋 Handoff\nDone: a\nOpen: b\nResume: c' }] }, parent_tool_use_id: null, session_id: 's' })
+    s.emit(result()) // the wrap-up turn
+    await h.tick()
+    expect(s.closed).toBe(true)
+    expect(h.tm.isLive('1')).toBe(false)
+    const wrapped = h.events.find(([, ev]) => ev.kind === 'wrapped')?.[1] as Extract<Event, { kind: 'wrapped' }>
+    expect(wrapped.dropped).toBe(2)
+  })
+
+  test("a hand-off in the model's text is remembered for resume", async () => {
+    const h = harness()
+    h.bind('1')
+    await h.tm.sendToTopic('1', 'x')
+    const s = h.backend.last()
+    s.emit({ type: 'assistant', message: { content: [{ type: 'text', text: 'Stopping here.\n\n📋 Handoff\nDone: typecheck green\nOpen: build pending\nResume: run pnpm build in repo X on branch y' }] }, parent_tool_use_id: null, session_id: 's' })
+    await h.tick()
+    expect(h.store.registry['1'].handoff?.text.startsWith('📋 Handoff')).toBe(true)
+    expect(h.store.registry['1'].handoff?.text).toContain('Resume: run pnpm build')
+    // ordinary text does not overwrite it
+    s.emit({ type: 'assistant', message: { content: [{ type: 'text', text: 'ok' }] }, parent_tool_use_id: null, session_id: 's' })
+    await h.tick()
+    expect(h.store.registry['1'].handoff?.text).toContain('Resume: run pnpm build')
   })
 
   test('never leaks the bot token into a session environment', async () => {

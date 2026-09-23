@@ -142,6 +142,30 @@ export const approveKb = (token: string): InlineKeyboard => new InlineKeyboard()
 
 export const controlsKb = (): InlineKeyboard => new InlineKeyboard().text('⚙️ Controls', 'm:ctl')
 
+/** On the live status message: ask the session to finish its step and hand off. */
+export const statusLiveKb = (): InlineKeyboard => new InlineKeyboard().text('⏹ Wrap up', 'm:twrap')
+
+/** The wrap-up choices; the drop option only exists when something is queued. */
+export function wrapConfirmKb(queued: number): InlineKeyboard {
+  const kb = new InlineKeyboard()
+    .text('⏹ Hand off at the next step (recommended)', 'm:tw:now').row()
+    .text('⏳ Finish this turn first, then hand off', 'm:tw:turn').row()
+  if (queued > 0) kb.text(`🗑 Hand off now and drop the ${queued} queued`, 'm:tw:nowdrop').row()
+  return kb.text('↩️ Cancel', 'm:ctl')
+}
+
+export function wrapConfirmText(queued: number): string {
+  return (
+    `⏹ Wrap up this session?\n\n` +
+    `The session finishes the step it is on (or the whole turn), writes a short hand-off (done · open · how to resume) and stops. ` +
+    `Nothing is lost: the context stays in the transcript and ▶️ Resume continues from the hand-off.` +
+    (queued > 0 ? `\n\n${queued} message${queued === 1 ? '' : 's'} of yours ${queued === 1 ? 'is' : 'are'} still queued behind the current turn; they run after the hand-off unless you drop them.` : '')
+  )
+}
+
+/** Under a hand-off: send its Resume paragraph as the next message. */
+export const resumeKb = (): InlineKeyboard => new InlineKeyboard().text('▶️ Resume from hand-off', 'm:tres')
+
 /** Test helpers: what a keyboard would send back, and what it shows. */
 export function callbackData(kb: InlineKeyboard): string[] {
   return kb.inline_keyboard.flat().flatMap(b => ('callback_data' in b && typeof b.callback_data === 'string' ? [b.callback_data] : []))

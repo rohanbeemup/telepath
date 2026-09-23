@@ -46,6 +46,16 @@ Rewrite on the current Agent SDK, in tested modules, with observability.
   `allowedTools` is no longer passed. Found by the new Ring 2 smoke.
 - The outbox contract was also registered as a SessionStart hook that never ran under the
   SDK; the first-prompt priming (which did) is now the only channel.
+- **⏹ Wrap up** on the status message (or type `wrap up` / `stop`): a steering message
+  with SDK priority `now` (or `next` for "finish this turn first") asks the session to
+  finish its current step, write a hand-off (Done · Open · Resume) and stop; the hand-off
+  is stored and **▶️ Resume** sends it back as the next message. Queued messages run
+  afterwards unless dropped, in which case the count is reported. Nothing is interrupted
+  mid-step and the transcript keeps the context.
+- The digest lists the most recent lines, not the first five frozen for the whole turn;
+  a background command no longer appears twice (tool call + task start); edited files
+  are named newest first; and the header says `last action 3m ago` once the session has
+  been quiet for 30 s.
 - From the third review round: every status operation (create, edit, both halves of a
   move, the closing summary and its retries) reserves budget first and is deferred, never
   skipped past, when the budget is full; ticks are serialized so a slow API call cannot

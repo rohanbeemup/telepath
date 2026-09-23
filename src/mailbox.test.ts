@@ -52,5 +52,7 @@ describe('userMessage', () => {
   test('wraps text as a user message with parent_tool_use_id null', () => {
     expect(userMessage('hi')).toEqual({ type: 'user', message: { role: 'user', content: 'hi' }, parent_tool_use_id: null })
     expect(userMessage('hi', 'abc').session_id).toBe('abc')
+    expect(userMessage('hi', undefined, 'now').priority).toBe('now')
+    expect('priority' in userMessage('hi')).toBe(false)
   })
 })

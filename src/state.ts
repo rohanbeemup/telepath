@@ -18,6 +18,8 @@ export type Binding = {
   /** Activity feed override; unset = on in auto mode, off under approvals. */
   feed?: boolean
   controlMsgId?: number
+  /** The last hand-off the model wrote after a wrap-up; Resume sends it back. */
+  handoff?: { at: number; text: string }
 }
 export type Registry = Record<string, Binding>
 export type Prefs = { defaultModel: string; defaultCwd: string; defaultEffort?: Effort }

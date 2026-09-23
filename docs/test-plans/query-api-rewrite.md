@@ -15,6 +15,7 @@ suite:
   - src/preflight.test.ts
   - src/gate.test.ts
   - src/status.test.ts
+  - src/handoff.test.ts
   - src/rotator.test.ts
 gate: bun test
 ---
@@ -121,6 +122,23 @@ what turned out false or true:
   something is posted below the status it is deleted and re-posted silently at the bottom,
   once per burst; a turn's verdict is posted at the bottom too when content arrived after
   the last move. The last message in a topic is therefore the timer or the verdict.
+- **Seen on the phone after a two-hour turn: "it keeps saying the same thing."** The digest
+  listed the FIRST five commands with "+128 more", every background command appeared twice
+  (its tool call and the SDK's `task_started` for it), and nothing in the header said when
+  the last action was. The digest now lists the most recent lines behind an "N earlier"
+  count, drops a task start that repeats a listed command, names the newest edited files
+  first, and the header carries "last action 3m ago" once the session has been quiet for
+  30 s, which is the one line that separates thinking from stuck.
+- **Asked: "a Stop button — but doesn't he forget what he was doing?"** A hard
+  `interrupt()` drops the step in flight and leaves the user to reconstruct where things
+  stood. Measured against SDK 0.3.278 with a strictly sequential eight-step chain: a user
+  message with `priority: 'now'` ends the running turn at its next step boundary (its own
+  result first) and runs immediately after; `'next'` runs after the current turn; both run
+  before messages queued plainly (order measured: now → next → plain). So Wrap up is a
+  steering message, not an interrupt: finish only the step you are on, start nothing new,
+  write Done/Open/Resume, stop. The hand-off is parsed and stored on the binding, ▶️
+  Resume sends it back, and the queue runs afterwards unless the user chooses to drop it
+  (the session is then closed after the hand-off, and the count is reported).
 - **Found by Copilot's third round (nine findings, all confirmed):** overlapping ticks could
   double an edit; a model-written description escaped redaction; "edited 5 files: a.ts"
   counted calls, not files; the user's own message buried the status without a move;
@@ -153,6 +171,7 @@ src/session.ts        the only module that imports SDK runtime: query(), listSes
 src/interpret.ts      SDKMessage → typed events (pure; the pump's decisions)
 src/feed.ts           tool-call items, secret redaction, the digest (pure)
 src/status.ts         one live status message per turn: elapsed, digest, queue; edits rate-limited (pure core)
+src/handoff.ts        wrap-up: the instruction, the hand-off shape and its parser, the resume prompt (pure)
 src/topics.ts         live sessions, cap, idle eviction, rate-limit resume, rotation watch
 src/commands.ts       typed-text command grammar (pure)
 src/ui/keyboards.ts   every keyboard and panel text (pure)
@@ -212,7 +231,9 @@ binary's version against the minimum the current models need, and the bot's iden
 | `turns an assistant message into one item per tool call, nothing for text or thinking` | `feedItems` yields one item per `tool_use` block, marked `sub` for a subagent | counting text blocks as activity |
 | `a digest lists commands and subagents, collapses edits into one line and counts reads` | commands, subagents and web calls keep a line each in call order; edits become one counted line of DISTINCT files; reads and searches are a count | one message per file the machine touched, or "edited 5 files: a.ts" for five edits to one file |
 | `labels never leak obvious secrets` | bearer headers, `KEY=value` credentials, known token prefixes and a bot token in a URL are masked in command labels AND in the model's own descriptions and briefs; a git sha is not | showing commands verbatim, or trusting the description because it is prose while it echoes the command's credential |
-| `a digest never lists more than a handful of lines and says how many it left out` | at most five listed lines plus a `+N more` line | a burst of thirty commands as thirty lines |
+| `a digest never lists more than a handful of lines and says how many it left out` | at most five listed lines, the MOST RECENT ones, behind an `… N earlier` line | a burst of thirty commands as thirty lines, or the first five frozen for two hours |
+| `a digest shows the most recent activity and drops a task start that duplicates its command` | the last five listed lines are shown, edits name the newest files first, and a `started:` line that repeats a listed command is dropped | showing the oldest lines forever, and every background command twice |
+| `the header says how long ago the last action was once the session goes quiet` | after 30 s without a tool call the header carries `last action Ns ago`, in s/m/h; nothing before the first action | a two-hour turn whose header cannot tell thinking from stuck |
 | `a message without tool calls yields no items` | text-only and undefined content yield `[]` | a placeholder item for every message |
 | `describes a started background task and a settled one` | `task_started` with `is_backgrounded` and `task_notification` each yield one line carrying status and description | showing only completions, so a start is invisible |
 | `assistant text becomes one say event` | text blocks in one message concatenate into a single say | one message per block |
@@ -272,6 +293,15 @@ binary's version against the minimum the current models need, and the bot's iden
 | `a status is not posted while the budget is exhausted and is posted once it frees` | a begin() the budget refuses is owed to a later tick; a status never posted finishes with no API call | creating past the cap because the budget's answer was discarded |
 | `drop cancels a pending closing for that topic` | deleting a topic forgets its queued summary edit | ten retries against a topic that no longer exists |
 | `queued messages are counted while a turn runs and the count falls as results arrive` | `N messages queued` while more than one turn is in flight; gone at one | a user unsure whether a second message was taken |
+| `parses the hand-off block into done, open and resume` | the three labelled sections are extracted, with or without markdown bold, Resume may span lines | a resume button that sends the whole chat or nothing |
+| `text without a resume paragraph is not a hand-off` | no Resume → undefined, so nothing is stored or offered | remembering "All done" as something to resume from |
+| `the resume prompt carries the hand-off verbatim and the wrap-up prompt asks for that exact shape` | the prompt the model gets names Done/Open/Resume and "finish only the step"; the resume prompt contains the hand-off | a prompt whose shape the parser cannot read back |
+| `wrap up and stop are commands` | `wrap up`, `wrapup`, `stop` alone are the wrap command; a sentence containing stop is chat | "stop the server please" ending the session |
+| `a wrap-up sends the hand-off instruction ahead of the queue and marks the next result as wrapped` | the instruction goes with priority `now` (or `next` for after-turn), one wrap-up at a time, nothing to wrap when idle; the preempted turn's result is `ok`, the hand-off turn's result is `wrapped`, queued messages keep running | queuing the instruction behind five messages, or reporting the preempted turn as the wrap-up |
+| `a wrap-up that drops the queue closes the session after the hand-off and says how many were dropped` | with drop, the session closes once the hand-off arrived and the event carries the count | dropping before the hand-off, or dropping silently |
+| `a hand-off in the model's text is remembered for resume` | a hand-off block in any answer is stored on the binding; ordinary text does not overwrite it | Resume with nothing to send |
+| `a wrapped-up turn ends with its own summary` | the verdict reads Wrapped up whatever earlier turns did; the live text carries the button kind, the summary does not | a wrap-up summarized as an error, or a summary still carrying a Wrap up button |
+| `the wrap-up confirmation offers the drop option only when something is queued` | no drop button at zero queued; the count in the label | offering to drop nothing |
 | `compares dotted versions numerically` | `2.1.278 > 2.1.99 > 2.0.1000` | a string comparison |
 | `flags a binary older than the minimum` | 2.1.117 against minimum 2.1.251 is a failure with both numbers in the message | a boot that proceeds to the first 400 |
 | `UTC stamp to whole seconds, one space, the raw JSON` | the limit-events line matches the shim's format | a line the rotator dashboard cannot parse |

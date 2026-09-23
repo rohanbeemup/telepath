@@ -6,6 +6,7 @@
  */
 import type { CanUseTool, HookCallbackMatcher, HookEvent } from '@anthropic-ai/claude-agent-sdk'
 import { interpret, newPumpState, type Event } from './interpret'
+import { HANDOFF_MARKER, parseHandoff, WRAP_UP_PROMPT } from './handoff'
 import type { Effort } from './models'
 import { effortFor, type Catalog } from './models'
 import type { Store } from './state'
@@ -26,10 +27,13 @@ export type OpenOptions = {
 } & SessionExtras
 
 export interface LiveSession {
-  send(text: string): void
+  send(text: string, opts?: { priority?: 'now' | 'next' }): void
   stream(): AsyncIterable<unknown>
   close(): void
 }
+
+/** A wrap-up in progress: waiting for the hand-off, then optionally dropping the queue. */
+type Wrap = { dropQueue: boolean; sawHandoff: boolean; resultsSeen: number; queuedAtRequest: number }
 
 export interface SessionBackend {
   open(opts: OpenOptions): LiveSession
@@ -47,6 +51,7 @@ export type Live = {
    * during a turn keeps the session busy until its own result arrives.
    */
   inFlight: number
+  wrap?: Wrap
 }
 
 export function isBusy(l: Live): boolean {
@@ -213,6 +218,23 @@ export class TopicManager {
     return true
   }
 
+  /**
+   * Wrap up the running turn: finish the current step (or the current turn), write a
+   * hand-off, stop. The instruction jumps ahead of every queued message. With
+   * `dropQueue`, the session is closed once the hand-off is in, so the messages still
+   * queued behind it never run; the caller is told how many.
+   */
+  wrapUp(topicId: string, opts: { when: 'now' | 'after-turn'; dropQueue: boolean }): boolean {
+    const l = this.live.get(topicId)
+    if (!l || !isBusy(l) || l.wrap) return false
+    l.wrap = { dropQueue: opts.dropQueue, sawHandoff: false, resultsSeen: 0, queuedAtRequest: Math.max(0, l.inFlight - 1) }
+    l.inFlight++
+    l.session.send(WRAP_UP_PROMPT, { priority: opts.when === 'now' ? 'now' : 'next' })
+    this.d.metrics.inc('wrap_ups')
+    this.d.log.info('session.wrap_up', { topic: topicId, when: opts.when, dropQueue: opts.dropQueue, queued: l.wrap.queuedAtRequest })
+    return true
+  }
+
   /** Idle eviction: a session with no turn in flight and nothing said for idleMinutes. */
   evictIdle(): void {
     const cutoff = this.now() - this.d.idleMinutes * 60_000
@@ -296,20 +318,48 @@ export class TopicManager {
               await this.d.onEvent(topicId, { kind: 'turn', phase: 'waiting', inFlight: l.inFlight, note: until ? `resets at ${until}` : undefined })
               break
             }
+            case 'say': {
+              // A hand-off the model wrote (after a wrap-up, or on its own) is kept: Resume sends it back.
+              if (ev.text.includes(HANDOFF_MARKER) && b) {
+                const h = parseHandoff(ev.text)
+                if (h) {
+                  b.handoff = { at: this.now(), text: h.text }
+                  this.d.store.saveRegistry()
+                  if (l.wrap) l.wrap.sawHandoff = true
+                }
+              }
+              await this.d.onEvent(topicId, ev)
+              break
+            }
             case 'turnEnd':
-            case 'turnError':
+            case 'turnError': {
               l.inFlight = Math.max(0, l.inFlight - 1)
               l.lastActive = this.now()
               this.d.metrics.inc('turns')
               if (ev.kind === 'turnError') this.d.metrics.inc('turn_errors')
               await this.d.onEvent(topicId, ev)
-              await this.d.onEvent(topicId, {
-                kind: 'turn',
-                phase: 'end',
-                inFlight: l.inFlight,
-                outcome: ev.kind === 'turnEnd' ? 'ok' : ev.afterRateLimit ? 'limited' : 'error',
-              })
+              let outcome: 'ok' | 'error' | 'limited' | 'wrapped' = ev.kind === 'turnEnd' ? 'ok' : ev.afterRateLimit ? 'limited' : 'error'
+              if (l.wrap) {
+                // `now` preempts the running turn (its own result comes first), then the
+                // wrap-up runs; `next` runs after it. Either way the wrap-up's result is the
+                // one that follows the hand-off text, or at the latest the second result.
+                l.wrap.resultsSeen++
+                if (l.wrap.sawHandoff || l.wrap.resultsSeen >= 2) {
+                  const w = l.wrap
+                  l.wrap = undefined
+                  outcome = 'wrapped'
+                  const dropped = w.dropQueue ? l.inFlight : 0
+                  if (w.dropQueue && l.inFlight > 0) {
+                    this.closeLive(topicId, `wrapped up, ${l.inFlight} queued dropped`)
+                    l.inFlight = 0
+                  }
+                  this.d.metrics.inc('wrap_ups_completed')
+                  await this.d.onEvent(topicId, { kind: 'wrapped', handoff: b?.handoff?.text, dropped })
+                }
+              }
+              await this.d.onEvent(topicId, { kind: 'turn', phase: 'end', inFlight: l.inFlight, outcome })
               break
+            }
             default:
               await this.d.onEvent(topicId, ev)
           }
