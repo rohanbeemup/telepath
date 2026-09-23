@@ -26,6 +26,13 @@ describe('parseTyped', () => {
     expect(parseTyped('Feed OFF', catalog)).toEqual({ kind: 'feed', on: false })
   })
 
+  test('wrap up and stop are commands', () => {
+    expect(parseTyped('wrap up', catalog)).toEqual({ kind: 'wrap' })
+    expect(parseTyped('Wrapup', catalog)).toEqual({ kind: 'wrap' })
+    expect(parseTyped('STOP', catalog)).toEqual({ kind: 'wrap' })
+    expect(parseTyped('stop the server please', catalog).kind).toBe('chat')
+  })
+
   test('slash commands with args', () => {
     expect(parseTyped('/new my project cwd=/p auto', catalog)).toEqual({ kind: 'slash', cmd: 'new', args: 'my project cwd=/p auto' })
     expect(parseTyped('/menu', catalog)).toEqual({ kind: 'slash', cmd: 'menu', args: '' })

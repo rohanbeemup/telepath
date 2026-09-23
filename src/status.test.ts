@@ -4,22 +4,26 @@ import { TurnStatus, renderStatus, type StatusTransport, type TurnState } from '
 /** Records every call and lets a test fail an edit with a retry-after. */
 class FakeTransport implements StatusTransport {
   created: [string, string][] = []
+  createdKinds: string[] = []
   edits: [string, number, string][] = []
+  editKinds: string[] = []
   removed: [string, number][] = []
   typing: string[] = []
   nextId = 100
   failEditWith: number | undefined // retry-after ms
-  async create(topicId: string, text: string): Promise<number | undefined> {
+  async create(topicId: string, text: string, kind: string): Promise<number | undefined> {
     this.created.push([topicId, text])
+    this.createdKinds.push(kind)
     return this.nextId++
   }
-  async edit(topicId: string, messageId: number, text: string): Promise<{ ok: boolean; retryAfterMs?: number; gone?: boolean }> {
+  async edit(topicId: string, messageId: number, text: string, kind: string): Promise<{ ok: boolean; retryAfterMs?: number; gone?: boolean }> {
     if (this.failEditWith !== undefined) {
       const r = this.failEditWith
       this.failEditWith = undefined
       return { ok: false, retryAfterMs: r }
     }
     this.edits.push([topicId, messageId, text])
+    this.editKinds.push(kind)
     return { ok: true }
   }
   async remove(topicId: string, messageId: number): Promise<void> {
@@ -66,11 +70,12 @@ describe('renderStatus', () => {
       waiting: false,
       waitNote: undefined,
       worst: 'ok',
+      lastItemAt: undefined,
     }
     const text = renderStatus(st, 192_000)
     expect(text.split('\n')[0]).toBe('⏳ Working · 3:12 · 4 tool calls · 1 message queued')
     expect(text).toContain('🖥 Typecheck and run the unit tests')
-    expect(text).toContain('✏️ edited 2 files: a.ts, b.ts')
+    expect(text).toContain('✏️ edited 2 files: b.ts, a.ts') // newest first
     expect(text).toContain('📖 1 read')
     // a rate-limit wait replaces the spinner line, with or without a known reset time
     expect(renderStatus({ ...st, waiting: true, waitNote: 'resets at 07:10' }, 192_000).split('\n')[0]).toBe('⏸ Rate limit hit · resets at 07:10 · 3:12')
@@ -78,6 +83,20 @@ describe('renderStatus', () => {
     // the render never exceeds a Telegram message
     const huge: TurnState = { ...st, items: Array.from({ length: 500 }, (_, i) => ({ kind: 'command' as const, label: `c${i} ${'x'.repeat(150)}` })) }
     expect(renderStatus(huge, 1000).length).toBeLessThanOrEqual(3500)
+  })
+})
+
+describe('renderStatus quiet marker', () => {
+  test('the header says how long ago the last action was once the session goes quiet', () => {
+    const st: TurnState = { startedAt: 0, items: [], toolCalls: 3, inFlight: 1, frame: 0, waiting: false, waitNote: undefined, worst: 'ok', lastItemAt: 100_000 }
+    // 10 s after the last action: nothing extra; the line stays short
+    expect(renderStatus(st, 110_000, { now: 110_000 }).split('\n')[0]).toBe('⏳ Working · 1:50 · 3 tool calls')
+    // 45 s after: the marker appears; minutes and hours format themselves
+    expect(renderStatus(st, 145_000, { now: 145_000 }).split('\n')[0]).toBe('⏳ Working · 2:25 · 3 tool calls · last action 45s ago')
+    expect(renderStatus(st, 400_000, { now: 400_000 }).split('\n')[0]).toContain('last action 5m ago')
+    expect(renderStatus(st, 8_000_000, { now: 8_000_000 }).split('\n')[0]).toContain('last action 2h 11m ago')
+    // before any action there is nothing to date
+    expect(renderStatus({ ...st, lastItemAt: undefined }, 400_000, { now: 400_000 }).split('\n')[0]).not.toContain('last action')
   })
 })
 
@@ -172,6 +191,20 @@ describe('TurnStatus', () => {
     await h.s.finish('7', 'stopped')
     expect(h.t.edits[h.t.edits.length - 1][2]).toBe('⏹ Stopped · 0:10 · 1 tool call')
     expect(h.s.isActive('7')).toBe(false)
+  })
+
+  test('a wrapped-up turn ends with its own summary', async () => {
+    const h = harness()
+    h.s.begin('7', 2)
+    await h.settle()
+    h.s.addItems('7', [{ kind: 'command', label: 'x' }, { kind: 'edit', label: 'a.ts' }])
+    h.s.turnEnded('7', 1, 'error') // an earlier turn failed, but a wrap-up is reported as a wrap-up
+    await h.advance(20_000)
+    await h.s.finish('7', 'wrapped')
+    expect(h.t.edits[h.t.edits.length - 1][2]).toBe('⏹ Wrapped up · 0:20 · 2 tool calls · 1 file edited')
+    // the live message carried the wrap-up button; the summary does not
+    expect(h.t.createdKinds[0]).toBe('live')
+    expect(h.t.editKinds[h.t.editKinds.length - 1]).toBe('summary')
   })
 
   test('a rate limit shows as waiting in the status', async () => {
@@ -318,10 +351,10 @@ describe('TurnStatus', () => {
     const t = new FakeTransport()
     const slowEdit = t.edit.bind(t)
     let edits = 0
-    t.edit = async (topicId, id, text) => {
+    t.edit = async (topicId, id, text, kind) => {
       edits++
       await new Promise<void>(r => (release = r)) // the API hangs until the test releases it
-      return slowEdit(topicId, id, text)
+      return slowEdit(topicId, id, text, kind)
     }
     const s = new TurnStatus(t, { now: () => now, editEveryMs: 1_000, firstEditAfterMs: 0, maxOpsPerMinute: 60 })
     s.begin('7', 1)

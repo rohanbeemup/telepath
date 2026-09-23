@@ -108,21 +108,44 @@ describe('digest', () => {
       '🖥 Typecheck and run the unit tests',
       '🤖 Inspect PR #92 branch state',
       '↳ 🖥 Start the dev server ⏳',
-      '✏️ edited 5 files: package.json, tsconfig.json, topics.ts +2',
+      '✏️ edited 5 files: facts.ts, registry.ts, topics.ts +2',
       '📖 2 reads · 🔍 1 search',
     ])
     expect(digest([])).toEqual([])
     expect(digest([{ kind: 'edit', label: 'one.ts' }])).toEqual(['✏️ edited one.ts'])
     // five edits to one file are one file edited, in the count and in the list
     expect(digest(Array.from({ length: 5 }, () => ({ kind: 'edit' as const, label: 'same.ts' })))).toEqual(['✏️ edited same.ts'])
-    expect(digest([{ kind: 'edit', label: 'a.ts' }, { kind: 'edit', label: 'a.ts' }, { kind: 'edit', label: 'b.ts' }])).toEqual(['✏️ edited 2 files: a.ts, b.ts'])
+    expect(digest([{ kind: 'edit', label: 'a.ts' }, { kind: 'edit', label: 'a.ts' }, { kind: 'edit', label: 'b.ts' }])).toEqual(['✏️ edited 2 files: b.ts, a.ts'])
   })
 
   test('a digest never lists more than a handful of lines and says how many it left out', () => {
     const items: FeedItem[] = Array.from({ length: 12 }, (_, i) => ({ kind: 'command' as const, label: `cmd ${i}` }))
     const lines = digest(items)
     expect(lines.length).toBe(6)
-    expect(lines[5]).toBe('… +7 more')
+    expect(lines[0]).toBe('… 7 earlier')
+    expect(lines[5]).toBe('🖥 cmd 11')
+  })
+
+  test('a digest shows the most recent activity and drops a task start that duplicates its command', () => {
+    const items: FeedItem[] = []
+    for (let i = 0; i < 8; i++) {
+      items.push({ kind: 'command', label: `Step ${i}`, background: true })
+      items.push({ kind: 'task', label: `⏳ started: Step ${i}` }) // the SDK's task_started for the same command
+      items.push({ kind: 'edit', label: `file${i}.ts` })
+    }
+    const lines = digest(items)
+    // the last five commands, not the first five; no duplicate "started" lines
+    expect(lines).toEqual([
+      '… 3 earlier',
+      '🖥 Step 3 ⏳',
+      '🖥 Step 4 ⏳',
+      '🖥 Step 5 ⏳',
+      '🖥 Step 6 ⏳',
+      '🖥 Step 7 ⏳',
+      '✏️ edited 8 files: file7.ts, file6.ts, file5.ts +5',
+    ])
+    // a task start with no matching command is still shown (a subagent the model spawned)
+    expect(digest([{ kind: 'task', label: '🤖 started: Audit the routes' }])).toEqual(['🤖 started: Audit the routes'])
   })
 })
 

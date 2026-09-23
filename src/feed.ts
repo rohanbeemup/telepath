@@ -138,41 +138,52 @@ function listOf(labels: string[], cap = NAMES_CAP): string {
   return uniq.length > cap ? `${shown} +${uniq.length - cap}` : shown
 }
 
+/** The description behind a "⏳ started: …" / "🤖 started: …" task line, for de-duplication. */
+function startedDescription(label: string): string | undefined {
+  const m = /^\S+\s+started:\s*(.+)$/.exec(label)
+  return m ? m[1] : undefined
+}
+
 /**
  * The digest: commands, subagents, web calls and task lines stay one per line (their
  * labels are what a reader can act on); edits collapse to one line naming a few files
- * and counting the rest; reads and searches are a count only. Order of the kept lines
- * follows the order the calls were made. Empty input → no lines.
+ * and counting the rest; reads and searches are a count only. Empty input → no lines.
+ *
+ * The listed lines are the MOST RECENT ones. A status message lives for the whole turn,
+ * and after two hours the first five commands say nothing about whether anything is
+ * still happening; the last five do. Older lines are counted, not shown. A task-start
+ * line whose description repeats a command or subagent already listed is dropped: the
+ * SDK reports a backgrounded command twice (its tool call and its task start).
  */
 export function digest(items: FeedItem[]): string[] {
   if (!items.length) return []
-  const lines: string[] = []
+  const listed: string[] = []
   const edits: string[] = []
+  const seen = new Set<string>()
   let reads = 0
   let searches = 0
-  let hidden = 0
   const sub = (it: FeedItem) => (it.sub ? '↳ ' : '')
   for (const it of items) {
     switch (it.kind) {
       case 'command':
-        if (lines.length < LIST_CAP) lines.push(`${sub(it)}🖥 ${it.label}${it.background ? ' ⏳' : ''}`)
-        else hidden++
+        seen.add(it.label)
+        listed.push(`${sub(it)}🖥 ${it.label}${it.background ? ' ⏳' : ''}`)
         break
       case 'agent':
-        if (lines.length < LIST_CAP) lines.push(`${sub(it)}🤖 ${it.label}`)
-        else hidden++
+        seen.add(it.label)
+        listed.push(`${sub(it)}🤖 ${it.label}`)
         break
       case 'web':
-        if (lines.length < LIST_CAP) lines.push(`${sub(it)}🌐 ${it.label}`)
-        else hidden++
+        listed.push(`${sub(it)}🌐 ${it.label}`)
         break
-      case 'task':
-        if (lines.length < LIST_CAP) lines.push(`${sub(it)}${it.label}`)
-        else hidden++
+      case 'task': {
+        const desc = startedDescription(it.label)
+        if (desc !== undefined && seen.has(desc)) break // the command line already says it
+        listed.push(`${sub(it)}${it.label}`)
         break
+      }
       case 'other':
-        if (lines.length < LIST_CAP) lines.push(`${sub(it)}🔧 ${it.label}`)
-        else hidden++
+        listed.push(`${sub(it)}🔧 ${it.label}`)
         break
       case 'edit':
         edits.push(it.label)
@@ -185,9 +196,12 @@ export function digest(items: FeedItem[]): string[] {
         break
     }
   }
-  if (hidden) lines.push(`… +${hidden} more`)
-  // Distinct files, not edit calls: five edits to one file are one file edited.
-  const files = [...new Set(edits)]
+  const lines: string[] = []
+  const earlier = Math.max(0, listed.length - LIST_CAP)
+  if (earlier) lines.push(`… ${earlier} earlier`)
+  lines.push(...listed.slice(-LIST_CAP))
+  // Distinct files, not edit calls, most recent first: five edits to one file are one file edited.
+  const files = [...new Set(edits.slice().reverse())]
   if (files.length) lines.push(`✏️ ${files.length === 1 ? 'edited' : `edited ${files.length} files:`} ${listOf(files)}`)
   const counts: string[] = []
   if (reads) counts.push(`📖 ${reads} read${reads === 1 ? '' : 's'}`)

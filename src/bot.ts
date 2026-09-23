@@ -12,6 +12,7 @@ import type { Config } from './config'
 import { parseTyped } from './commands'
 import { describeTask } from './feed'
 import { TurnStatus, type StatusTransport } from './status'
+import { parseHandoff, resumePrompt } from './handoff'
 import { deleteTranscript, isImage, listRepoFolders, type Files } from './files'
 import type { Event } from './interpret'
 import type { Logger, Metrics } from './log'
@@ -29,7 +30,11 @@ import {
   openLinkKb,
   pagedListKb,
   pageSuffix,
+  resumeKb,
   settingsKb,
+  statusLiveKb,
+  wrapConfirmKb,
+  wrapConfirmText,
   settingsText,
   topicControlsKb,
   topicControlsText,
@@ -96,9 +101,13 @@ export class TelegramBot {
       return { code: any?.error_code, text: String(any?.description ?? any?.message ?? e), retryAfter: any?.parameters?.retry_after }
     }
     return {
-      create: async (topicId, text) => {
+      create: async (topicId, text, kind) => {
         try {
-          const sent = await this.bot.api.sendMessage(chat, text, { message_thread_id: Number(topicId), disable_notification: true })
+          const sent = await this.bot.api.sendMessage(chat, text, {
+            message_thread_id: Number(topicId),
+            disable_notification: true,
+            ...(kind === 'live' ? { reply_markup: statusLiveKb() } : {}),
+          })
           this.d.metrics.inc('status_created')
           return sent.message_id
         } catch (e) {
@@ -106,9 +115,11 @@ export class TelegramBot {
           return undefined
         }
       },
-      edit: async (topicId, messageId, text) => {
+      edit: async (topicId, messageId, text, kind) => {
         try {
-          await this.bot.api.editMessageText(chat, messageId, text)
+          // The markup is stated on every edit: the live text re-sends its button, the
+          // summary clears it explicitly rather than relying on an omitted field to do so.
+          await this.bot.api.editMessageText(chat, messageId, text, { reply_markup: kind === 'live' ? statusLiveKb() : { inline_keyboard: [] } })
           this.d.metrics.inc('status_edits')
           return { ok: true }
         } catch (e) {
@@ -216,9 +227,22 @@ export class TelegramBot {
       case 'turn':
         if (ev.phase === 'start') this.status.begin(topicId, ev.inFlight, b ? feedOn(b) : false)
         else if (ev.phase === 'waiting') this.status.waiting(topicId, ev.note)
-        else if (ev.inFlight > 0) this.status.turnEnded(topicId, ev.inFlight, ev.outcome) // more turns queued: keep the status open
+        else if (ev.outcome === 'wrapped') {
+          // A wrap-up closes its status whatever is still queued; the queued turns, which the
+          // CLI already holds, get a fresh status of their own.
+          await this.status.finish(topicId, 'wrapped')
+          if (ev.inFlight > 0) this.status.begin(topicId, ev.inFlight, b ? feedOn(b) : false)
+        } else if (ev.inFlight > 0) this.status.turnEnded(topicId, ev.inFlight, ev.outcome) // more turns queued: keep the status open
         else await this.status.finish(topicId, ev.outcome)
         return
+      case 'wrapped': {
+        // The hand-off text itself arrived as a normal answer; this is the verdict plus the
+        // way back in. Dropped messages are named by count: the user knows what they sent.
+        const dropped = ev.dropped ? `\n🗑 ${ev.dropped} queued message${ev.dropped === 1 ? '' : 's'} dropped — re-send what still matters.` : ''
+        if (ev.handoff) await this.send(topicId, `⏹ Wrapped up. Tap ▶️ to continue from the hand-off, or just type what to do next.${dropped}`, resumeKb())
+        else await this.send(topicId, `⏹ Wrapped up, but the session wrote no hand-off in the expected shape. Its last message above is what it left; type what to do next.${dropped}`)
+        return
+      }
       case 'turnEnd':
         await this.flushOutbox(topicId)
         return
@@ -427,6 +451,14 @@ export class TelegramBot {
     } catch (e) {
       this.d.log.error('controls.post_failed', { topic: topicId, error: e })
     }
+  }
+
+  /** The wrap-up confirmation, with the queue count from the live session. */
+  private async offerWrapUp(topicId: string): Promise<void> {
+    const live = this.topics.live.get(topicId)
+    if (!live || live.inFlight === 0) return this.send(topicId, 'Nothing is running in this topic right now, so there is nothing to wrap up.')
+    const queued = Math.max(0, live.inFlight - 1)
+    await this.send(topicId, wrapConfirmText(queued), wrapConfirmKb(queued))
   }
 
   private async repaintControls(topicId: string, b: Binding, note?: string): Promise<void> {
@@ -703,6 +735,25 @@ export class TelegramBot {
       await ack(`Effort: ${b.effort ?? 'default'}`)
       return this.repaintControls(topicId, b, '(applies on next message)')
     }
+    if (data === 'm:twrap') {
+      await ack()
+      return this.offerWrapUp(topicId)
+    }
+    const tw = /^m:tw:(now|turn|nowdrop)$/.exec(data)
+    if (tw) {
+      const ok = this.topics.wrapUp(topicId, { when: tw[1] === 'turn' ? 'after-turn' : 'now', dropQueue: tw[1] === 'nowdrop' })
+      await ack(ok ? '⏹ Wrapping up…' : 'Nothing is running')
+      if (!ok) return this.send(topicId, 'Nothing is running in this topic right now, so there is nothing to wrap up.')
+      return this.paint(topicId, tw[1] === 'turn' ? '⏳ Wrapping up after this turn: the session finishes what it is doing, then writes a hand-off.' : '⏹ Wrapping up: the session finishes its current step, then writes a hand-off.')
+    }
+    if (data === 'm:tres') {
+      const hb = this.d.store.registry[topicId]
+      const h = hb?.handoff ? parseHandoff(hb.handoff.text) : undefined
+      if (!h) return void ack('No hand-off saved for this topic')
+      await ack('▶️ Resuming')
+      await this.topics.sendToTopic(topicId, resumePrompt(h))
+      return
+    }
     if (data === 'm:tf') {
       if (!b) return void ack('No session here')
       b.feed = !feedOn(b)
@@ -832,6 +883,7 @@ export class TelegramBot {
     if (ft) return void ft(raw)
 
     const b = this.d.store.registry[topicId]
+    if (typed.kind === 'wrap') return this.offerWrapUp(topicId)
     if (typed.kind === 'use' || typed.kind === 'effort' || typed.kind === 'feed') {
       if (!b) return void this.say(topicId, 'No session bound here.')
       if (typed.kind === 'use') {
@@ -1032,6 +1084,10 @@ every session topic with:
 ⏳ Every turn shows one live status message ("Working · 1:42 · 9 tool calls"), updated
 every few seconds while Claude works, ending in a one-line summary. Answers, questions
 and approvals always arrive as new messages, so your phone still notifies you.
+• ⏹ Wrap up (on the status message, or type "wrap up" / "stop") — the session finishes
+   its current step, writes a hand-off (done · open · how to resume) and stops; nothing
+   is lost, and ▶️ Resume continues from that hand-off. Queued messages run afterwards
+   unless you choose to drop them.
 • 💾 Close & keep — stop the session + close the topic, keep everything
    (a ♻️ Reopen button appears to resume later with full context)
 • 🗑 Close & delete — remove the topic + session (transcript stays on disk)

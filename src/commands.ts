@@ -9,6 +9,7 @@ export type Typed =
   | { kind: 'use'; model: ModelKey; effort: Effort | undefined }
   | { kind: 'effort'; effort: Effort | undefined }
   | { kind: 'feed'; on: boolean }
+  | { kind: 'wrap' }
   | { kind: 'chat'; text: string }
 
 export function parseTyped(raw: string, catalog: Catalog): Typed {
@@ -32,5 +33,6 @@ export function parseTyped(raw: string, catalog: Catalog): Typed {
   }
   const feed = /^feed\s+(on|off)$/i.exec(text)
   if (feed) return { kind: 'feed', on: feed[1].toLowerCase() === 'on' }
+  if (/^(wrap\s*up|stop)$/i.test(text)) return { kind: 'wrap' }
   return { kind: 'chat', text }
 }

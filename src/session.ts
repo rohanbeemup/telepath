@@ -40,9 +40,9 @@ export class SdkBackend implements SessionBackend {
     const q = query({ prompt: inbox, options })
     let closed = false
     return {
-      send: (text: string) => {
+      send: (text: string, opts?: { priority?: 'now' | 'next' }) => {
         if (closed) throw new Error('session is closed')
-        inbox.push(userMessage(text) as SDKUserMessage)
+        inbox.push(userMessage(text, undefined, opts?.priority) as SDKUserMessage)
       },
       stream: () => q,
       close: () => {

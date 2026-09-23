@@ -10,6 +10,9 @@ import {
   mainMenuKb,
   askKeyboard,
   approveKb,
+  statusLiveKb,
+  wrapConfirmKb,
+  resumeKb,
   callbackData,
   labels,
 } from './keyboards'
@@ -48,6 +51,15 @@ describe('pinned controls', () => {
   })
 })
 
+describe('wrap-up', () => {
+  test('the wrap-up confirmation offers the drop option only when something is queued', () => {
+    expect(labels(wrapConfirmKb(0)).some(l => l.includes('drop'))).toBe(false)
+    expect(labels(wrapConfirmKb(3))).toContain('🗑 Hand off now and drop the 3 queued')
+    expect(labels(statusLiveKb())).toEqual(['⏹ Wrap up'])
+    expect(labels(resumeKb())).toEqual(['▶️ Resume from hand-off'])
+  })
+})
+
 describe('lists', () => {
   test('pages a long list two per row with prev and next only where they lead somewhere', () => {
     const buttons = Array.from({ length: 25 }, (_, i) => ({ label: `b${i}`, data: `m:x:${i}` }))
@@ -79,6 +91,9 @@ describe('telegram limits', () => {
       pagedListKb(Array.from({ length: 1000 }, (_, i) => ({ label: 'L'.repeat(300), data: `m:sess:${'f'.repeat(8)}` })), 99, 'spage'),
       askKeyboard('zz9', Array.from({ length: 30 }, (_, i) => ({ label: 'option '.repeat(20) + i })), true, new Set([1, 2])),
       approveKb('abc'),
+      statusLiveKb(),
+      wrapConfirmKb(999),
+      resumeKb(),
     ]
     for (const kb of kbs) {
       for (const data of callbackData(kb)) expect(Buffer.byteLength(data, 'utf8')).toBeLessThanOrEqual(64)
