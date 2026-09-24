@@ -145,13 +145,16 @@ export const controlsKb = (): InlineKeyboard => new InlineKeyboard().text('⚙�
 /** On the live status message: ask the session to finish its step and hand off. */
 export const statusLiveKb = (): InlineKeyboard => new InlineKeyboard().text('⏹ Wrap up', 'm:twrap')
 
-/** The wrap-up choices; the drop option only exists when something is queued. */
-export function wrapConfirmKb(queued: number): InlineKeyboard {
-  const kb = new InlineKeyboard()
+/**
+ * The wrap-up choices. There is no "drop the queue": messages sent during a turn are
+ * already with the session (the CLI folds them into the running or the next turn), so
+ * nothing can be taken back; the confirmation says so instead of offering it.
+ */
+export function wrapConfirmKb(): InlineKeyboard {
+  return new InlineKeyboard()
     .text('⏹ Hand off at the next step (recommended)', 'm:tw:now').row()
     .text('⏳ Finish this turn first, then hand off', 'm:tw:turn').row()
-  if (queued > 0) kb.text(`🗑 Hand off now and drop the ${queued} queued`, 'm:tw:nowdrop').row()
-  return kb.text('↩️ Cancel', 'm:ctl')
+    .text('↩️ Cancel', 'm:ctl')
 }
 
 export function wrapConfirmText(queued: number): string {
@@ -159,7 +162,7 @@ export function wrapConfirmText(queued: number): string {
     `⏹ Wrap up this session?\n\n` +
     `The session finishes the step it is on (or the whole turn), writes a short hand-off (done · open · how to resume) and stops. ` +
     `Nothing is lost: the context stays in the transcript and ▶️ Resume continues from the hand-off.` +
-    (queued > 0 ? `\n\n${queued} message${queued === 1 ? '' : 's'} of yours ${queued === 1 ? 'is' : 'are'} still queued behind the current turn; they run after the hand-off unless you drop them.` : '')
+    (queued > 0 ? `\n\nThe ${queued === 1 ? 'message' : `${queued} messages`} you sent during this turn ${queued === 1 ? 'is' : 'are'} already with the session; the hand-off will cover ${queued === 1 ? 'it' : 'them'}.` : '')
   )
 }
 

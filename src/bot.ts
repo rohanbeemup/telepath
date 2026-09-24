@@ -20,7 +20,7 @@ import { htmlEsc, htmlToPlain, renderWithDeadline, chunkHtml, chunkPlain } from 
 import { isEnabledModelKey, modelLabel, parseEffort, supportsEffort, MODEL_MENU, type Effort } from './models'
 import { listSessions } from './session'
 import { feedOn, type Binding, type Store } from './state'
-import type { SessionExtras, TopicManager } from './topics'
+import { isBusy, type SessionExtras, type TopicManager } from './topics'
 import {
   approveKb,
   askKeyboard,
@@ -237,10 +237,9 @@ export class TelegramBot {
         return
       case 'wrapped': {
         // The hand-off text itself arrived as a normal answer; this is the verdict plus the
-        // way back in. Dropped messages are named by count: the user knows what they sent.
-        const dropped = ev.dropped ? `\n🗑 ${ev.dropped} queued message${ev.dropped === 1 ? '' : 's'} dropped — re-send what still matters.` : ''
-        if (ev.handoff) await this.send(topicId, `⏹ Wrapped up. Tap ▶️ to continue from the hand-off, or just type what to do next.${dropped}`, resumeKb())
-        else await this.send(topicId, `⏹ Wrapped up, but the session wrote no hand-off in the expected shape. Its last message above is what it left; type what to do next.${dropped}`)
+        // way back in.
+        if (ev.handoff) await this.send(topicId, '⏹ Wrapped up. Tap ▶️ to continue from the hand-off, or just type what to do next.', resumeKb())
+        else await this.send(topicId, '⏹ Wrapped up, but the session wrote no hand-off in the expected shape. Its last message above is what it left; type what to do next.')
         return
       }
       case 'turnEnd':
@@ -456,9 +455,8 @@ export class TelegramBot {
   /** The wrap-up confirmation, with the queue count from the live session. */
   private async offerWrapUp(topicId: string): Promise<void> {
     const live = this.topics.live.get(topicId)
-    if (!live || live.inFlight === 0) return this.send(topicId, 'Nothing is running in this topic right now, so there is nothing to wrap up.')
-    const queued = Math.max(0, live.inFlight - 1)
-    await this.send(topicId, wrapConfirmText(queued), wrapConfirmKb(queued))
+    if (!live || !isBusy(live)) return this.send(topicId, 'Nothing is running in this topic right now, so there is nothing to wrap up.')
+    await this.send(topicId, wrapConfirmText(live.queued), wrapConfirmKb())
   }
 
   private async repaintControls(topicId: string, b: Binding, note?: string): Promise<void> {
@@ -739,9 +737,9 @@ export class TelegramBot {
       await ack()
       return this.offerWrapUp(topicId)
     }
-    const tw = /^m:tw:(now|turn|nowdrop)$/.exec(data)
+    const tw = /^m:tw:(now|turn)$/.exec(data)
     if (tw) {
-      const ok = this.topics.wrapUp(topicId, { when: tw[1] === 'turn' ? 'after-turn' : 'now', dropQueue: tw[1] === 'nowdrop' })
+      const ok = this.topics.wrapUp(topicId, { when: tw[1] === 'turn' ? 'after-turn' : 'now' })
       await ack(ok ? '⏹ Wrapping up…' : 'Nothing is running')
       if (!ok) return this.send(topicId, 'Nothing is running in this topic right now, so there is nothing to wrap up.')
       return this.paint(topicId, tw[1] === 'turn' ? '⏳ Wrapping up after this turn: the session finishes what it is doing, then writes a hand-off.' : '⏹ Wrapping up: the session finishes its current step, then writes a hand-off.')
@@ -1086,8 +1084,8 @@ every few seconds while Claude works, ending in a one-line summary. Answers, que
 and approvals always arrive as new messages, so your phone still notifies you.
 • ⏹ Wrap up (on the status message, or type "wrap up" / "stop") — the session finishes
    its current step, writes a hand-off (done · open · how to resume) and stops; nothing
-   is lost, and ▶️ Resume continues from that hand-off. Queued messages run afterwards
-   unless you choose to drop them.
+   is lost, and ▶️ Resume continues from that hand-off. Messages you sent during the
+   turn are already with the session; the hand-off covers them.
 • 💾 Close & keep — stop the session + close the topic, keep everything
    (a ♻️ Reopen button appears to resume later with full context)
 • 🗑 Close & delete — remove the topic + session (transcript stays on disk)

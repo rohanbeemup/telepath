@@ -29,13 +29,20 @@ describe('interpret', () => {
 
   test('captures the session id on the first assistant or result, never on init', () => {
     const st = newPumpState(undefined)
-    expect(interpret({ type: 'system', subtype: 'init', session_id: 'fresh' }, st)).toEqual([])
+    expect(kinds(interpret({ type: 'system', subtype: 'init', session_id: 'fresh' }, st))).toEqual(['init'])
     expect(st.sessionId).toBeUndefined()
     const evs = interpret(assistant([{ type: 'text', text: 'hi' }], { session_id: 'fresh' }), st)
     expect(evs[0]).toEqual({ kind: 'sessionId', id: 'fresh' })
     expect(st.sessionId).toBe('fresh')
     // second time: no repeat
     expect(kinds(interpret(assistant([{ type: 'text', text: 'again' }], { session_id: 'fresh' }), st))).toEqual(['say'])
+  })
+
+  test('a system init marks the start of a turn', () => {
+    const st = newPumpState('s')
+    expect(interpret({ type: 'system', subtype: 'init', session_id: 's' }, st)).toEqual([{ kind: 'init' }])
+    // other system subtypes are not turn starts
+    expect(kinds(interpret({ type: 'system', subtype: 'thinking_tokens', estimated_tokens: 50 }, st))).toEqual([])
   })
 
   test('a rejected rate limit yields one rate-limit event and later allowed events yield none', () => {

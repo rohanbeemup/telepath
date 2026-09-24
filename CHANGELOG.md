@@ -49,27 +49,30 @@ Rewrite on the current Agent SDK, in tested modules, with observability.
 - **⏹ Wrap up** on the status message (or type `wrap up` / `stop`): a steering message
   with SDK priority `now` (or `next` for "finish this turn first") asks the session to
   finish its current step, write a hand-off (Done · Open · Resume) and stop; the hand-off
-  is stored and **▶️ Resume** sends it back as the next message. Queued messages run
-  afterwards unless dropped, in which case the count is reported. Nothing is interrupted
+  is stored and **▶️ Resume** sends it back as the next message. Nothing is interrupted
   mid-step and the transcript keeps the context.
+- A session is busy from a turn's `init` to its `result`, and messages sent mid-turn are
+  counted as folded into that turn (measured: the CLI answers them with its one result).
+  The former per-message count drifted upward by one per folded message, so a session
+  that had answered everything still read `9 messages queued` and never went idle.
 - The digest lists the most recent lines, not the first five frozen for the whole turn;
   a background command no longer appears twice (tool call + task start); edited files
   are named newest first; and the header says `last action 3m ago` once the session has
   been quiet for 30 s.
-- From the third review round: every status operation (create, edit, both halves of a
+- Status budget hardening: every status operation (create, edit, both halves of a
   move, the closing summary and its retries) reserves budget first and is deferred, never
   skipped past, when the budget is full; ticks are serialized so a slow API call cannot
   double an edit; the user's own message moves the status below it; a rate-limit wait
   clears when the next queued turn runs; a deleted topic cancels its pending summary;
   "edited N files" counts distinct files; model-written descriptions are redacted too,
   and redaction requires `=`/`:` after a keyword so prose like "the auth routes" is left alone.
-- From review: `/attach` and the sessions list refuse an ambiguous prefix instead of
+- `/attach` and the sessions list refuse an ambiguous prefix instead of
   binding the first match; a registry that does not parse stops the boot (exit 2) and is
   never overwritten; the unformatted fallback is split as plain text; `use <key>` and the
   panel refuse packages outside `ENABLED_MODELS`; an oversized feed burst is sent as
   several messages; closing a session drops its queued prompts; the rotation baseline is
-  read before the rotator is spawned; a queued second turn keeps a session busy until its
-  own result; the 🗑 delete prompt no longer claims the transcript is gone. The SDK's peer
+  read before the rotator is spawned; the 🗑 delete prompt no longer claims the transcript
+  is gone. The SDK's peer
   dependency `@anthropic-ai/sdk` is now pinned to a version it accepts.
 
 ### Added

@@ -92,7 +92,7 @@ const CHILD_ENV: Record<string, string | undefined> = { ...process.env }
 function statusText(): string {
   const up = Math.round((Date.now() - STARTED) / 60000)
   const snap = metrics.snapshot()
-  const liveList = [...topics.live.values()].map(l => `• ${store.registry[l.topicId]?.title ?? l.topicId} — ${l.model}${isBusy(l) ? ` (running, ${l.inFlight} in flight)` : ''}`)
+  const liveList = [...topics.live.values()].map(l => `• ${store.registry[l.topicId]?.title ?? l.topicId} — ${l.model}${isBusy(l) ? ` (running${l.queued ? `, ${l.queued} queued` : ''})` : ''}`)
   const errors = ring.list().slice(-5).map(e => `• ${new Date(e.at).toISOString().slice(11, 19)} ${e.ev}${e.message ? `: ${e.message.slice(0, 120)}` : ''}`)
   const counters = Object.entries(snap).map(([k, v]) => `${k}=${v}`).join('  ')
   return (
