@@ -12,6 +12,7 @@ import {
   approveKb,
   statusLiveKb,
   wrapConfirmKb,
+  wrapConfirmText,
   resumeKb,
   callbackData,
   labels,
@@ -52,9 +53,12 @@ describe('pinned controls', () => {
 })
 
 describe('wrap-up', () => {
-  test('the wrap-up confirmation offers the drop option only when something is queued', () => {
-    expect(labels(wrapConfirmKb(0)).some(l => l.includes('drop'))).toBe(false)
-    expect(labels(wrapConfirmKb(3))).toContain('🗑 Hand off now and drop the 3 queued')
+  test('the wrap-up confirmation offers no drop and names the messages sent during the turn', () => {
+    expect(labels(wrapConfirmKb()).some(l => /drop/i.test(l))).toBe(false)
+    expect(labels(wrapConfirmKb())).toEqual(['⏹ Hand off at the next step (recommended)', '⏳ Finish this turn first, then hand off', '↩️ Cancel'])
+    expect(wrapConfirmText(0)).not.toContain('already with the session')
+    expect(wrapConfirmText(3)).toContain('The 3 messages you sent during this turn are already with the session')
+    expect(wrapConfirmText(1)).toContain('The message you sent during this turn is already with the session')
     expect(labels(statusLiveKb())).toEqual(['⏹ Wrap up'])
     expect(labels(resumeKb())).toEqual(['▶️ Resume from hand-off'])
   })
@@ -92,7 +96,7 @@ describe('telegram limits', () => {
       askKeyboard('zz9', Array.from({ length: 30 }, (_, i) => ({ label: 'option '.repeat(20) + i })), true, new Set([1, 2])),
       approveKb('abc'),
       statusLiveKb(),
-      wrapConfirmKb(999),
+      wrapConfirmKb(),
       resumeKb(),
     ]
     for (const kb of kbs) {

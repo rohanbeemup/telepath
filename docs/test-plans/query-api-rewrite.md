@@ -81,13 +81,12 @@ what turned out false or true:
   prepended to the topic's first prompt (which was already the guaranteed channel) and the
   hook is gone rather than kept as decoration. The smoke now tests the channel the daemon
   actually uses.
-- **Found by Copilot's review of the first push (nine findings, all confirmed against the
-  code):** a `/attach` prefix bound the first of several matches; a registry that failed to
+- **Second pass after the first push:** a `/attach` prefix bound the first of several matches; a registry that failed to
   parse was overwritten with `{}` (my own boot-time "repair"); the unformatted fallback went
   through the HTML-aware splitter, which reads `<…>` as tags; `use haiku` switched to a
   package the config had disabled; an oversized feed burst was truncated at the tail; a
   closed mailbox still drained queued prompts; the rotation baseline was read after the
-  hand-off had spawned the rotator (the same race fixed in PR #6, reintroduced by event
+  hand-off had spawned the rotator (the same race fixed once before, reintroduced by event
   ordering); a boolean `busy` let a queued second turn be evicted as idle; and the 🗑 delete
   prompt claimed permanence the operation does not have. Each has a case below or a
   wording fix, and the SDK's peer dependency `@anthropic-ai/sdk >=0.93.0` was unmet by the
@@ -139,15 +138,29 @@ what turned out false or true:
   write Done/Open/Resume, stop. The hand-off is parsed and stored on the binding, ▶️
   Resume sends it back, and the queue runs afterwards unless the user chooses to drop it
   (the session is then closed after the hand-off, and the count is reported).
-- **Found by Copilot's review of the wrap-up (two inline findings, both taken):** a wrap-up
+- **Seen on the phone after a five-hour turn: "9 messages queued", yet everything was
+  answered.** The daemon counted turns in flight as sends minus results. Measured against
+  SDK 0.3.278 (three probes): messages sent while a turn runs are folded INTO that turn
+  and answered by its one result (four sends, one result); every turn begins with a
+  `system/init` and ends with one `result`, including the turn a `now` message preempts
+  into (result → init → new turn); a `now` message that lands while the model is
+  mid-thought ends the turn at once with an `error_during_execution` result, after which
+  the CLI begins the next turn on its own. So a session is busy from init to result,
+  "queued" is the number of messages sent since the running turn began, a result clears
+  both, and output arriving with no turn known is itself a turn beginning. The wrap-up's
+  "drop the queue" option is gone: what was sent mid-turn is already with the session
+  (folded into the running or the next turn), so nothing could be dropped and offering it
+  was a lie. The cut-short turn's result is not reported as an error, and the status stays
+  open for the wrap-up turn that follows.
+- **Second pass on the wrap-up:** a wrap-up
   did not count as a takeover, so a rate-limit nudge scheduled before it, or a rotation
   landing after it, could restart the work behind the hand-off or reopen a dropped
   session; and the summary edit left the keyboard to an omitted field, now cleared
-  explicitly. Two remarks in its file table were read against the code and kept as they
-  are: a hand-off with only a Resume paragraph is still resumable, so Done/Open stay
-  optional; and a `started:` line is dropped only when its command is listed in the same
-  digest, which is the dedupe wanted, not a recency bug.
-- **Found by Copilot's third round (nine findings, all confirmed):** overlapping ticks could
+  explicitly. Two things were weighed and kept as they are: a hand-off with only a Resume
+  paragraph is still resumable, so Done/Open stay optional; and a `started:` line is
+  dropped only when its command is listed in the same digest, which is the dedupe
+  wanted, not a recency bug.
+- **Hardening the status budget:** overlapping ticks could
   double an edit; a model-written description escaped redaction; "edited 5 files: a.ts"
   counted calls, not files; the user's own message buried the status without a move;
   `begin()`, the final edit and its retries ignored the budget's answer; a move spent two
@@ -155,7 +168,7 @@ what turned out false or true:
   and a deleted topic kept retrying its summary. Each has a case below; the rule that
   came out of it is that EVERY transport operation reserves budget first and what the
   budget refuses is owed, never skipped past.
-- **Found by Copilot's review of the status push (five findings, all confirmed):** an old
+- **Second pass on the status message:** an old
   pump's unconditional `idle` closed a replacement session's fresh status as "stopped"
   after a model switch; a status spanning queued turns summarized an early failure as
   "Done" when the last turn succeeded; feed-off turns produced no items, so the status
@@ -260,14 +273,15 @@ binary's version against the minimum the current models need, and the bot's iden
 | `wraps text as a user message with parent_tool_use_id null` | `userMessage(text)` has the exact shape the SDK types require | a message the CLI rejects as malformed |
 | `opens a session on first message and reuses it while live` | two messages open one backend session | a new process per message |
 | `evicts the least recently active session when the cap is reached and tells that topic` | the oldest topic is closed and notified; the new one opens | evicting the newest, or evicting silently |
-| `evicts idle sessions and leaves a session mid-turn alone` | idle past the limit closes; a turn in flight protects the session, and a second message queued during a turn keeps it busy until its own result | a boolean that the first result clears while a queued turn still runs |
+| `evicts idle sessions and leaves a session mid-turn alone` | idle past the limit closes; a running turn protects the session; a second message sent during the turn is answered by the same result, after which the session is idle; a turn the CLI began on its own (init) protects it too | a count of sends the first result cannot clear, or an init nobody counts |
+| `messages sent during a turn are folded into it and one result answers them all` | four sends during one turn report 1 to 4 in flight; the one result ends the turn with 0 in flight and clears the queue; output arriving with no turn known begins one | a per-message count that drifts by one per folded message and reads "9 messages queued" over an idle session |
 | `a model or effort switch closes the live session so the next message resumes with the new options` | after the switch the backend sees a new open with the new model and effort | a live process that keeps the old model until eviction |
 | `resumes with the recorded session id and records it once produced` | `open` receives `resume` when the binding has an id; the id from the stream is stored | a resume that starts a blank session |
 | `schedules a resume nudge for a usable resetsAt and cancels it when the user takes over` | a future reset schedules; a user message cancels | a nudge that fires into a topic the user already continued |
 | `a rotation with the topic untouched closes the session and continues` | with no takeover, the session closes and a continuation is sent | waiting out a reset the rotator already solved |
 | `a stale rate-limit alert does not suppress the next turn's error notice` | an error in the turn after a rejection is reported | a per-session flag that never resets |
 | `a stale pump does not report idle once a replacement session is live` | an old stream ending while a replacement runs emits no idle; the replacement's own end does | closing the new session's status as stopped from the old pump's finally |
-| `emits turn start and end with the number of turns in flight` | `turn/start` per send with the count, `turn/end` per result with the count after decrement and the outcome, `turn/waiting` on a rejection | a status that cannot tell one running turn from three queued ones |
+| `emits turn start and end from the stream with the messages in the running turn` | `turn/start` per send with the running turn plus what was sent into it, one start for a turn the CLI begins on its own, `turn/end` per result with the outcome and 0 in flight, `turn/waiting` on a rejection | a status that cannot tell one running turn from three messages sent into it |
 | `pinned controls show only enabled models and mark the current one` | buttons for enabled keys only, ✓ on the binding's model | every key in the catalog, or no mark |
 | `effort rows appear only for models with effort levels` | no effort row for a Haiku binding | sending Haiku an effort |
 | `the activity feed toggle reflects the effective default in auto and approvals` | auto with no explicit choice reads ON; approvals reads OFF | a label that reads the raw undefined flag |
@@ -305,12 +319,13 @@ binary's version against the minimum the current models need, and the bot's iden
 | `text without a resume paragraph is not a hand-off` | no Resume → undefined, so nothing is stored or offered | remembering "All done" as something to resume from |
 | `the resume prompt carries the hand-off verbatim and the wrap-up prompt asks for that exact shape` | the prompt the model gets names Done/Open/Resume and "finish only the step"; the resume prompt contains the hand-off | a prompt whose shape the parser cannot read back |
 | `wrap up and stop are commands` | `wrap up`, `wrapup`, `stop` alone are the wrap command; a sentence containing stop is chat | "stop the server please" ending the session |
-| `a wrap-up sends the hand-off instruction ahead of the queue and marks the next result as wrapped` | the instruction goes with priority `now` (or `next` for after-turn), one wrap-up at a time, nothing to wrap when idle; the preempted turn's result is `ok`, the hand-off turn's result is `wrapped`, queued messages keep running | queuing the instruction behind five messages, or reporting the preempted turn as the wrap-up |
-| `a wrap-up that drops the queue closes the session after the hand-off and says how many were dropped` | with drop, the session closes once the hand-off arrived and the event carries the count | dropping before the hand-off, or dropping silently |
+| `a wrap-up sends the hand-off instruction ahead of the queue and marks the next result as wrapped` | the instruction goes with priority `now` (or `next` for after-turn), one wrap-up at a time, nothing to wrap when idle; the preempted turn's result is `ok` with one more turn known to follow, the hand-off turn's result is `wrapped` with none; the session stays live and idle | queuing the instruction behind five messages, reporting the preempted turn as the wrap-up, or closing the status before the hand-off turn |
+| `the turn a wrap-up cuts short is not reported as an error, and a second result completes the wrap-up without a hand-off` | the error result a `now` message forces mid-thought reaches the bot as a quiet turn end; the wrap-up completes on its second result whether or not a hand-off was written, with the hand-off absent when none was; a later ordinary error is still reported | an "⚠️ turn ended" notice for every wrap-up, or a wrap-up that never completes and blocks the next one |
 | `a wrap-up cancels a pending rate-limit nudge and rotation watch` | a wrap-up counts as a takeover: the reset nudge scheduled by an earlier rejection never fires and a rotation landing afterwards neither closes the session nor injects a continuation | work restarting after the hand-off, or a dropped session reopened by a timer nobody remembers |
 | `a hand-off in the model's text is remembered for resume` | a hand-off block in any answer is stored on the binding; ordinary text does not overwrite it | Resume with nothing to send |
 | `a wrapped-up turn ends with its own summary` | the verdict reads Wrapped up whatever earlier turns did; the live text carries the button kind, the summary does not | a wrap-up summarized as an error, or a summary still carrying a Wrap up button |
-| `the wrap-up confirmation offers the drop option only when something is queued` | no drop button at zero queued; the count in the label | offering to drop nothing |
+| `the wrap-up confirmation offers no drop and names the messages sent during the turn` | two choices and cancel, never a drop; the text says how many messages sent during the turn the hand-off will cover, singular and plural | offering to drop messages the session already has |
+| `a system init marks the start of a turn` | `system/init` yields the init event and other system subtypes do not | a turn the CLI began that nobody counts as running |
 | `compares dotted versions numerically` | `2.1.278 > 2.1.99 > 2.0.1000` | a string comparison |
 | `flags a binary older than the minimum` | 2.1.117 against minimum 2.1.251 is a failure with both numbers in the message | a boot that proceeds to the first 400 |
 | `UTC stamp to whole seconds, one space, the raw JSON` | the limit-events line matches the shim's format | a line the rotator dashboard cannot parse |

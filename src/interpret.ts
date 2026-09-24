@@ -20,16 +20,19 @@ export type Event =
   | { kind: 'denied'; tool: string; message: string }
   | { kind: 'assistantError'; error: string }
   | { kind: 'state'; state: 'idle' | 'running' | 'requires_action' }
+  /** The CLI began a turn (`system/init`); its `result` ends it. Measured: one per turn, including the turn a `now` message preempts into. */
+  | { kind: 'init' }
   /**
    * Emitted by TopicManager, not by interpret(): the turn lifecycle as the daemon sees
-   * it. `start` when a user message is sent (inFlight counts it), `end` when its result
-   * arrives (inFlight already decremented), `waiting` while a rate limit holds it.
+   * it. `inFlight` is 1 for the running turn plus the messages sent since it began,
+   * which the CLI folds into it; `end` carries 1 when another turn is known to follow
+   * (a wrap-up's own turn), else 0. `waiting` while a rate limit holds the turn.
    */
   | { kind: 'turn'; phase: 'start'; inFlight: number }
   | { kind: 'turn'; phase: 'end'; inFlight: number; outcome: 'ok' | 'error' | 'limited' | 'wrapped' }
   | { kind: 'turn'; phase: 'waiting'; inFlight: number; note: string | undefined }
-  /** A wrap-up completed: the hand-off (if the model wrote one) and what was dropped from the queue. */
-  | { kind: 'wrapped'; handoff: string | undefined; dropped: number }
+  /** A wrap-up completed, with the hand-off if the model wrote one. */
+  | { kind: 'wrapped'; handoff: string | undefined }
 
 /** Per live session. `alerted` is the once-per-turn latch for rate-limit alerts. */
 export type PumpState = { sessionId?: string; alerted: boolean }
@@ -92,6 +95,9 @@ export function interpret(msg: any, st: PumpState): Event[] {
     }
     case 'system': {
       switch (msg.subtype) {
+        case 'init':
+          out.push({ kind: 'init' })
+          return out
         case 'task_notification':
           out.push({ kind: 'task', status: taskStatus(msg.status), description: String(msg.summary ?? ''), background: true })
           return out

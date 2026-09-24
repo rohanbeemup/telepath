@@ -32,8 +32,12 @@ export interface LiveSession {
   close(): void
 }
 
-/** A wrap-up in progress: waiting for the hand-off, then optionally dropping the queue. */
-type Wrap = { dropQueue: boolean; sawHandoff: boolean; resultsSeen: number; queuedAtRequest: number }
+/**
+ * A wrap-up in progress. Measured against the CLI: the instruction always gets a turn of
+ * its own, so two results follow the request (the preempted or finished turn's, then the
+ * wrap-up's); the hand-off, when written, is in the text before the second.
+ */
+type Wrap = { sawHandoff: boolean; resultsSeen: number }
 
 export interface SessionBackend {
   open(opts: OpenOptions): LiveSession
@@ -46,16 +50,21 @@ export type Live = {
   cwd: string
   lastActive: number
   /**
-   * Turns in flight: incremented per user message sent, decremented per result. The
-   * CLI queues messages and answers each with its own result, so a second message sent
-   * during a turn keeps the session busy until its own result arrives.
+   * A turn is running: set when a message is sent into an idle session or the stream
+   * shows a turn beginning (`system/init`, or output with no turn known), cleared by the
+   * turn's `result`. Measured: messages sent while a turn runs are folded INTO that turn
+   * and answered by its one result, so results are not counted against sends. A count
+   * that did was off by one per folded message and read "9 messages queued" over a
+   * session that had answered everything.
    */
-  inFlight: number
+  running: boolean
+  /** Messages sent since the running turn began; the CLI folds them into it. Shown as "queued". */
+  queued: number
   wrap?: Wrap
 }
 
 export function isBusy(l: Live): boolean {
-  return l.inFlight > 0
+  return l.running
 }
 
 export type Rotator = {
@@ -181,7 +190,7 @@ export class TopicManager {
       env,
       ...this.d.extras(topicId),
     })
-    const l: Live = { session, topicId, model: b.model, cwd: b.cwd, lastActive: this.now(), inFlight: 0 }
+    const l: Live = { session, topicId, model: b.model, cwd: b.cwd, lastActive: this.now(), running: false, queued: 0 }
     this.live.set(topicId, l)
     this.d.metrics.inc('sessions_opened')
     this.d.log.info('session.open', { topic: topicId, model: b.model, effort: effortFor(this.d.catalog, b) ?? null, resume: b.sessionId ?? null })
@@ -195,7 +204,6 @@ export class TopicManager {
     let l = this.ensureLive(topicId)
     if (!l) return false
     l.lastActive = this.now()
-    l.inFlight++
     let payload = text
     if (!this.primed.has(topicId)) {
       this.primed.add(topicId)
@@ -210,31 +218,44 @@ export class TopicManager {
       const l2 = this.ensureLive(topicId)
       if (!l2) return false
       l = l2
-      l.inFlight++
       l.session.send(payload)
     }
     this.d.metrics.inc('messages_in')
-    void this.d.onEvent(topicId, { kind: 'turn', phase: 'start', inFlight: l.inFlight })
+    // Into an idle session this starts a turn (the stream's init confirms it shortly);
+    // into a running one it joins that turn and is reported as queued until its result.
+    if (l.running) l.queued++
+    else {
+      l.running = true
+      l.queued = 0
+    }
+    void this.d.onEvent(topicId, { kind: 'turn', phase: 'start', inFlight: 1 + l.queued })
     return true
+  }
+
+  /** The stream shows a turn beginning: from init, or from output when no turn was known. */
+  private turnBegan(l: Live): void {
+    const known = l.running
+    l.running = true
+    l.queued = 0 // whatever was sent before this point is in the turn now
+    if (!known) void this.d.onEvent(l.topicId, { kind: 'turn', phase: 'start', inFlight: 1 })
   }
 
   /**
    * Wrap up the running turn: finish the current step (or the current turn), write a
-   * hand-off, stop. The instruction jumps ahead of every queued message. With
-   * `dropQueue`, the session is closed once the hand-off is in, so the messages still
-   * queued behind it never run; the caller is told how many.
+   * hand-off, stop. The instruction jumps ahead of everything the user sent since the
+   * turn began; those messages are already with the session (the CLI folds them into
+   * the running or the next turn), so there is nothing to drop and the hand-off covers them.
    */
-  wrapUp(topicId: string, opts: { when: 'now' | 'after-turn'; dropQueue: boolean }): boolean {
+  wrapUp(topicId: string, opts: { when: 'now' | 'after-turn' }): boolean {
     const l = this.live.get(topicId)
     if (!l || !isBusy(l) || l.wrap) return false
     // A wrap-up is the user taking over: a pending rate-limit nudge or rotation watch
-    // would otherwise restart the work after the hand-off, or reopen a dropped session.
+    // would otherwise restart the work after the hand-off.
     this.userTookOver(topicId)
-    l.wrap = { dropQueue: opts.dropQueue, sawHandoff: false, resultsSeen: 0, queuedAtRequest: Math.max(0, l.inFlight - 1) }
-    l.inFlight++
+    l.wrap = { sawHandoff: false, resultsSeen: 0 }
     l.session.send(WRAP_UP_PROMPT, { priority: opts.when === 'now' ? 'now' : 'next' })
     this.d.metrics.inc('wrap_ups')
-    this.d.log.info('session.wrap_up', { topic: topicId, when: opts.when, dropQueue: opts.dropQueue, queued: l.wrap.queuedAtRequest })
+    this.d.log.info('session.wrap_up', { topic: topicId, when: opts.when, queued: l.queued })
     return true
   }
 
@@ -289,8 +310,15 @@ export class TopicManager {
     try {
       for await (const msg of l.session.stream()) {
         const b = this.d.store.registry[topicId]
+        // Output with no turn known (a turn the CLI began on its own after a preemption,
+        // or an init this pump missed) is a running turn: count it, or eviction and the
+        // status would both be wrong about it.
+        if ((msg as { type?: unknown })?.type === 'assistant' && !l.running) this.turnBegan(l)
         for (const ev of interpret(msg, st)) {
           switch (ev.kind) {
+            case 'init':
+              this.turnBegan(l)
+              break
             case 'sessionId': {
               if (b && !b.sessionId) {
                 b.sessionId = ev.id
@@ -318,7 +346,7 @@ export class TopicManager {
                   : `⏳ Rate limit hit on this model.${rotating} Otherwise wait a moment and send your message again, or switch to a lighter model via ⚙️ Controls.`,
               )
               if (rot) void this.resumeAfterRotation(topicId, activeBefore)
-              await this.d.onEvent(topicId, { kind: 'turn', phase: 'waiting', inFlight: l.inFlight, note: until ? `resets at ${until}` : undefined })
+              await this.d.onEvent(topicId, { kind: 'turn', phase: 'waiting', inFlight: 1 + l.queued, note: until ? `resets at ${until}` : undefined })
               break
             }
             case 'say': {
@@ -336,31 +364,36 @@ export class TopicManager {
             }
             case 'turnEnd':
             case 'turnError': {
-              l.inFlight = Math.max(0, l.inFlight - 1)
+              // One result ends the turn and every message folded into it.
+              l.running = false
+              l.queued = 0
               l.lastActive = this.now()
               this.d.metrics.inc('turns')
-              if (ev.kind === 'turnError') this.d.metrics.inc('turn_errors')
-              await this.d.onEvent(topicId, ev)
               let outcome: 'ok' | 'error' | 'limited' | 'wrapped' = ev.kind === 'turnEnd' ? 'ok' : ev.afterRateLimit ? 'limited' : 'error'
+              let more = 0
+              let report: Event = ev
               if (l.wrap) {
-                // `now` preempts the running turn (its own result comes first), then the
-                // wrap-up runs; `next` runs after it. Either way the wrap-up's result is the
-                // one that follows the hand-off text, or at the latest the second result.
                 l.wrap.resultsSeen++
                 if (l.wrap.sawHandoff || l.wrap.resultsSeen >= 2) {
-                  const w = l.wrap
                   l.wrap = undefined
                   outcome = 'wrapped'
-                  const dropped = w.dropQueue ? l.inFlight : 0
-                  if (w.dropQueue && l.inFlight > 0) {
-                    this.closeLive(topicId, `wrapped up, ${l.inFlight} queued dropped`)
-                    l.inFlight = 0
-                  }
                   this.d.metrics.inc('wrap_ups_completed')
-                  await this.d.onEvent(topicId, { kind: 'wrapped', handoff: b?.handoff?.text, dropped })
+                } else {
+                  // The first result after a wrap-up request is the turn it cut short (a
+                  // `now` message ends it at once, as an error result when the model was
+                  // mid-thought). The wrap-up's own turn follows: keep the status open and
+                  // report no error for the cut itself.
+                  more = 1
+                  if (ev.kind === 'turnError' && !ev.afterRateLimit) {
+                    outcome = 'ok'
+                    report = { kind: 'turnEnd', afterRateLimit: false }
+                  }
                 }
               }
-              await this.d.onEvent(topicId, { kind: 'turn', phase: 'end', inFlight: l.inFlight, outcome })
+              if (report.kind === 'turnError') this.d.metrics.inc('turn_errors')
+              await this.d.onEvent(topicId, report)
+              if (outcome === 'wrapped') await this.d.onEvent(topicId, { kind: 'wrapped', handoff: b?.handoff?.text })
+              await this.d.onEvent(topicId, { kind: 'turn', phase: 'end', inFlight: more, outcome })
               break
             }
             default:

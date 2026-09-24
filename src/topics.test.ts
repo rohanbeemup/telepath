@@ -143,7 +143,8 @@ describe('TopicManager', () => {
     expect(h.tm.isLive('idle')).toBe(false)
     expect(h.tm.isLive('busy')).toBe(true)
 
-    // two messages queued: the first result does not make the session idle
+    // a second message sent during the turn is folded into it: the one result answers
+    // both, and the session is idle afterwards
     h.bind('queued')
     await h.tm.sendToTopic('queued', 'first')
     await h.tm.sendToTopic('queued', 'second')
@@ -151,12 +152,47 @@ describe('TopicManager', () => {
     await h.tick()
     t += 5 * 60_000
     h.tm.evictIdle()
-    expect(h.tm.isLive('queued')).toBe(true)
+    expect(h.tm.isLive('queued')).toBe(false)
+    // a turn the CLI began on its own (init) protects the session like a sent message does
+    h.bind('own')
+    await h.tm.sendToTopic('own', 'x')
     h.backend.last().emit(result())
+    await h.tick()
+    h.backend.last().emit({ type: 'system', subtype: 'init', session_id: 's' })
     await h.tick()
     t += 5 * 60_000
     h.tm.evictIdle()
-    expect(h.tm.isLive('queued')).toBe(false)
+    expect(h.tm.isLive('own')).toBe(true)
+  })
+
+  test('messages sent during a turn are folded into it and one result answers them all', async () => {
+    const h = harness()
+    h.bind('1')
+    await h.tm.sendToTopic('1', 'a')
+    const s = h.backend.last()
+    s.emit({ type: 'system', subtype: 'init', session_id: 's' })
+    await h.tick()
+    await h.tm.sendToTopic('1', 'b')
+    await h.tm.sendToTopic('1', 'c')
+    await h.tm.sendToTopic('1', 'd')
+    const turns = () => h.events.filter(([, ev]) => ev.kind === 'turn').map(([, ev]) => ev as Extract<Event, { kind: 'turn' }>)
+    // the running turn plus three sent into it
+    expect(turns().map(t => [t.phase, t.inFlight])).toEqual([['start', 1], ['start', 2], ['start', 3], ['start', 4]])
+    expect(h.tm.live.get('1')?.queued).toBe(3)
+    s.emit(result())
+    await h.tick()
+    const ends = turns().filter(t => t.phase === 'end') as Extract<Event, { kind: 'turn'; phase: 'end' }>[]
+    expect(ends.map(t => [t.inFlight, t.outcome])).toEqual([[0, 'ok']])
+    expect(h.tm.live.get('1')?.running).toBe(false)
+    expect(h.tm.live.get('1')?.queued).toBe(0)
+    // a turn the pump did not see begin (output with no init) still counts as running
+    s.emit({ type: 'assistant', message: { content: [{ type: 'text', text: 'more' }] }, parent_tool_use_id: null, session_id: 's' })
+    await h.tick()
+    expect(h.tm.live.get('1')?.running).toBe(true)
+    expect(turns().filter(t => t.phase === 'start').length).toBe(5)
+    s.emit(result())
+    await h.tick()
+    expect(h.tm.live.get('1')?.running).toBe(false)
   })
 
   test('a model or effort switch closes the live session so the next message resumes with the new options', async () => {
@@ -250,7 +286,7 @@ describe('TopicManager', () => {
     expect(h.rotator.handedOff.length).toBe(1)
   })
 
-  test('emits turn start and end with the number of turns in flight', async () => {
+  test('emits turn start and end from the stream with the messages in the running turn', async () => {
     const h = harness()
     h.bind('1')
     await h.tm.sendToTopic('1', 'first')
@@ -260,10 +296,13 @@ describe('TopicManager', () => {
     const s = h.backend.last()
     s.emit(result())
     await h.tick()
+    // the CLI begins the next turn on its own: one start, then its error result
+    s.emit({ type: 'system', subtype: 'init', session_id: 's' })
     s.emit({ type: 'result', subtype: 'error_during_execution', is_error: true, errors: ['x'], session_id: 's' })
     await h.tick()
+    expect(turns().filter(t => t.phase === 'start').map(t => t.inFlight)).toEqual([1, 2, 1])
     const ends = turns().filter(t => t.phase === 'end') as Extract<Event, { kind: 'turn'; phase: 'end' }>[]
-    expect(ends.map(t => [t.inFlight, t.outcome])).toEqual([[1, 'ok'], [0, 'error']])
+    expect(ends.map(t => [t.inFlight, t.outcome])).toEqual([[0, 'ok'], [0, 'error']])
     // a rejection reports the wait to the status
     s.emit({ type: 'rate_limit_event', rate_limit_info: { status: 'rejected' } })
     await h.tick()
@@ -296,50 +335,63 @@ describe('TopicManager', () => {
     await h.tm.sendToTopic('1', 'long job')
     await h.tm.sendToTopic('1', 'queued one')
     const s = h.backend.last()
-    expect(h.tm.wrapUp('1', { when: 'now', dropQueue: false })).toBe(true)
-    expect(h.tm.wrapUp('1', { when: 'now', dropQueue: false })).toBe(false) // one wrap-up at a time
+    expect(h.tm.wrapUp('1', { when: 'now' })).toBe(true)
+    expect(h.tm.wrapUp('1', { when: 'now' })).toBe(false) // one wrap-up at a time
     const wrap = s.sentWith[s.sentWith.length - 1]
     expect(wrap.priority).toBe('now')
     expect(wrap.text).toContain('📋 Handoff')
-    // the preempted turn ends first (its own result), then the wrap-up turn writes the hand-off
+    // the preempted turn ends first (its own result, which must not close the status),
+    // then the CLI begins the wrap-up turn, which writes the hand-off
     s.emit(result())
     await h.tick()
+    s.emit({ type: 'system', subtype: 'init', session_id: 's' })
     s.emit({ type: 'assistant', message: { content: [{ type: 'text', text: '📋 Handoff\nDone: a\nOpen: b\nResume: continue with c' }] }, parent_tool_use_id: null, session_id: 's' })
     s.emit(result())
     await h.tick()
     const ends = h.events.filter(([, ev]) => ev.kind === 'turn' && ev.phase === 'end') as [string, Extract<Event, { kind: 'turn'; phase: 'end' }>][]
-    expect(ends.map(([, e]) => e.outcome)).toEqual(['ok', 'wrapped'])
+    expect(ends.map(([, e]) => [e.inFlight, e.outcome])).toEqual([[1, 'ok'], [0, 'wrapped']])
     const wrapped = h.events.find(([, ev]) => ev.kind === 'wrapped')?.[1] as Extract<Event, { kind: 'wrapped' }>
-    expect(wrapped.dropped).toBe(0)
     expect(wrapped.handoff).toContain('Resume: continue with c')
-    expect(h.tm.isLive('1')).toBe(true) // the queued message still runs
+    expect(h.tm.isLive('1')).toBe(true) // the session stays; the transcript keeps the context
+    expect(h.tm.live.get('1')?.running).toBe(false)
     // "after this turn" uses the next-priority slot
     h.bind('2')
     await h.tm.sendToTopic('2', 'x')
-    h.tm.wrapUp('2', { when: 'after-turn', dropQueue: false })
+    h.tm.wrapUp('2', { when: 'after-turn' })
     expect(h.backend.last().sentWith[1].priority).toBe('next')
     // not busy → nothing to wrap
     h.bind('3')
-    expect(h.tm.wrapUp('3', { when: 'now', dropQueue: false })).toBe(false)
+    expect(h.tm.wrapUp('3', { when: 'now' })).toBe(false)
   })
 
-  test('a wrap-up that drops the queue closes the session after the hand-off and says how many were dropped', async () => {
+  test('the turn a wrap-up cuts short is not reported as an error, and a second result completes the wrap-up without a hand-off', async () => {
     const h = harness()
     h.bind('1')
     await h.tm.sendToTopic('1', 'long job')
-    await h.tm.sendToTopic('1', 'queued one')
-    await h.tm.sendToTopic('1', 'queued two')
     const s = h.backend.last()
-    h.tm.wrapUp('1', { when: 'now', dropQueue: true })
-    s.emit(result()) // the preempted turn
+    h.tm.wrapUp('1', { when: 'now' })
+    // a `now` message that lands while the model is mid-thought ends the turn at once with an error result
+    s.emit({ type: 'result', subtype: 'error_during_execution', is_error: true, errors: [], session_id: 's' })
     await h.tick()
-    s.emit({ type: 'assistant', message: { content: [{ type: 'text', text: '📋 Handoff\nDone: a\nOpen: b\nResume: c' }] }, parent_tool_use_id: null, session_id: 's' })
-    s.emit(result()) // the wrap-up turn
+    expect(h.events.some(([, ev]) => ev.kind === 'turnError')).toBe(false)
+    expect(h.events.some(([, ev]) => ev.kind === 'turnEnd')).toBe(true)
+    let ends = h.events.filter(([, ev]) => ev.kind === 'turn' && ev.phase === 'end') as [string, Extract<Event, { kind: 'turn'; phase: 'end' }>][]
+    expect(ends.map(([, e]) => [e.inFlight, e.outcome])).toEqual([[1, 'ok']])
+    // the wrap-up turn ends without a hand-off in the expected shape: still wrapped, hand-off absent
+    s.emit({ type: 'system', subtype: 'init', session_id: 's' })
+    s.emit({ type: 'assistant', message: { content: [{ type: 'text', text: 'Stopped.' }] }, parent_tool_use_id: null, session_id: 's' })
+    s.emit(result())
     await h.tick()
-    expect(s.closed).toBe(true)
-    expect(h.tm.isLive('1')).toBe(false)
+    ends = h.events.filter(([, ev]) => ev.kind === 'turn' && ev.phase === 'end') as [string, Extract<Event, { kind: 'turn'; phase: 'end' }>][]
+    expect(ends.map(([, e]) => e.outcome)).toEqual(['ok', 'wrapped'])
     const wrapped = h.events.find(([, ev]) => ev.kind === 'wrapped')?.[1] as Extract<Event, { kind: 'wrapped' }>
-    expect(wrapped.dropped).toBe(2)
+    expect(wrapped.handoff).toBeUndefined()
+    expect(h.tm.live.get('1')?.wrap).toBeUndefined() // a new wrap-up is possible next time
+    // a real error in an ordinary turn is still reported
+    await h.tm.sendToTopic('1', 'again')
+    s.emit({ type: 'result', subtype: 'error_during_execution', is_error: true, errors: ['boom'], session_id: 's' })
+    await h.tick()
+    expect(h.events.some(([, ev]) => ev.kind === 'turnError')).toBe(true)
   })
 
   test('a wrap-up cancels a pending rate-limit nudge and rotation watch', async () => {
@@ -348,11 +400,10 @@ describe('TopicManager', () => {
     const h = harness({ rotator, resumeBufferMs: 0 })
     h.bind('1')
     await h.tm.sendToTopic('1', 'long job')
-    await h.tm.sendToTopic('1', 'queued one') // still busy after the rejection, so a wrap-up is possible
     const s = h.backend.last()
-    s.emit({ type: 'rate_limit_event', rate_limit_info: { status: 'rejected', resetsAt: Date.now() + 30 } })
+    s.emit({ type: 'rate_limit_event', rate_limit_info: { status: 'rejected', resetsAt: Date.now() + 30 } }) // the turn is still running, so a wrap-up is possible
     await h.tick()
-    expect(h.tm.wrapUp('1', { when: 'now', dropQueue: true })).toBe(true)
+    expect(h.tm.wrapUp('1', { when: 'now' })).toBe(true)
     release('claude_36') // the rotation lands after the wrap-up was requested
     await new Promise(r => setTimeout(r, 80)) // and the reset nudge would have fired by now
     expect(s.closed).toBe(false)
