@@ -169,14 +169,15 @@ describe('TopicManager', () => {
     const h = harness()
     h.bind('1')
     await h.tm.sendToTopic('1', 'a')
+    await h.tm.sendToTopic('1', 'b') // sent before the CLI's init: still unanswered once it arrives
     const s = h.backend.last()
     s.emit({ type: 'system', subtype: 'init', session_id: 's' })
     await h.tick()
-    await h.tm.sendToTopic('1', 'b')
+    expect(h.tm.live.get('1')?.queued).toBe(1)
     await h.tm.sendToTopic('1', 'c')
     await h.tm.sendToTopic('1', 'd')
     const turns = () => h.events.filter(([, ev]) => ev.kind === 'turn').map(([, ev]) => ev as Extract<Event, { kind: 'turn' }>)
-    // the running turn plus three sent into it
+    // the running turn plus three sent into it; the confirming init added no start
     expect(turns().map(t => [t.phase, t.inFlight])).toEqual([['start', 1], ['start', 2], ['start', 3], ['start', 4]])
     expect(h.tm.live.get('1')?.queued).toBe(3)
     s.emit(result())
@@ -367,6 +368,7 @@ describe('TopicManager', () => {
   test('the turn a wrap-up cuts short is not reported as an error, and a second result completes the wrap-up without a hand-off', async () => {
     const h = harness()
     h.bind('1')
+    h.store.registry['1'].handoff = { at: 0, text: '📋 Handoff\nResume: an earlier wrap-up' } // must not be offered as this one's
     await h.tm.sendToTopic('1', 'long job')
     const s = h.backend.last()
     h.tm.wrapUp('1', { when: 'now' })
@@ -386,12 +388,24 @@ describe('TopicManager', () => {
     expect(ends.map(([, e]) => e.outcome)).toEqual(['ok', 'wrapped'])
     const wrapped = h.events.find(([, ev]) => ev.kind === 'wrapped')?.[1] as Extract<Event, { kind: 'wrapped' }>
     expect(wrapped.handoff).toBeUndefined()
+    expect(h.store.registry['1'].handoff?.text).toContain('an earlier wrap-up') // the stored one is untouched
     expect(h.tm.live.get('1')?.wrap).toBeUndefined() // a new wrap-up is possible next time
     // a real error in an ordinary turn is still reported
     await h.tm.sendToTopic('1', 'again')
     s.emit({ type: 'result', subtype: 'error_during_execution', is_error: true, errors: ['boom'], session_id: 's' })
     await h.tick()
     expect(h.events.some(([, ev]) => ev.kind === 'turnError')).toBe(true)
+    // "finish this turn first" lets the turn run to its end, so its error is real and reported
+    h.bind('2')
+    await h.tm.sendToTopic('2', 'x')
+    const s2 = h.backend.last()
+    h.tm.wrapUp('2', { when: 'after-turn' })
+    s2.emit({ type: 'result', subtype: 'error_during_execution', is_error: true, errors: ['real'], session_id: 's2' })
+    await h.tick()
+    const errs2 = h.events.filter(([t, ev]) => t === '2' && ev.kind === 'turnError')
+    expect(errs2.length).toBe(1)
+    const end2 = h.events.filter(([t, ev]) => t === '2' && ev.kind === 'turn' && ev.phase === 'end') as [string, Extract<Event, { kind: 'turn'; phase: 'end' }>][]
+    expect(end2.map(([, e]) => [e.inFlight, e.outcome])).toEqual([[1, 'error']])
   })
 
   test('a wrap-up cancels a pending rate-limit nudge and rotation watch', async () => {

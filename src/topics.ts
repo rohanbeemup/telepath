@@ -37,7 +37,7 @@ export interface LiveSession {
  * its own, so two results follow the request (the preempted or finished turn's, then the
  * wrap-up's); the hand-off, when written, is in the text before the second.
  */
-type Wrap = { sawHandoff: boolean; resultsSeen: number }
+type Wrap = { when: 'now' | 'after-turn'; handoff: string | undefined; resultsSeen: number }
 
 export interface SessionBackend {
   open(opts: OpenOptions): LiveSession
@@ -232,12 +232,16 @@ export class TopicManager {
     return true
   }
 
-  /** The stream shows a turn beginning: from init, or from output when no turn was known. */
+  /**
+   * The stream shows a turn beginning: from init, or from output when no turn was known.
+   * An init that only confirms a turn a send already started changes nothing: a message
+   * sent between that send and the init is still unanswered and stays counted.
+   */
   private turnBegan(l: Live): void {
-    const known = l.running
+    if (l.running) return
     l.running = true
-    l.queued = 0 // whatever was sent before this point is in the turn now
-    if (!known) void this.d.onEvent(l.topicId, { kind: 'turn', phase: 'start', inFlight: 1 })
+    l.queued = 0
+    void this.d.onEvent(l.topicId, { kind: 'turn', phase: 'start', inFlight: 1 })
   }
 
   /**
@@ -252,7 +256,7 @@ export class TopicManager {
     // A wrap-up is the user taking over: a pending rate-limit nudge or rotation watch
     // would otherwise restart the work after the hand-off.
     this.userTookOver(topicId)
-    l.wrap = { sawHandoff: false, resultsSeen: 0 }
+    l.wrap = { when: opts.when, handoff: undefined, resultsSeen: 0 }
     l.session.send(WRAP_UP_PROMPT, { priority: opts.when === 'now' ? 'now' : 'next' })
     this.d.metrics.inc('wrap_ups')
     this.d.log.info('session.wrap_up', { topic: topicId, when: opts.when, queued: l.queued })
@@ -356,7 +360,7 @@ export class TopicManager {
                 if (h) {
                   b.handoff = { at: this.now(), text: h.text }
                   this.d.store.saveRegistry()
-                  if (l.wrap) l.wrap.sawHandoff = true
+                  if (l.wrap) l.wrap.handoff = h.text
                 }
               }
               await this.d.onEvent(topicId, ev)
@@ -372,19 +376,23 @@ export class TopicManager {
               let outcome: 'ok' | 'error' | 'limited' | 'wrapped' = ev.kind === 'turnEnd' ? 'ok' : ev.afterRateLimit ? 'limited' : 'error'
               let more = 0
               let report: Event = ev
+              // The hand-off this wrap-up produced, never an earlier one the binding still holds.
+              let handoff: string | undefined
               if (l.wrap) {
                 l.wrap.resultsSeen++
-                if (l.wrap.sawHandoff || l.wrap.resultsSeen >= 2) {
+                if (l.wrap.handoff !== undefined || l.wrap.resultsSeen >= 2) {
+                  handoff = l.wrap.handoff
                   l.wrap = undefined
                   outcome = 'wrapped'
                   this.d.metrics.inc('wrap_ups_completed')
                 } else {
-                  // The first result after a wrap-up request is the turn it cut short (a
-                  // `now` message ends it at once, as an error result when the model was
-                  // mid-thought). The wrap-up's own turn follows: keep the status open and
-                  // report no error for the cut itself.
+                  // The first result after a wrap-up request belongs to the turn before the
+                  // wrap-up's own; keep the status open for the one that follows. With `now`
+                  // that turn was cut short, and the error result the cut produces when the
+                  // model was mid-thought is the cut itself, not a failure. With `after-turn`
+                  // the turn ran to its end, so its error is real and stays reported.
                   more = 1
-                  if (ev.kind === 'turnError' && !ev.afterRateLimit) {
+                  if (l.wrap.when === 'now' && ev.kind === 'turnError' && !ev.afterRateLimit) {
                     outcome = 'ok'
                     report = { kind: 'turnEnd', afterRateLimit: false }
                   }
@@ -392,7 +400,7 @@ export class TopicManager {
               }
               if (report.kind === 'turnError') this.d.metrics.inc('turn_errors')
               await this.d.onEvent(topicId, report)
-              if (outcome === 'wrapped') await this.d.onEvent(topicId, { kind: 'wrapped', handoff: b?.handoff?.text })
+              if (outcome === 'wrapped') await this.d.onEvent(topicId, { kind: 'wrapped', handoff })
               await this.d.onEvent(topicId, { kind: 'turn', phase: 'end', inFlight: more, outcome })
               break
             }
