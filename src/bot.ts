@@ -26,6 +26,7 @@ import {
   askKeyboard,
   backKb,
   controlsKb,
+  focusGateKb,
   mainMenuKb,
   openLinkKb,
   pagedListKb,
@@ -43,6 +44,8 @@ import {
   wizardModelKb,
 } from './ui/keyboards'
 import { startWizard, wizardStep, type WizardState } from './ui/wizard'
+import { HeldCreations, gateText, gatedEntry, parseGateTap, planResume, runGateTap, shouldGate, type GateEffects, type HeldCreation } from './ui/focusgate'
+import { focusEnabled, markItem, parkIdle, readGate } from './focus'
 
 import { AUTO_ALLOW, preToolUseHookOutput } from './gate'
 export { AUTO_ALLOW }
@@ -68,6 +71,8 @@ export class TelegramBot {
   private readonly askBtns = new Map<string, AskBtn>()
   private readonly askFreeText = new Map<string, (t: string) => void>()
   private readonly wizard = new Map<string, WizardState>()
+  /** New topics held behind a Focus gate prompt, until a tap (or the expiry) decides. */
+  private readonly gateHeld = new HeldCreations()
   private defaultFolderChoices: string[] = []
   private tokenSeed = 0
   /** Set for the duration of a button tap so menu screens repaint the tapped message in place. */
@@ -589,6 +594,72 @@ export class TelegramBot {
     await this.postPinnedControls(topicId)
   }
 
+  // ── the Focus gate (decisions in src/ui/focusgate.ts) ─────────────────────
+
+  /**
+   * With three or more work items in flight, a NEW topic asks once first: resume one, park
+   * one, or start anyway. No focus tool, no answer, or an answer under the limit: `go` runs
+   * at once, exactly as before the gate existed.
+   */
+  private async gateOrGo(kind: HeldCreation['kind'], h: Omit<HeldCreation, 'kind' | 'view'>, go: () => Promise<void>): Promise<void> {
+    if (!gatedEntry(kind) || !focusEnabled()) return go()
+    const { view, reason } = await readGate()
+    // No view, or one the tool says it could not compute: the topic starts ungated, and
+    // the log and the counter say so instead of reading as "under the limit".
+    const unavailable = !view ? reason ?? 'unknown' : view.error ?? (view.reason && !view.gate ? view.reason : undefined)
+    if (unavailable) {
+      this.d.metrics.inc('focus_gate_unavailable')
+      this.d.log.warn('focus.gate_unavailable', { reason: unavailable })
+    }
+    if (!view || !shouldGate(view, true)) return go()
+    this.d.metrics.inc('focus_gate_prompts')
+    const token = this.gateHeld.hold({ ...h, kind, view })
+    await this.paint(h.topicId, gateText(view), focusGateKb(token, view))
+  }
+
+  /** Finishes what a gate prompt held, after Start anyway or a Park. */
+  private async createHeld(h: HeldCreation): Promise<void> {
+    if (h.kind === 'wizard' || h.kind === 'newhere') {
+      this.wizard.set(h.uid, startWizard(listRepoFolders(this.d.cfg.reposDir, this.d.store.defaultCwd()), h.kind === 'newhere' ? h.topicId : undefined))
+      return this.renderWizard(h.uid, h.topicId)
+    }
+    const name = h.name ?? basename(h.cwd ?? this.d.store.defaultCwd())
+    const tid = await this.newSession(name, h.cwd ?? this.d.store.defaultCwd(), h.model ?? this.d.store.prefs.defaultModel, h.effort, h.auto ?? false, h.topicId)
+    if (tid) await this.paint(h.topicId, `✅ Created "${name}".`, openLinkKb(this.d.cfg.forumChatId, tid))
+  }
+
+  private gateEffects(topicId: string | undefined): GateEffects {
+    return {
+      create: h => this.createHeld(h),
+      mark: n => markItem(n),
+      parkIdle: () => parkIdle(),
+      resume: async item => {
+        // Decided now, from the live registry and the transcript's real last write: the
+        // gate's view is up to a scan old and its idle time counts from the last prompt.
+        const bound = Object.entries(this.d.store.registry).find(([, b]) => b.sessionId === item.id)
+        let lastModifiedMs: number | undefined
+        if (!bound) {
+          try {
+            lastModifiedMs = (await listSessions()).find(s => s.sessionId === item.id)?.lastModified
+          } catch (e) {
+            this.d.log.warn('focus.resume_lookup_failed', { error: e })
+          }
+        }
+        const plan = planResume({ boundTopicId: bound?.[0], lastModifiedMs, now: Date.now() })
+        if (plan.kind === 'link') return void this.paint(topicId, `▶️ #${item.num} ${item.title} is open in its topic.`, openLinkKb(this.d.cfg.forumChatId, plan.topicId))
+        if (plan.kind === 'busy') {
+          return void this.paint(topicId, `⏳ #${item.num} was written to ${plan.minutesAgo}m ago, so it is probably still open where it runs. Resume it there:\n${item.resume}`, backKb())
+        }
+        if (plan.kind === 'missing') return void this.paint(topicId, `⚠️ Could not find the session behind #${item.num}.`, backKb())
+        await this.paint(topicId, `📎 Opening #${item.num} here…`, backKb())
+        const tid = await this.attach(item.id.slice(0, 8), item.title, topicId)
+        await this.paint(topicId, tid ? `✅ Opened #${item.num} ${item.title}.` : '⚠️ Could not open that session.', tid ? openLinkKb(this.d.cfg.forumChatId, tid) : backKb())
+      },
+      notice: text => this.send(topicId, text),
+      cancel: () => this.showMainMenu(topicId),
+    }
+  }
+
   // ── menu taps ────────────────────────────────────────────────────────────
 
   private async handleMenu(ctx: Context, data: string): Promise<void> {
@@ -600,17 +671,29 @@ export class TelegramBot {
 
     if (data === 'm:menu') return void (await ack(), this.showMainMenu(topicId))
     if (data === 'm:noop') return void ack()
+    // Focus gate taps come mostly from General, so they are handled before anything that
+    // needs a topic.
+    const tap = parseGateTap(data)
+    if (tap) {
+      await ack()
+      await runGateTap(tap, this.gateHeld, this.gateEffects(topicId))
+      return
+    }
     if (data === 'm:new' || data === 'm:newhere') {
       await ack()
-      this.wizard.set(uid, startWizard(listRepoFolders(this.d.cfg.reposDir, store.defaultCwd()), data === 'm:newhere' ? topicId : undefined))
-      return this.renderWizard(uid, topicId)
+      return this.gateOrGo(data === 'm:newhere' ? 'newhere' : 'wizard', { uid, topicId }, async () => {
+        this.wizard.set(uid, startWizard(listRepoFolders(this.d.cfg.reposDir, store.defaultCwd()), data === 'm:newhere' ? topicId : undefined))
+        return this.renderWizard(uid, topicId)
+      })
     }
     if (data === 'm:quick') {
       await ack('Creating…')
       const cwd = store.defaultCwd()
-      const tid = await this.newSession(basename(cwd), cwd, store.prefs.defaultModel, store.prefs.defaultEffort, false, topicId)
-      if (tid) await this.paint(topicId, `✅ Created "${basename(cwd)}".`, openLinkKb(this.d.cfg.forumChatId, tid))
-      return
+      const { defaultModel: model, defaultEffort: effort } = store.prefs
+      return this.gateOrGo('quick', { uid, topicId, name: basename(cwd), cwd, model, effort, auto: false }, async () => {
+        const tid = await this.newSession(basename(cwd), cwd, model, effort, false, topicId)
+        if (tid) await this.paint(topicId, `✅ Created "${basename(cwd)}".`, openLinkKb(this.d.cfg.forumChatId, tid))
+      })
     }
     if (data === 'm:list') return void (await ack(), this.showSessions(topicId, 0))
     if (data === 'm:resume') {
@@ -843,7 +926,10 @@ export class TelegramBot {
         case 'new': {
           const { name, cwd, auto, notes } = parseNew(typed.args, this.d.store.defaultCwd())
           for (const n of notes) await this.say(topicId, n)
-          await this.newSession(name, cwd, this.d.store.prefs.defaultModel, this.d.store.prefs.defaultEffort, auto, topicId)
+          const { defaultModel: model, defaultEffort: effort } = this.d.store.prefs
+          await this.gateOrGo('new', { uid: String(ctx.from?.id), topicId, name, cwd, model, effort, auto }, async () => {
+            await this.newSession(name, cwd, model, effort, auto, topicId)
+          })
           return
         }
         case 'list':

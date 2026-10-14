@@ -161,9 +161,16 @@ export class TopicManager {
 
   private enforceCap(): void {
     while (this.live.size >= this.d.maxLiveSessions) {
+      // Only an idle session makes room: closing one mid-turn would kill work in another
+      // topic, and one awaiting its wrap-up hand-off is not done either (its first result
+      // leaves it looking idle). When every live session is busy, run over the cap.
       let oldest: Live | undefined
-      for (const l of this.live.values()) if (!oldest || l.lastActive < oldest.lastActive) oldest = l
-      if (!oldest) break
+      for (const l of this.live.values()) if (!isBusy(l) && !l.wrap && (!oldest || l.lastActive < oldest.lastActive)) oldest = l
+      if (!oldest) {
+        this.d.metrics.inc('sessions_over_cap')
+        this.d.log.warn('session.over_cap', { live: this.live.size, cap: this.d.maxLiveSessions })
+        break
+      }
       void this.d.say(oldest.topicId, `💤 Paused to free a slot (max ${this.d.maxLiveSessions} live sessions). Send a message here to resume — your context is kept.`)
       this.d.metrics.inc('sessions_evicted_cap')
       this.closeLive(oldest.topicId, 'evicted (session cap)')

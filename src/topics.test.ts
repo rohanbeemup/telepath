@@ -71,6 +71,7 @@ function harness(over: { maxLive?: number; idleMinutes?: number; rotator?: FakeR
   const events: [string, Event][] = []
   const rotator = over.rotator ?? fakeRotator()
   const extras = { canUseTool: (async () => ({ behavior: 'allow' })) as any, hooks: {} }
+  const metrics = new Metrics()
   const tm = new TopicManager({
     store,
     catalog,
@@ -84,7 +85,7 @@ function harness(over: { maxLive?: number; idleMinutes?: number; rotator?: FakeR
     onEvent: async (t, ev) => void events.push([t, ev]),
     rotator,
     log: new Logger({ level: 'error', sink: () => {} }),
-    metrics: new Metrics(),
+    metrics,
     now: over.now,
     resumeBufferMs: over.resumeBufferMs,
   })
@@ -92,7 +93,7 @@ function harness(over: { maxLive?: number; idleMinutes?: number; rotator?: FakeR
     store.registry[topicId] = { cwd: '/w', model: b.model ?? 'claude-opus-5', effort: b.effort, sessionId: b.sessionId, title: 't' + topicId, lastActive: 0, auto: b.auto }
   }
   const tick = () => new Promise(r => setTimeout(r, 5))
-  return { store, backend, said, events, tm, bind, tick, rotator }
+  return { store, backend, said, events, tm, bind, tick, rotator, metrics }
 }
 
 const result = (sid = 's') => ({ type: 'result', subtype: 'success', is_error: false, session_id: sid })
@@ -116,9 +117,14 @@ describe('TopicManager', () => {
     h.bind('a')
     h.bind('b')
     h.bind('c')
+    // both finish their turn: only an idle session may be evicted (see the busy case below)
     await h.tm.sendToTopic('a', 'x')
+    h.backend.sessions[0].emit(result())
+    await h.tick()
     t += 10
     await h.tm.sendToTopic('b', 'x')
+    h.backend.sessions[1].emit(result())
+    await h.tick()
     t += 10
     await h.tm.sendToTopic('c', 'x')
     expect(h.tm.isLive('a')).toBe(false)
@@ -126,6 +132,41 @@ describe('TopicManager', () => {
     expect(h.tm.isLive('c')).toBe(true)
     expect(h.backend.sessions[0].closed).toBe(true)
     expect(h.said.find(([topic, text]) => topic === 'a' && text.includes('Paused'))).toBeTruthy()
+  })
+
+  test('enforceCap never evicts a busy session', async () => {
+    let t = 1000
+    const h = harness({ maxLive: 2, now: () => t })
+    for (const id of ['old', 'idle', 'new', 'fourth']) h.bind(id)
+    await h.tm.sendToTopic('old', 'x') // oldest, and still mid-turn
+    t += 10
+    await h.tm.sendToTopic('idle', 'x')
+    h.backend.sessions[1].emit(result())
+    await h.tick()
+    t += 10
+    await h.tm.sendToTopic('new', 'x') // cap reached: the idle one goes, not the older busy one
+    expect(h.tm.isLive('old')).toBe(true)
+    expect(h.tm.isLive('idle')).toBe(false)
+    expect(h.tm.isLive('new')).toBe(true)
+    expect(h.backend.sessions[0].closed).toBe(false)
+    t += 10
+    await h.tm.sendToTopic('fourth', 'x') // every live session is mid-turn: run over the cap
+    expect(['old', 'new', 'fourth'].every(id => h.tm.isLive(id))).toBe(true)
+    expect(h.metrics.get('sessions_over_cap')).toBe(1)
+    expect(h.said.filter(([, text]) => text.includes('Paused')).map(([topic]) => topic)).toEqual(['idle'])
+
+    // A wrap-up's first result leaves the session looking idle until its hand-off turn
+    // starts; closing it then would lose the hand-off.
+    const w = harness({ maxLive: 1, now: () => t })
+    w.bind('wrapping')
+    w.bind('next')
+    await w.tm.sendToTopic('wrapping', 'x')
+    expect(w.tm.wrapUp('wrapping', { when: 'now' })).toBe(true)
+    w.backend.sessions[0].emit(result())
+    await w.tick()
+    await w.tm.sendToTopic('next', 'x')
+    expect(w.tm.isLive('wrapping')).toBe(true)
+    expect(w.backend.sessions[0].closed).toBe(false)
   })
 
   test('evicts idle sessions and leaves a session mid-turn alone', async () => {

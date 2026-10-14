@@ -14,6 +14,7 @@ import {
   wrapConfirmKb,
   wrapConfirmText,
   resumeKb,
+  focusGateKb,
   callbackData,
   labels,
 } from './keyboards'
@@ -98,6 +99,10 @@ describe('telegram limits', () => {
       statusLiveKb(),
       wrapConfirmKb(),
       resumeKb(),
+      focusGateKb('zzzzzzzzzz', {
+        gate: true, limit: 3, inFlight: 9, more: 4,
+        items: Array.from({ length: 9 }, (_, i) => ({ num: 99999 + i, id: 'f'.repeat(36), title: 'T'.repeat(300), source: 'vscode', topicId: null, cwd: '/w', idleMin: 600, waiting: true, state: 'open', resume: 'r' })),
+      }),
     ]
     for (const kb of kbs) {
       for (const data of callbackData(kb)) expect(Buffer.byteLength(data, 'utf8')).toBeLessThanOrEqual(64)

@@ -6,6 +6,7 @@
 import { InlineKeyboard } from 'grammy'
 import { EFFORT_LEVELS, EFFORT_MENU, MODEL_MENU, modelLabel, modelLines, supportsEffort, type Catalog, type Effort } from '../models'
 import { feedOn, type Binding, type Prefs } from '../state'
+import { ATTACH_IDLE_MIN, GATE_ROWS, type GateView } from './focusgate'
 
 export const PAGE_SIZE = 10
 
@@ -112,7 +113,9 @@ export function pagedListKb(
 export function wizardModelKb(c: Catalog): InlineKeyboard {
   const kb = new InlineKeyboard()
   for (const k of c.enabled) kb.text(MODEL_MENU[k].long, `m:nm:${k}`).row()
-  return kb.text('⬅️ Back', 'm:new').text('✖️ Cancel', 'm:cancel')
+  // m:nback, not m:new: going back keeps the wizard's state (a "Start a session here"
+  // topic binding included) and does not pass the Focus gate a second time.
+  return kb.text('⬅️ Back', 'm:nback').text('✖️ Cancel', 'm:cancel')
 }
 export function wizardEffortKb(settingsDefault: Effort | undefined): InlineKeyboard {
   const kb = new InlineKeyboard()
@@ -175,4 +178,22 @@ export function callbackData(kb: InlineKeyboard): string[] {
 }
 export function labels(kb: InlineKeyboard): string[] {
   return kb.inline_keyboard.flat().map(b => b.text)
+}
+
+/**
+ * The Focus gate's prompt: one row per in-flight item (at most GATE_ROWS) with Resume and
+ * Park, then park-idle · start anyway · cancel. A telepath item resumes by its topic link
+ * (a URL button, no callback); any other item resumes by attaching it here, offered only
+ * once it has been idle over ATTACH_IDLE_MIN, so a session still open in VS Code never gets
+ * a second writer. Titles stay in labels; callback data is a token and an index.
+ */
+export function focusGateKb(token: string, view: GateView): InlineKeyboard {
+  const kb = new InlineKeyboard()
+  view.items.slice(0, GATE_ROWS).forEach((i, n) => {
+    const label = Array.from(`▶️ #${i.num} ${i.title}`).slice(0, 36).join('')
+    if (i.source === 'telepath' && i.resume.startsWith('https://')) kb.url(label, i.resume)
+    else if (i.idleMin !== null && i.idleMin > ATTACH_IDLE_MIN) kb.text(label, `m:fg:${token}:r:${n}`)
+    kb.text(`⏸ Park #${i.num}`, `m:fg:${token}:p:${n}`).row()
+  })
+  return kb.text('🧹 Park idle', `m:fg:${token}:pi`).text('🆕 Start anyway', `m:fg:${token}:go`).text('✖️ Cancel', `m:fg:${token}:x`)
 }
