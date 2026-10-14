@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- **Focus gate.** With the focus tool installed (`~/.claude/scripts/focus/focus.py`), a new
+  topic (`/new`, ⚡ Quick new, 🆕 New session, "Start a session here") asks once when three
+  or more work items are already in flight: resume one, park one to make room, park
+  everything not touched today, or start anyway. Reopening an existing session (`/attach`,
+  ▶️ Resume last, My sessions) is never gated. The tool decides; telepath only asks it, with
+  a 3 s deadline, and starts the topic as before when there is no tool, no answer or an
+  answer under the limit. `FOCUS_GATE=off` disables it; `FOCUS_CLI` and `FOCUS_PY`
+  override where the tool and its interpreter are.
+
+### Fixed
+- **The session cap could kill a running turn.** `MAX_LIVE_SESSIONS` closed the least
+  recently active session even when it was mid-turn, so opening a fourth topic could stop
+  work in progress in another one. Now only an idle session is closed to make room; when
+  every live session is busy, the cap is exceeded until one finishes (counted as
+  `sessions_over_cap`).
+- **"Start a session here" lost its topic on Back.** The wizard's model step Back button
+  restarted the wizard without the topic binding, so the session was then created in a new
+  topic. Back now returns to the folder step with the wizard's state kept.
+
 ## 0.2.0 — 2026-09-22
 
 Rewrite on the current Agent SDK, in tested modules, with observability.

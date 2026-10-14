@@ -3,9 +3,8 @@ feature: Starting a new topic while three or more work items are already in flig
 suite:
   - src/focus.test.ts
   - src/ui/focusgate.test.ts
-  - src/ui/keyboards.test.ts
-  - src/topics.test.ts
-gate: bun test src/focus.test.ts src/ui/focusgate.test.ts src/ui/keyboards.test.ts src/topics.test.ts
+  - src/ui/focusgate-kb.test.ts
+gate: bun test src/focus.test.ts src/ui/focusgate.test.ts src/ui/focusgate-kb.test.ts
 ---
 
 # Focus gate on new topics
@@ -53,7 +52,13 @@ Checked on 2026-10-14 against this branch:
 | `focus gate: an expired or unknown token says send /new again` | tokens are random; a tap after the expiry, or with an unknown token, creates nothing and says to send `/new` again; a token is used once | counter tokens reused after a restart park the wrong item |
 | `focusGateKb: items, then park-idle, start anyway, cancel` | at most five item rows; a telepath item resumes by its topic link; another resumes by an attach callback only when idle over 30 minutes; every item has Park; the last row is park-idle, start anyway, cancel | a callback for every item; attaching a VS Code session that is still live |
 | `wizard model step Back keeps the topic binding` | the model step's Back sends `m:nback`, and going back keeps `bindTopic` | `m:new`: the topic binding is lost and the gate asks again |
-| `enforceCap never evicts a busy session` | the oldest idle session is evicted even when a busy one is older; when every live session is mid-turn, none is closed and the overrun is counted | evicting the oldest regardless, so one topic's reply kills another's running turn |
+
+The session-cap case signed off with this plan, `enforceCap never evicts a busy session`,
+is a row of `query-api-rewrite.md`: that plan owns `src/topics.test.ts` and the cap rows the
+fix corrects, and the `64-byte` keyboard case there now builds `focusGateKb` as well. Keeping
+this plan's suite disjoint from that one's also keeps `test_plan_check.py` honest: today it
+merges a sibling plan's case names into the CASE direction too, not only into the ORPHAN
+direction its own docstring describes.
 
 ### Negative cases
 
