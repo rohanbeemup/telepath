@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- **Voice notes.** A voice note or audio file sent into a topic is transcribed by
+  `TRANSCRIBE_CMD` (new, optional), shown as `🎙️ <words>` and handled as typed text. The
+  transcription runs in the background with a 3-minute limit, so it holds up no other topic;
+  every failure, an unset `TRANSCRIBE_CMD` included, is answered in the topic. The pre-0.2.0
+  fork had this; the rewrite dropped it and voice notes were ignored without a trace.
+
 ## 0.2.0 — 2026-09-22
 
 Rewrite on the current Agent SDK, in tested modules, with observability.
