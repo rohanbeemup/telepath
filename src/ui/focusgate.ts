@@ -31,7 +31,16 @@ export type GateItem = {
   /** How to get back into it: a topic link, or a resume command. Printed, never run. */
   resume: string
 }
-export type GateView = { gate: boolean; limit: number; inFlight: number; items: GateItem[]; more: number }
+export type GateView = {
+  gate: boolean
+  limit: number
+  inFlight: number
+  items: GateItem[]
+  more: number
+  /** Set when the tool could not compute a gate (it then answers gate:false); worth a log line. */
+  error?: string
+  reason?: string
+}
 
 const str = (v: unknown): string | null => (typeof v === 'string' ? v : null)
 const num = (v: unknown, fallback: number): number => (typeof v === 'number' && Number.isFinite(v) ? v : fallback)
@@ -65,7 +74,10 @@ export function parseGateView(raw: string): GateView | undefined {
       resume: str(i.resume) ?? '',
     })
   }
-  return { gate: o.gate, limit: num(o.limit, 3), inFlight: num(o.inFlight, items.length), items, more: num(o.more, 0) }
+  const view: GateView = { gate: o.gate, limit: num(o.limit, 3), inFlight: num(o.inFlight, items.length), items, more: num(o.more, 0) }
+  if (typeof o.error === 'string') view.error = o.error
+  if (typeof o.reason === 'string') view.reason = o.reason
+  return view
 }
 
 /**
@@ -225,4 +237,21 @@ export async function runGateTap(tap: GateTap, store: HeldCreations, fx: GateEff
   await fx.create(h)
   if (!ok) await fx.notice(`⚠️ Could not park #${item.num}; the new session was started anyway. Park it from 🎯 Focus with: park ${item.num}`)
   return 'created'
+}
+
+export type ResumePlan = { kind: 'link'; topicId: string } | { kind: 'busy'; minutesAgo: number } | { kind: 'attach' } | { kind: 'missing' }
+
+/**
+ * What ▶️ Resume on an attachable item does, decided when it is tapped: the gate's view is
+ * up to a scan old, and its idle time counts from the last prompt, not the last write. A
+ * session a topic here already holds opens that topic; a transcript written to in the last
+ * ATTACH_IDLE_MIN minutes is still live somewhere and is not given a second writer; a
+ * session that cannot be found is reported; anything else is attached here.
+ */
+export function planResume(o: { boundTopicId?: string; lastModifiedMs?: number; now: number }): ResumePlan {
+  if (o.boundTopicId) return { kind: 'link', topicId: o.boundTopicId }
+  if (o.lastModifiedMs === undefined) return { kind: 'missing' }
+  const minutesAgo = Math.floor((o.now - o.lastModifiedMs) / 60_000)
+  if (minutesAgo < ATTACH_IDLE_MIN) return { kind: 'busy', minutesAgo: Math.max(0, minutesAgo) }
+  return { kind: 'attach' }
 }

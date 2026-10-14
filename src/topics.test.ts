@@ -154,6 +154,19 @@ describe('TopicManager', () => {
     expect(['old', 'new', 'fourth'].every(id => h.tm.isLive(id))).toBe(true)
     expect(h.metrics.get('sessions_over_cap')).toBe(1)
     expect(h.said.filter(([, text]) => text.includes('Paused')).map(([topic]) => topic)).toEqual(['idle'])
+
+    // A wrap-up's first result leaves the session looking idle until its hand-off turn
+    // starts; closing it then would lose the hand-off.
+    const w = harness({ maxLive: 1, now: () => t })
+    w.bind('wrapping')
+    w.bind('next')
+    await w.tm.sendToTopic('wrapping', 'x')
+    expect(w.tm.wrapUp('wrapping', { when: 'now' })).toBe(true)
+    w.backend.sessions[0].emit(result())
+    await w.tick()
+    await w.tm.sendToTopic('next', 'x')
+    expect(w.tm.isLive('wrapping')).toBe(true)
+    expect(w.backend.sessions[0].closed).toBe(false)
   })
 
   test('evicts idle sessions and leaves a session mid-turn alone', async () => {

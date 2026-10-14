@@ -4,6 +4,7 @@ import {
   HeldCreations,
   gatedEntry,
   parseGateView,
+  planResume,
   runGateTap,
   shouldGate,
   type GateEffects,
@@ -65,6 +66,22 @@ test('focus gate: parses the CLI JSON and rejects junk', () => {
     JSON.stringify({ ...view(), items: [{ title: 'no number' }] }), JSON.stringify({ ...view(), gate: 'yes' })]) {
     expect(parseGateView(raw)).toBeUndefined()
   }
+  // the tool answers gate:false when it cannot compute one; telepath must be able to tell
+  const broken = parseGateView(JSON.stringify({ gate: false, limit: 3, inFlight: 0, items: [], more: 0, error: 'CorruptState: observations.json' }))
+  expect(broken?.gate).toBe(false)
+  expect(broken?.error).toBe('CorruptState: observations.json')
+  expect(parseGateView(JSON.stringify({ gate: false, limit: 3, inFlight: 0, items: [], more: 0, reason: 'no scan yet' }))?.reason).toBe('no scan yet')
+  expect(parseGateView(JSON.stringify(view()))?.error).toBeUndefined()
+})
+
+test('focus gate: resume opens the holding topic, refuses a recently written session, else attaches', () => {
+  const now = 10_000_000_000
+  const min = 60_000
+  expect(planResume({ boundTopicId: '77', lastModifiedMs: now - 5 * min, now })).toEqual({ kind: 'link', topicId: '77' })
+  expect(planResume({ lastModifiedMs: now - 5 * min, now })).toEqual({ kind: 'busy', minutesAgo: 5 })
+  expect(planResume({ lastModifiedMs: now - 29 * min, now }).kind).toBe('busy')
+  expect(planResume({ lastModifiedMs: now - 31 * min, now })).toEqual({ kind: 'attach' })
+  expect(planResume({ now })).toEqual({ kind: 'missing' })
 })
 
 test('focus gate: only new-session entry points are gated', () => {

@@ -9,15 +9,19 @@
   everything not touched today, or start anyway. Reopening an existing session (`/attach`,
   ▶️ Resume last, My sessions) is never gated. The tool decides; telepath only asks it, with
   a 3 s deadline, and starts the topic as before when there is no tool, no answer or an
-  answer under the limit. `FOCUS_GATE=off` disables it; `FOCUS_CLI` and `FOCUS_PY`
-  override where the tool and its interpreter are.
+  answer under the limit; a gate the tool reports it could not compute is logged and
+  counted (`focus_gate_unavailable`) rather than read as "under the limit". Resuming a VS
+  Code item from the prompt is decided when tapped: a session a topic already holds opens
+  that topic, and one written to in the last 30 minutes is not attached a second time.
+  `FOCUS_GATE=off` disables it; `FOCUS_CLI` and `FOCUS_PY` override where the tool and its
+  interpreter are.
 
 ### Fixed
 - **The session cap could kill a running turn.** `MAX_LIVE_SESSIONS` closed the least
   recently active session even when it was mid-turn, so opening a fourth topic could stop
-  work in progress in another one. Now only an idle session is closed to make room; when
-  every live session is busy, the cap is exceeded until one finishes (counted as
-  `sessions_over_cap`).
+  work in progress in another one. Now only an idle session is closed to make room (one
+  awaiting its wrap-up hand-off counts as busy); when every live session is busy, the cap
+  is exceeded until one finishes (counted as `sessions_over_cap`).
 - **"Start a session here" lost its topic on Back.** The wizard's model step Back button
   restarted the wizard without the topic binding, so the session was then created in a new
   topic. Back now returns to the folder step with the wizard's state kept.

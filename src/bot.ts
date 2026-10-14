@@ -44,7 +44,7 @@ import {
   wizardModelKb,
 } from './ui/keyboards'
 import { startWizard, wizardStep, type WizardState } from './ui/wizard'
-import { HeldCreations, gateText, gatedEntry, parseGateTap, runGateTap, shouldGate, type GateEffects, type HeldCreation } from './ui/focusgate'
+import { HeldCreations, gateText, gatedEntry, parseGateTap, planResume, runGateTap, shouldGate, type GateEffects, type HeldCreation } from './ui/focusgate'
 import { focusEnabled, markItem, parkIdle, readGate } from './focus'
 
 import { AUTO_ALLOW, preToolUseHookOutput } from './gate'
@@ -604,7 +604,13 @@ export class TelegramBot {
   private async gateOrGo(kind: HeldCreation['kind'], h: Omit<HeldCreation, 'kind' | 'view'>, go: () => Promise<void>): Promise<void> {
     if (!gatedEntry(kind) || !focusEnabled()) return go()
     const { view, reason } = await readGate()
-    if (!view) this.d.log.warn('focus.gate_unavailable', { reason: reason ?? 'unknown' })
+    // No view, or one the tool says it could not compute: the topic starts ungated, and
+    // the log and the counter say so instead of reading as "under the limit".
+    const unavailable = !view ? reason ?? 'unknown' : view.error ?? (view.reason && !view.gate ? view.reason : undefined)
+    if (unavailable) {
+      this.d.metrics.inc('focus_gate_unavailable')
+      this.d.log.warn('focus.gate_unavailable', { reason: unavailable })
+    }
     if (!view || !shouldGate(view, true)) return go()
     this.d.metrics.inc('focus_gate_prompts')
     const token = this.gateHeld.hold({ ...h, kind, view })
@@ -628,10 +634,23 @@ export class TelegramBot {
       mark: n => markItem(n),
       parkIdle: () => parkIdle(),
       resume: async item => {
-        if (item.source === 'telepath' && item.resume.startsWith('https://')) {
-          return void this.paint(topicId, `▶️ #${item.num} ${item.title}: ${item.resume}`, backKb())
+        // Decided now, from the live registry and the transcript's real last write: the
+        // gate's view is up to a scan old and its idle time counts from the last prompt.
+        const bound = Object.entries(this.d.store.registry).find(([, b]) => b.sessionId === item.id)
+        let lastModifiedMs: number | undefined
+        if (!bound) {
+          try {
+            lastModifiedMs = (await listSessions()).find(s => s.sessionId === item.id)?.lastModified
+          } catch (e) {
+            this.d.log.warn('focus.resume_lookup_failed', { error: e })
+          }
         }
-        // Offered only for an item idle long enough that VS Code is not still writing to it.
+        const plan = planResume({ boundTopicId: bound?.[0], lastModifiedMs, now: Date.now() })
+        if (plan.kind === 'link') return void this.paint(topicId, `▶️ #${item.num} ${item.title} is open in its topic.`, openLinkKb(this.d.cfg.forumChatId, plan.topicId))
+        if (plan.kind === 'busy') {
+          return void this.paint(topicId, `⏳ #${item.num} was written to ${plan.minutesAgo}m ago, so it is probably still open where it runs. Resume it there:\n${item.resume}`, backKb())
+        }
+        if (plan.kind === 'missing') return void this.paint(topicId, `⚠️ Could not find the session behind #${item.num}.`, backKb())
         await this.paint(topicId, `📎 Opening #${item.num} here…`, backKb())
         const tid = await this.attach(item.id.slice(0, 8), item.title, topicId)
         await this.paint(topicId, tid ? `✅ Opened #${item.num} ${item.title}.` : '⚠️ Could not open that session.', tid ? openLinkKb(this.d.cfg.forumChatId, tid) : backKb())
