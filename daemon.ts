@@ -22,6 +22,7 @@ import { Files } from './src/files'
 import { ErrorRing, Logger, Metrics } from './src/log'
 import { bundledClaudePath, checkClaudeVersion, MIN_CLAUDE_VERSION, readClaudeVersion } from './src/preflight'
 import { handOffToRotator, rotatorActive, rotatorEnabled, waitForRotation } from './src/rotator'
+import { drainSeedRequests } from './src/seed'
 import { SdkBackend } from './src/session'
 import { loadStore, StateError } from './src/state'
 import { TopicManager, isBusy } from './src/topics'
@@ -126,6 +127,19 @@ bot.attachTopics(topics)
 
 // ── periodic work ───────────────────────────────────────────────────────────
 setInterval(() => topics.evictIdle(), 60_000).unref()
+// A todo-queue run drops a seed-request per finished item; bind each to its session so it
+// can be continued by typing in the topic. Binding only (the topic already exists); paint controls.
+const seedDir = join(stateDir, 'seed-requests')
+setInterval(() => {
+  try {
+    for (const id of drainSeedRequests(seedDir, store, Date.now, log)) {
+      metrics.inc('seed_bindings')
+      void bot.postPinnedControls(id)
+    }
+  } catch (e) {
+    log.warn('seed.drain_failed', { error: e })
+  }
+}, 5_000).unref()
 // The live status messages: typing while a turn runs, an edit at most every 12 s per topic.
 setInterval(() => void bot.status.tick().catch(e => log.warn('status.tick_failed', { error: e })), 1_000).unref()
 
