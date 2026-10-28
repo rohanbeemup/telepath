@@ -1,5 +1,5 @@
 import { test, expect, describe } from 'bun:test'
-import { TopicManager, type LiveSession, type OpenOptions, type SessionBackend, type Rotator } from './topics'
+import { TopicManager, outboxContract, type LiveSession, type OpenOptions, type SessionBackend, type Rotator } from './topics'
 import { Mailbox } from './mailbox'
 import { Store } from './state'
 import { buildCatalog } from './models'
@@ -467,5 +467,16 @@ describe('TopicManager', () => {
     expect(errs.length).toBe(2)
     expect(errs[0][1].afterRateLimit).toBe(true)
     expect(errs[1][1].afterRateLimit).toBe(false)
+  })
+})
+
+describe('outboxContract', () => {
+  test('names the outbox dir and the media kinds the session can deliver', () => {
+    const c = outboxContract('/state/outbox/42')
+    expect(c).toContain('/state/outbox/42')
+    expect(c.toLowerCase()).toContain('photo')
+    expect(c.toLowerCase()).toContain('video')
+    expect(c.toLowerCase()).toContain('audio')
+    expect(c.toLowerCase()).toContain('document')
   })
 })

@@ -13,7 +13,8 @@ import { parseTyped } from './commands'
 import { describeTask } from './feed'
 import { TurnStatus, type StatusTransport } from './status'
 import { parseHandoff, resumePrompt } from './handoff'
-import { deleteTranscript, isImage, listRepoFolders, type Files } from './files'
+import { deleteTranscript, listRepoFolders, type Files } from './files'
+import { fallsBackToDocument, inboundFileName, inboundMediaNotice, mediaKind, MAX_DOWNLOAD_BYTES, type InboundKind } from './media'
 import type { Event } from './interpret'
 import type { Logger, Metrics } from './log'
 import { htmlEsc, htmlToPlain, renderWithDeadline, chunkHtml, chunkPlain } from './markdown'
@@ -390,10 +391,38 @@ export class TelegramBot {
   // ── files ────────────────────────────────────────────────────────────────
 
   private async sendFile(topicId: string, path: string): Promise<boolean> {
+    const chat = this.d.cfg.forumChatId
     const opts = { message_thread_id: Number(topicId), caption: basename(path) }
+    const kind = mediaKind(path)
+    // A fresh InputFile per attempt: a consumed file stream cannot be replayed on fallback.
+    const sendTyped = async (): Promise<void> => {
+      switch (kind) {
+        case 'image':
+          await this.bot.api.sendPhoto(chat, new InputFile(path), opts)
+          break
+        case 'video':
+          await this.bot.api.sendVideo(chat, new InputFile(path), { ...opts, supports_streaming: true })
+          break
+        case 'animation':
+          await this.bot.api.sendAnimation(chat, new InputFile(path), opts)
+          break
+        case 'audio':
+          await this.bot.api.sendAudio(chat, new InputFile(path), opts)
+          break
+        default:
+          await this.bot.api.sendDocument(chat, new InputFile(path), opts)
+      }
+    }
     try {
-      if (isImage(path)) await this.bot.api.sendPhoto(this.d.cfg.forumChatId, new InputFile(path), opts)
-      else await this.bot.api.sendDocument(this.d.cfg.forumChatId, new InputFile(path), opts)
+      try {
+        await sendTyped()
+      } catch (e) {
+        // Telegram rejects formats outside its inline set (e.g. wav/flac, mkv/mov); deliver
+        // them as a document rather than leaving the file stuck in the outbox forever.
+        if (!fallsBackToDocument(kind)) throw e
+        this.d.log.warn('media.typed_send_failed', { topic: topicId, path, kind, error: e })
+        await this.bot.api.sendDocument(chat, new InputFile(path), opts)
+      }
       this.d.metrics.inc('files_sent')
       this.status.bump(topicId)
       return true
@@ -406,6 +435,40 @@ export class TelegramBot {
 
   async flushOutbox(topicId: string): Promise<void> {
     for (const p of this.d.files.pendingOutbox(topicId)) if (await this.sendFile(topicId, p)) this.d.files.afterSent(p)
+  }
+
+  /** Download an inbound video / GIF / video note / voice / audio upload and tell the session where it landed. */
+  private async handleIncomingMedia(ctx: Context, kind: InboundKind): Promise<void> {
+    if (!this.allowed(ctx)) return void this.d.metrics.inc('rejected_updates')
+    const topicId = this.topicIdOf(ctx)
+    if (!topicId) return void this.say(undefined, 'Send media inside a session topic.')
+    this.status.bump(topicId)
+    const m = ctx.message
+    const src =
+      kind === 'video' ? m?.video
+      : kind === 'animation' ? m?.animation
+      : kind === 'video_note' ? m?.video_note
+      : kind === 'voice' ? m?.voice
+      : m?.audio
+    if (!src) return
+    try {
+      if (src.file_size && src.file_size > MAX_DOWNLOAD_BYTES) {
+        return void this.say(
+          topicId,
+          `File too large (${(src.file_size / 1048576).toFixed(1)} MB) — Telegram caps bot downloads at 20 MB.`,
+        )
+      }
+      const name = inboundFileName(kind, src)
+      const path = this.d.files.saveInbox(name, await this.download(src.file_id))
+      const mime = 'mime_type' in src ? src.mime_type : undefined
+      const caption = m?.caption?.trim()
+      this.d.metrics.inc('files_received')
+      const notice = inboundMediaNotice(kind, { path, name, mime, duration: src.duration, caption })
+      await this.say(topicId, notice.ack)
+      await this.topics.sendToTopic(topicId, notice.prompt)
+    } catch (e) {
+      await this.say(topicId, `media handling failed: ${e}`)
+    }
   }
 
   private async download(fileId: string): Promise<Uint8Array> {
@@ -944,6 +1007,14 @@ export class TelegramBot {
       }
     })
 
+    // Registered before message:document: Telegram animation (GIF) messages also carry a
+    // legacy document field, so the document handler would otherwise claim them first.
+    bot.on('message:video', ctx => this.handleIncomingMedia(ctx, 'video'))
+    bot.on('message:animation', ctx => this.handleIncomingMedia(ctx, 'animation'))
+    bot.on('message:video_note', ctx => this.handleIncomingMedia(ctx, 'video_note'))
+    bot.on('message:voice', ctx => this.handleIncomingMedia(ctx, 'voice'))
+    bot.on('message:audio', ctx => this.handleIncomingMedia(ctx, 'audio'))
+
     bot.on('message:document', async ctx => {
       if (!this.allowed(ctx)) return void this.d.metrics.inc('rejected_updates')
       const topicId = this.topicIdOf(ctx)
@@ -951,7 +1022,7 @@ export class TelegramBot {
       this.status.bump(topicId)
       const doc = ctx.message.document
       try {
-        if (doc.file_size && doc.file_size > 20 * 1024 * 1024) {
+        if (doc.file_size && doc.file_size > MAX_DOWNLOAD_BYTES) {
           return void this.say(topicId, `File too large (${(doc.file_size / 1048576).toFixed(1)} MB) — Telegram caps bot downloads at 20 MB.`)
         }
         const name = doc.file_name || `${Date.now()}.bin`
@@ -1096,7 +1167,7 @@ Typed in a topic: use fable high · use opus · effort max · effort default · 
 
 🖼️ Files both ways:
 • Claude can send you images/files — they appear right in the topic.
-• Send a photo or file into a topic and the session can read it.
+• Send a photo, video, voice note, or file into a topic and the session can read it.
 
 ❓ Questions & plans:
 • Clarifying questions appear as tappable options (or type your own answer).

@@ -27,7 +27,7 @@ Telegram allows exactly **one poller per bot token**, and the Claude Agent SDK i
 - ❓ **Clarifying questions & plan mode** — `AskUserQuestion` renders as tappable option buttons; plan mode shows the full plan then asks to approve.
 - 💸 **Cost controls** — Sonnet by default (`use opus` per topic), idle-eviction, and a concurrent-session cap.
 - ⏳ **Rate-limit auto-resume** — a turn cut off by a hard rate limit is picked up again automatically when the window resets, instead of stalling until you notice. With [claude-rotator](https://github.com/yom-ooo/claude-rotator) installed, every rate-limit event is relayed to it so it can switch accounts, and the topic then continues at once instead of waiting for the reset.
-- 🖼️ **Files both ways** — send a photo or document into a topic and the session reads it; anything the session drops in its `TELEPATH_OUTBOX` folder is delivered back to the topic (images as photos, the rest as documents).
+- 🖼️ **Files both ways** — send a photo, video, voice note, or file into a topic and the session reads it; anything the session drops in its `TELEPATH_OUTBOX` folder is delivered back to the topic (images as photos, videos as playable videos, audio as audio, the rest as documents).
 - ✍️ **Formatted replies** — Claude's Markdown is rendered as Telegram HTML (bold, headings, lists, code, links), with a plain-text fallback so a message is never dropped. Tables become one labelled block per row, because Telegram never wraps a `<pre>` grid and a phone shows you a sliver of it.
 - 🆔 **Resumable** — each new topic prints its session id + a `claude --resume …` command so you can pick it up on your laptop.
 - 📊 **Observable** — structured JSON logs, per-process counters, a Status screen and a `health.json` on disk, so a silent failure is a number you can read rather than a silence you have to notice.
@@ -108,7 +108,7 @@ Clarifying questions appear as buttons — tap one, or type your own reply. Typi
 
 ### Getting files out
 
-Each session gets a `TELEPATH_OUTBOX` directory in its environment, and is told once — at the start of the conversation — that anything it writes there is delivered to you in the topic. So "screenshot that", "chart it", "export the report" arrive as a photo or document instead of a description. Delivered files are removed from the outbox after Telegram accepts them; a failed send stays put and is retried after the next turn.
+Each session gets a `TELEPATH_OUTBOX` directory in its environment, and is told once — at the start of the conversation — that anything it writes there is delivered to you in the topic. So "screenshot that", "chart it", "export the report" arrive as a photo, playable video, audio track, or document instead of a description. Delivered files are removed from the outbox after Telegram accepts them; a failed send stays put and is retried after the next turn.
 
 ## Run as a service (24/7)
 
@@ -172,6 +172,7 @@ src/commands.ts       the typed-text grammar (use / effort / feed / slash)
 src/ui/               keyboards, panel texts, the wizard state machine
 src/bot.ts            grammy handlers: Telegram in, Telegram out
 src/files.ts          outbox / inbox / transcript removal
+src/media.ts          attachment routing + inbound notices (the deciding layer for files)
 src/markdown.ts       markdown → Telegram HTML, rendered on a worker with a deadline
 src/rotator.ts        hand-off to claude-rotator
 ```
