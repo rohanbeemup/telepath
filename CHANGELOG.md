@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- **Full media, both ways.** Inbound: videos, GIFs/animations, round video notes, voice
+  messages and audio files are now downloaded (under Telegram's 20 MB bot-download cap) and
+  handed to the session with the saved path, a frame-extraction hint for video and a
+  transcription hint for voice/audio. Previously only photos and documents were handled and
+  every other media type was silently dropped. Outbound: a file dropped in the outbox is
+  routed by type, so a video plays inline (`sendVideo`), a GIF animates (`sendAnimation`) and
+  audio gets a player (`sendAudio`), instead of every non-image going out as a document.
+  A typed send that Telegram rejects for a format outside its inline set (for example
+  `.wav`/`.flac` audio or `.mkv`/`.mov` video) falls back to document delivery, so a file is
+  never left stuck in the outbox retrying, only ever upgraded to inline when supported.
+  The routing and the per-kind notices live in a new pure, tested module `src/media.ts`;
+  `src/bot.ts` stays the thin Telegram edge. The `message:animation` handler is registered
+  before `message:document` because Telegram tags animation messages with a legacy document
+  field that the document handler would otherwise claim first.
+
 ## 0.2.0 — 2026-09-22
 
 Rewrite on the current Agent SDK, in tested modules, with observability.

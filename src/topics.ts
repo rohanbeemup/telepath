@@ -108,7 +108,7 @@ export function outboxContract(dir: string): string {
     `You are operated remotely over Telegram; the user cannot see your filesystem. ` +
     `To show the user an image or file (screenshot, chart, diagram, PDF, export), copy or save it into this directory:\n` +
     `${dir}\n` +
-    `Anything placed there is delivered to the user in this chat automatically — images as photos, other files as documents. ` +
+    `Anything placed there is delivered to the user in this chat automatically: images as photos, videos (mp4/mov/webm) as playable videos, GIFs as animations, audio (mp3/m4a/ogg) as audio tracks, and other files as documents. ` +
     `When the user asks to see something visual, deliver it this way; don't only describe it.`
   )
 }
