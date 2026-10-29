@@ -3,20 +3,26 @@
 ## Unreleased
 
 ### Added
-- **Full media, both ways.** Inbound: videos, GIFs/animations, round video notes, voice
-  messages and audio files are now downloaded (under Telegram's 20 MB bot-download cap) and
-  handed to the session with the saved path, a frame-extraction hint for video and a
-  transcription hint for voice/audio. Previously only photos and documents were handled and
-  every other media type was silently dropped. Outbound: a file dropped in the outbox is
+- **Video, GIFs and video notes, both ways.** Inbound: videos, GIFs/animations and round video
+  notes are now downloaded (under Telegram's 20 MB bot-download cap) and handed to the session
+  with the saved path and a frame-extraction hint, where before only photos and documents were
+  handled and every other type was silently dropped. Outbound: a file dropped in the outbox is
   routed by type, so a video plays inline (`sendVideo`), a GIF animates (`sendAnimation`) and
-  audio gets a player (`sendAudio`), instead of every non-image going out as a document.
-  A typed send that Telegram rejects for a format outside its inline set (for example
-  `.wav`/`.flac` audio or `.mkv`/`.mov` video) falls back to document delivery, so a file is
-  never left stuck in the outbox retrying, only ever upgraded to inline when supported.
-  The routing and the per-kind notices live in a new pure, tested module `src/media.ts`;
-  `src/bot.ts` stays the thin Telegram edge. The `message:animation` handler is registered
-  before `message:document` because Telegram tags animation messages with a legacy document
-  field that the document handler would otherwise claim first.
+  audio gets a player (`sendAudio`), instead of every non-image going out as a document; a typed
+  send Telegram rejects for a format outside its inline set (for example `.wav`/`.flac` audio or
+  `.mkv`/`.mov` video) falls back to document delivery, so a file is never left stuck in the outbox
+  retrying. Routing and the per-kind notices live in a new pure, tested module `src/media.ts`;
+  `src/bot.ts` stays the thin Telegram edge. The `message:animation` handler is registered before
+  `message:document` because Telegram tags animation messages with a legacy document field the
+  document handler would otherwise claim first.
+- **Voice notes.** A voice note or audio file sent into a topic is transcribed by `TRANSCRIBE_CMD`
+  (new, optional; a command line, arguments allowed), shown as `🎙️ <words>` and handled as typed
+  text. A forwarded note or an audio file is passed on as shared content with its caption, not as
+  the user's instructions; a voice note in General is refused like a photo. Transcription runs in
+  the background with a 3-minute limit and a per-topic queue, so later messages in that topic wait
+  for it while no other topic is held up; every failure, an unset `TRANSCRIBE_CMD` included, is
+  answered in the topic. The pre-0.2.0 fork had this; the rewrite dropped it and voice notes were
+  ignored without a trace.
 
 ## 0.2.0 — 2026-09-22
 
