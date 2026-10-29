@@ -24,6 +24,8 @@ export type Config = {
   logLevel: LogLevel
   /** Optional override; the SDK's bundled binary is the default. */
   claudeBinary?: string
+  /** Turns a voice note into text: run with the audio file as its one argument. Unset: voice notes are refused with that reason. */
+  transcribeCmd?: string
 }
 
 export class ConfigError extends Error {
@@ -114,5 +116,6 @@ export function parseConfig(env: Record<string, string | undefined>, stateDir: s
     maxLiveSessions,
     logLevel,
     claudeBinary: env.CLAUDE_BINARY || undefined,
+    transcribeCmd: env.TRANSCRIBE_CMD || undefined,
   }
 }

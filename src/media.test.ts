@@ -39,7 +39,7 @@ describe('mediaKind (outbound routing)', () => {
 })
 
 describe('inboundMediaNotice', () => {
-  const kinds: InboundKind[] = ['video', 'animation', 'video_note', 'voice', 'audio']
+  const kinds: InboundKind[] = ['video', 'animation', 'video_note']
 
   test('every kind returns an ack and a prompt that carries the saved path', () => {
     for (const k of kinds) {
@@ -56,21 +56,6 @@ describe('inboundMediaNotice', () => {
     expect(n.prompt).toContain('video/mp4')
     expect(n.prompt).toContain('12s')
     expect(n.prompt.toLowerCase()).toContain('frame')
-  })
-
-  test('voice: hints at transcription and treating the transcript as the message', () => {
-    const n = inboundMediaNotice('voice', { path: '/inbox/v.ogg', duration: 5 })
-    expect(n.ack.toLowerCase()).toContain('voice')
-    expect(n.prompt.toLowerCase()).toContain('transcrib')
-    expect(n.prompt).toContain('/inbox/v.ogg')
-    expect(n.prompt).toContain('5s')
-  })
-
-  test('audio: includes the file name when present and hints at transcription', () => {
-    const n = inboundMediaNotice('audio', { path: '/inbox/song.mp3', name: 'song.mp3', mime: 'audio/mpeg' })
-    expect(n.ack.toLowerCase()).toContain('audio')
-    expect(n.prompt).toContain('song.mp3')
-    expect(n.prompt.toLowerCase()).toContain('transcrib')
   })
 
   test('animation: names a GIF and hints at reading a frame', () => {
@@ -116,12 +101,8 @@ describe('fallsBackToDocument (recover from a rejected typed send)', () => {
 
 describe('inboundFileName', () => {
   test('a Telegram-supplied file name is used verbatim', () => {
-    expect(inboundFileName('audio', { file_name: 'track.flac', file_unique_id: 'u1' })).toBe('track.flac')
+    expect(inboundFileName('animation', { file_name: 'clip.gif', file_unique_id: 'u1' })).toBe('clip.gif')
     expect(inboundFileName('video', { file_name: 'clip.mp4', file_unique_id: 'u2' })).toBe('clip.mp4')
-  })
-
-  test('voice without a name falls back to <unique-id>.ogg', () => {
-    expect(inboundFileName('voice', { file_unique_id: 'abc' })).toBe('abc.ogg')
   })
 
   test('video / animation / video_note without a name fall back to .mp4', () => {
@@ -131,9 +112,9 @@ describe('inboundFileName', () => {
   })
 
   test('extension is taken from the mime type when no name is given', () => {
-    expect(inboundFileName('audio', { file_unique_id: 'm', mime_type: 'audio/mpeg' })).toBe('m.mp3')
     expect(inboundFileName('animation', { file_unique_id: 'g', mime_type: 'image/gif' })).toBe('g.gif')
     expect(inboundFileName('video', { file_unique_id: 'w', mime_type: 'video/webm' })).toBe('w.webm')
+    expect(inboundFileName('video', { file_unique_id: 'q', mime_type: 'video/quicktime' })).toBe('q.mov')
   })
 })
 

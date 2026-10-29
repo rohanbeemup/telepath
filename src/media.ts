@@ -6,7 +6,8 @@
 import { isImage } from './files'
 
 export type OutboundKind = 'image' | 'video' | 'animation' | 'audio' | 'document'
-export type InboundKind = 'video' | 'animation' | 'video_note' | 'voice' | 'audio'
+/** Inbound kinds handled as files to Read. Voice and audio are transcribed instead (src/voice.ts). */
+export type InboundKind = 'video' | 'animation' | 'video_note'
 
 /** Telegram caps a bot's file downloads at 20 MB; a larger upload cannot be fetched. */
 export const MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
@@ -43,21 +44,12 @@ const MIME_EXT: Record<string, string> = {
   'video/webm': 'webm',
   'video/quicktime': 'mov',
   'image/gif': 'gif',
-  'audio/mpeg': 'mp3',
-  'audio/mp4': 'm4a',
-  'audio/aac': 'aac',
-  'audio/flac': 'flac',
-  'audio/wav': 'wav',
-  'audio/x-wav': 'wav',
-  'audio/ogg': 'ogg',
 }
 
 const DEFAULT_EXT: Record<InboundKind, string> = {
   video: 'mp4',
   animation: 'mp4',
   video_note: 'mp4',
-  voice: 'ogg',
-  audio: 'mp3',
 }
 
 /**
@@ -124,18 +116,6 @@ export function inboundMediaNotice(kind: InboundKind, info: IncomingMedia): { ac
       return {
         ack: '🎞️ GIF received',
         prompt: `The user sent an animation (GIF)${meta(info)}${at}. Extract a frame with ffmpeg and Read it to see it.${cap}`,
-      }
-    case 'voice':
-      return {
-        ack: '🎤 voice message received',
-        prompt: `The user sent a voice message${meta(info)}${at}. Transcribe it and treat the transcript as their message.${cap}`,
-      }
-    case 'audio':
-      return {
-        ack: '🎵 audio received',
-        prompt:
-          `The user sent an audio file${info.name ? ` "${info.name}"` : ''}${meta(info)}${at}. ` +
-          `Transcribe or analyze it as needed.${cap}`,
       }
   }
 }

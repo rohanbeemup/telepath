@@ -5,6 +5,7 @@
  * Telegram API, plus the permission prompts a session blocks on.
  */
 import { Bot, InlineKeyboard, InputFile, type Context } from 'grammy'
+import type { Message } from 'grammy/types'
 import { autoRetry } from '@grammyjs/auto-retry'
 import type { CanUseTool, PermissionResult } from '@anthropic-ai/claude-agent-sdk'
 import { basename } from 'path'
@@ -20,6 +21,7 @@ import type { Logger, Metrics } from './log'
 import { htmlEsc, htmlToPlain, renderWithDeadline, chunkHtml, chunkPlain } from './markdown'
 import { isEnabledModelKey, modelLabel, parseEffort, supportsEffort, MODEL_MENU, type Effort } from './models'
 import { listSessions } from './session'
+import { transcribe, TopicOrder, voiceTurn, type Heard } from './voice'
 import { feedOn, type Binding, type Store } from './state'
 import { isBusy, type SessionExtras, type TopicManager } from './topics'
 import {
@@ -69,6 +71,8 @@ export class TelegramBot {
   private readonly askBtns = new Map<string, AskBtn>()
   private readonly askFreeText = new Map<string, (t: string) => void>()
   private readonly wizard = new Map<string, WizardState>()
+  /** Per-topic order while a voice note is being transcribed in the background. */
+  private readonly order = new TopicOrder()
   private defaultFolderChoices: string[] = []
   private tokenSeed = 0
   /** Set for the duration of a button tap so menu screens repaint the tapped message in place. */
@@ -437,19 +441,48 @@ export class TelegramBot {
     for (const p of this.d.files.pendingOutbox(topicId)) if (await this.sendFile(topicId, p)) this.d.files.afterSent(p)
   }
 
-  /** Download an inbound video / GIF / video note / voice / audio upload and tell the session where it landed. */
+  /** Typed text, photos, files and video wait behind a voice note still being transcribed in their
+   *  topic. Otherwise they run directly: bot.start() awaits each update before the next (grammY's
+   *  handleUpdates), so a message handled here is in its session's queue before any later update,
+   *  a voice note included, is looked at. A concurrent runner (@grammyjs/runner) would void this
+   *  and need every message queued. */
+  private async inOrder(ctx: Context, fn: () => Promise<void>): Promise<void> {
+    const key = this.topicIdOf(ctx) ?? 'general'
+    if (!this.order.busy(key)) return fn()
+    this.order.queue(key, fn, e => this.d.log.error('message.failed', { topic: key, error: e }))
+  }
+
+  /** A voice note becomes the words in it, then goes the way typed text does. Any failure is said in the topic. */
+  private async handleVoice(ctx: Context, topicId: string, media: { file_id: string; file_unique_id: string; file_size?: number; file_name?: string }, shared: Omit<Heard, 'words'>): Promise<void> {
+    try {
+      if (media.file_size && media.file_size > MAX_DOWNLOAD_BYTES) {
+        return await this.say(topicId, `🎙️ Voice note too large (${(media.file_size / 1048576).toFixed(1)} MB): Telegram caps bot downloads at 20 MB.`)
+      }
+      if (topicId) await this.typing(topicId)
+      const path = this.d.files.saveInbox(media.file_name || `${media.file_unique_id}.ogg`, await this.download(media.file_id))
+      const words = await transcribe(path, this.d.cfg.transcribeCmd)
+      this.d.metrics.inc('voice_notes')
+      const turn = voiceTurn({ words, ...shared })
+      if (!shared.forwarded && !shared.audioFile) {
+        // the user's own voice note: their turn, as if typed (commands included)
+        await this.say(topicId, `🎙️ ${words}`)
+        return await this.handleText(ctx, turn)
+      }
+      await this.say(topicId, `🎙️ ${shared.audioFile ? 'Audio file' : 'Forwarded voice note'}, passed on as content: ${words}`)
+      await this.topics.sendToTopic(topicId, turn)
+    } catch (e) {
+      await this.say(topicId, `🎙️ Voice note not transcribed: ${e instanceof Error ? e.message : String(e)}`)
+    }
+  }
+
+  /** Download an inbound video / GIF / video note upload and tell the session where it landed.
+   *  Voice and audio go through handleVoice (transcription) instead. */
   private async handleIncomingMedia(ctx: Context, kind: InboundKind): Promise<void> {
-    if (!this.allowed(ctx)) return void this.d.metrics.inc('rejected_updates')
     const topicId = this.topicIdOf(ctx)
     if (!topicId) return void this.say(undefined, 'Send media inside a session topic.')
     this.status.bump(topicId)
     const m = ctx.message
-    const src =
-      kind === 'video' ? m?.video
-      : kind === 'animation' ? m?.animation
-      : kind === 'video_note' ? m?.video_note
-      : kind === 'voice' ? m?.voice
-      : m?.audio
+    const src = kind === 'video' ? m?.video : kind === 'animation' ? m?.animation : m?.video_note
     if (!src) return
     try {
       if (src.file_size && src.file_size > MAX_DOWNLOAD_BYTES) {
@@ -474,7 +507,8 @@ export class TelegramBot {
   private async download(fileId: string): Promise<Uint8Array> {
     const file = await this.bot.api.getFile(fileId)
     const url = `https://api.telegram.org/file/bot${this.d.cfg.telegramToken}/${file.file_path}`
-    return new Uint8Array(await (await fetch(url)).arrayBuffer())
+    // a hung download would otherwise hold its topic's queue forever
+    return new Uint8Array(await (await fetch(url, { signal: AbortSignal.timeout(120_000) })).arrayBuffer())
   }
 
   // ── topics: create / bind / controls ─────────────────────────────────────
@@ -987,53 +1021,84 @@ export class TelegramBot {
     const bot = this.bot
     bot.on('message:text', async ctx => {
       if (!this.allowed(ctx)) return void this.d.metrics.inc('rejected_updates')
-      await this.handleText(ctx, ctx.message.text)
+      await this.inOrder(ctx, () => this.handleText(ctx, ctx.message.text))
     })
 
     bot.on('message:photo', async ctx => {
       if (!this.allowed(ctx)) return void this.d.metrics.inc('rejected_updates')
-      const topicId = this.topicIdOf(ctx)
-      if (!topicId) return void this.say(undefined, 'Send images inside a session topic.')
-      this.status.bump(topicId)
-      try {
-        const best = ctx.message.photo[ctx.message.photo.length - 1]
-        const path = this.d.files.saveInbox(`${best.file_unique_id}.jpg`, await this.download(best.file_id))
-        const caption = ctx.message.caption?.trim()
-        this.d.metrics.inc('files_received')
-        await this.say(topicId, '🖼️ image received')
-        await this.topics.sendToTopic(topicId, `The user sent an image, saved at ${path} — Read it to see it.${caption ? `\nCaption: ${caption}` : ''}`)
-      } catch (e) {
-        await this.say(topicId, `image handling failed: ${e}`)
-      }
+      await this.inOrder(ctx, async () => {
+        const topicId = this.topicIdOf(ctx)
+        if (!topicId) return await this.say(undefined, 'Send images inside a session topic.')
+        this.status.bump(topicId)
+        try {
+          const best = ctx.message.photo[ctx.message.photo.length - 1]
+          const path = this.d.files.saveInbox(`${best.file_unique_id}.jpg`, await this.download(best.file_id))
+          const caption = ctx.message.caption?.trim()
+          this.d.metrics.inc('files_received')
+          await this.say(topicId, '🖼️ image received')
+          await this.topics.sendToTopic(topicId, `The user sent an image, saved at ${path} — Read it to see it.${caption ? `\nCaption: ${caption}` : ''}`)
+        } catch (e) {
+          await this.say(topicId, `image handling failed: ${e}`)
+        }
+      })
     })
 
-    // Registered before message:document: Telegram animation (GIF) messages also carry a
-    // legacy document field, so the document handler would otherwise claim them first.
-    bot.on('message:video', ctx => this.handleIncomingMedia(ctx, 'video'))
-    bot.on('message:animation', ctx => this.handleIncomingMedia(ctx, 'animation'))
-    bot.on('message:video_note', ctx => this.handleIncomingMedia(ctx, 'video_note'))
-    bot.on('message:voice', ctx => this.handleIncomingMedia(ctx, 'voice'))
-    bot.on('message:audio', ctx => this.handleIncomingMedia(ctx, 'audio'))
+    // Registered before message:document: Telegram animation (GIF) messages also carry a legacy
+    // document field, so the document handler would otherwise claim them first. Each waits behind a
+    // transcribing voice note in its topic (inOrder), as the other media handlers do.
+    bot.on('message:video', async ctx => {
+      if (!this.allowed(ctx)) return void this.d.metrics.inc('rejected_updates')
+      await this.inOrder(ctx, () => this.handleIncomingMedia(ctx, 'video'))
+    })
+    bot.on('message:animation', async ctx => {
+      if (!this.allowed(ctx)) return void this.d.metrics.inc('rejected_updates')
+      await this.inOrder(ctx, () => this.handleIncomingMedia(ctx, 'animation'))
+    })
+    bot.on('message:video_note', async ctx => {
+      if (!this.allowed(ctx)) return void this.d.metrics.inc('rejected_updates')
+      await this.inOrder(ctx, () => this.handleIncomingMedia(ctx, 'video_note'))
+    })
 
     bot.on('message:document', async ctx => {
       if (!this.allowed(ctx)) return void this.d.metrics.inc('rejected_updates')
-      const topicId = this.topicIdOf(ctx)
-      if (!topicId) return void this.say(undefined, 'Send files inside a session topic.')
-      this.status.bump(topicId)
-      const doc = ctx.message.document
-      try {
-        if (doc.file_size && doc.file_size > MAX_DOWNLOAD_BYTES) {
-          return void this.say(topicId, `File too large (${(doc.file_size / 1048576).toFixed(1)} MB) — Telegram caps bot downloads at 20 MB.`)
+      await this.inOrder(ctx, async () => {
+        const topicId = this.topicIdOf(ctx)
+        if (!topicId) return await this.say(undefined, 'Send files inside a session topic.')
+        this.status.bump(topicId)
+        const doc = ctx.message.document
+        try {
+          if (doc.file_size && doc.file_size > MAX_DOWNLOAD_BYTES) {
+            return await this.say(topicId, `File too large (${(doc.file_size / 1048576).toFixed(1)} MB) — Telegram caps bot downloads at 20 MB.`)
+          }
+          const name = doc.file_name || `${Date.now()}.bin`
+          const path = this.d.files.saveInbox(name, await this.download(doc.file_id))
+          const caption = ctx.message.caption?.trim()
+          this.d.metrics.inc('files_received')
+          await this.say(topicId, `📎 file received: ${name}`)
+          await this.topics.sendToTopic(topicId, `The user sent a file "${name}" (${doc.mime_type ?? 'unknown type'}), saved at ${path} — Read it.${caption ? `\nCaption: ${caption}` : ''}`)
+        } catch (e) {
+          await this.say(topicId, `file handling failed: ${e}`)
         }
-        const name = doc.file_name || `${Date.now()}.bin`
-        const path = this.d.files.saveInbox(name, await this.download(doc.file_id))
-        const caption = ctx.message.caption?.trim()
-        this.d.metrics.inc('files_received')
-        await this.say(topicId, `📎 file received: ${name}`)
-        await this.topics.sendToTopic(topicId, `The user sent a file "${name}" (${doc.mime_type ?? 'unknown type'}), saved at ${path} — Read it.${caption ? `\nCaption: ${caption}` : ''}`)
-      } catch (e) {
-        await this.say(topicId, `file handling failed: ${e}`)
+      })
+    })
+
+    // Transcription takes 20 s or more on a CPU, and updates are handled one at a time, so it runs
+    // in the background: awaiting it here would hold up every other message in every topic.
+    bot.on(['message:voice', 'message:audio'], async ctx => {
+      if (!this.allowed(ctx)) return void this.d.metrics.inc('rejected_updates')
+      const media = ctx.message.voice ?? ctx.message.audio
+      if (!media) return
+      const topicId = this.topicIdOf(ctx)
+      if (!topicId) return await this.say(undefined, 'Send voice notes inside a session topic.')
+      this.status.bump(topicId)
+      const shared = {
+        audioFile: !ctx.message.voice,
+        forwarded: originName(ctx.message.forward_origin),
+        caption: ctx.message.caption?.trim() || undefined,
       }
+      // queued per topic, so whatever is sent after the note is handled after it
+      this.order.queue(topicId, () => this.handleVoice(ctx, topicId, media, shared),
+        e => this.d.log.error('voice.failed', { topic: topicId, error: e }))
     })
 
     bot.on('callback_query:data', async ctx => {
@@ -1108,6 +1173,14 @@ function modelLinesText(cfg: Config): string {
   return cfg.catalog.enabled.map(k => `${modelLabel(cfg.catalog, cfg.catalog.ids[k])} → ${cfg.catalog.ids[k]}`).join('\n')
 }
 
+/** Who a forwarded message came from, for framing it as shared content; undefined when not forwarded. */
+function originName(o: Message['forward_origin']): string | undefined {
+  if (!o) return undefined
+  if (o.type === 'user') return [o.sender_user.first_name, o.sender_user.last_name].filter(Boolean).join(' ')
+  if (o.type === 'hidden_user') return o.sender_user_name
+  return o.type === 'chat' ? (o.sender_chat.title ?? 'a chat') : (o.chat.title ?? 'a channel')
+}
+
 /** `/new <name…> [cwd=<path>] [auto]`: the rest of the line is the topic name. */
 export function parseNew(args: string, fallbackCwd: string): { name: string; cwd: string; auto: boolean; notes: string[] } {
   const { existsSync, statSync } = require('fs') as typeof import('fs')
@@ -1167,7 +1240,8 @@ Typed in a topic: use fable high · use opus · effort max · effort default · 
 
 🖼️ Files both ways:
 • Claude can send you images/files — they appear right in the topic.
-• Send a photo, video, voice note, or file into a topic and the session can read it.
+• Send a photo, video, or file into a topic and the session can read it.
+• Send a voice note and it is transcribed (🎙️) and handled like typed text (needs TRANSCRIBE_CMD).
 
 ❓ Questions & plans:
 • Clarifying questions appear as tappable options (or type your own answer).
