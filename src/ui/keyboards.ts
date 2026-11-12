@@ -9,7 +9,15 @@ import { feedOn, type Binding, type Prefs } from '../state'
 
 export const PAGE_SIZE = 10
 
-export function mainMenuKb(): InlineKeyboard {
+/**
+ * Team mode: members get the screens that change nothing on the host; the rest is the
+ * admins'. A profile (always on in team mode, optional otherwise) owns the model, the
+ * effort and the absent approvals, so their buttons go.
+ */
+export type KbMode = { team?: boolean; profile?: boolean }
+
+export function mainMenuKb(mode: KbMode = {}): InlineKeyboard {
+  if (mode.team) return new InlineKeyboard().text('🆕 New topic', 'm:new').row().text('📊 Status', 'm:status').text('❓ Help', 'm:help')
   return new InlineKeyboard()
     .text('🆕 New session', 'm:new').text('⚡ Quick new', 'm:quick').row()
     .text('📋 My sessions', 'm:list').text('▶️ Resume last', 'm:resume').row()
@@ -55,19 +63,28 @@ export function settingsText(c: Catalog, prefs: Prefs, defaultCwd: string): stri
   )
 }
 
-export function topicControlsKb(c: Catalog, b: Binding): InlineKeyboard {
+export function topicControlsKb(c: Catalog, b: Binding, mode: KbMode = {}): InlineKeyboard {
   const kb = new InlineKeyboard()
-  for (const k of c.enabled) kb.text(`${MODEL_MENU[k].short}${b.model === c.ids[k] ? ' ✓' : ''}`, `m:tm:${k}`)
-  kb.row()
-  if (supportsEffort(c, b.model)) effortRows(kb, b.effort, 'te')
-  kb.text(b.auto ? '⚡ Auto: ON → switch to approvals' : '🔐 Approvals: ON → switch to auto', 'm:ta').row()
+  if (!mode.team && !mode.profile) {
+    // The profile owns the model, the effort and the (absent) approvals.
+    for (const k of c.enabled) kb.text(`${MODEL_MENU[k].short}${b.model === c.ids[k] ? ' ✓' : ''}`, `m:tm:${k}`)
+    kb.row()
+    if (supportsEffort(c, b.model)) effortRows(kb, b.effort, 'te')
+    kb.text(b.auto ? '⚡ Auto: ON → switch to approvals' : '🔐 Approvals: ON → switch to auto', 'm:ta').row()
+  }
   kb.text(feedOn(b) ? '🔎 Activity feed: ON → hide tool calls' : '🔎 Activity feed: OFF → show tool calls', 'm:tf').row()
   kb.text('💾 Close & keep', 'm:tclose').text('🗑 Close & delete', 'm:tdelete').row()
   kb.text('🧹 Close, delete & remove all', 'm:twipe')
   return kb
 }
 
-export function topicControlsText(c: Catalog, b: Binding, note?: string): string {
+export function topicControlsText(c: Catalog, b: Binding, note?: string, mode: KbMode = {}): string {
+  if (mode.team) {
+    return `⚙️ "${b.title}"\n🔎 feed ${feedOn(b) ? 'on' : 'off'} · closing, deleting and wiping a topic is for admins\n\n💬 Just type your question below.${note ? `\n${note}` : ''}`
+  }
+  if (mode.profile) {
+    return `⚙️ "${b.title}"\nProfile session · 🔎 feed ${feedOn(b) ? 'on' : 'off'}\n\n💬 Just type your request below.${note ? `\n${note}` : ''}`
+  }
   const effort = supportsEffort(c, b.model) ? ` · 🎚 ${b.effort ?? 'default'}` : ''
   return (
     `⚙️ "${b.title}"\n` +

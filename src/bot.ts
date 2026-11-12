@@ -10,7 +10,10 @@ import { autoRetry } from '@grammyjs/auto-retry'
 import type { CanUseTool, PermissionResult } from '@anthropic-ai/claude-agent-sdk'
 import { basename } from 'path'
 import type { Config } from './config'
+import { admitted, allowedAction, Membership, type AccessConfig } from './access'
 import { parseTyped } from './commands'
+import type { Profile } from './profile'
+import { parseTeamNew, type Member } from './team'
 import { describeTask } from './feed'
 import { TurnStatus, type StatusTransport } from './status'
 import { parseHandoff, resumePrompt } from './handoff'
@@ -44,6 +47,7 @@ import {
   wizardAutoKb,
   wizardEffortKb,
   wizardModelKb,
+  type KbMode,
 } from './ui/keyboards'
 import { startWizard, wizardStep, type WizardState } from './ui/wizard'
 
@@ -58,6 +62,8 @@ export type BotDeps = {
   metrics: Metrics
   /** Text for the 📊 Status screen; built by the daemon, which owns uptime and versions. */
   statusText: () => string
+  /** The locked session profile, when one is configured (team mode requires it). */
+  profile?: Profile
 }
 
 type Pending = { resolve: (r: PermissionResult) => void; topicId: string; messageId?: number }
@@ -79,9 +85,15 @@ export class TelegramBot {
   private menuCtx: Context | undefined
   /** One live "working" message per turn; driven by a 1 s tick from the daemon. */
   readonly status: TurnStatus
+  /** Who may talk and who may change a topic (access.ts). */
+  private readonly access: AccessConfig
+  /** Team mode's second gate: the forum's own member list, asked per sender and cached. */
+  private readonly membership: Membership
 
   constructor(private readonly d: BotDeps) {
     this.bot = new Bot(d.cfg.telegramToken)
+    this.access = { teamMode: d.cfg.teamMode, allowedUserId: d.cfg.allowedUserId, forumChatId: d.cfg.forumChatId, adminUserIds: d.cfg.adminUserIds }
+    this.membership = new Membership(async id => this.bot.api.getChatMember(d.cfg.forumChatId, Number(id)))
     // Every API call waits out a 429 for exactly the `retry_after` Telegram names (up to
     // 30 s, three attempts) instead of failing, so a burst of answers across topics is
     // delayed rather than lost. The status message has its own budget on top of this.
@@ -225,6 +237,7 @@ export class TelegramBot {
         this.status.addItems(topicId, ev.items)
         return
       case 'sessionId': {
+        if (this.d.cfg.teamMode) return // a group needs no resume line, and the host's paths stay out of the chat
         const cwd = b?.cwd ?? this.d.cfg.defaultCwd
         await this.say(topicId, `🆔 Session id: ${ev.id}\nResume on laptop:\ncd ${cwd} && claude --resume ${ev.id}`)
         return
@@ -536,9 +549,9 @@ export class TelegramBot {
       await this.bot.api.deleteMessage(this.d.cfg.forumChatId, b.controlMsgId).catch(() => {})
     }
     try {
-      const sent = await this.bot.api.sendMessage(this.d.cfg.forumChatId, topicControlsText(this.d.cfg.catalog, b), {
+      const sent = await this.bot.api.sendMessage(this.d.cfg.forumChatId, topicControlsText(this.d.cfg.catalog, b, undefined, this.kbMode()), {
         message_thread_id: Number(topicId),
-        reply_markup: topicControlsKb(this.d.cfg.catalog, b),
+        reply_markup: topicControlsKb(this.d.cfg.catalog, b, this.kbMode()),
       })
       b.controlMsgId = sent.message_id
       this.d.store.saveRegistry()
@@ -557,7 +570,42 @@ export class TelegramBot {
   }
 
   private async repaintControls(topicId: string, b: Binding, note?: string): Promise<void> {
-    await this.paint(topicId, topicControlsText(this.d.cfg.catalog, b, note), topicControlsKb(this.d.cfg.catalog, b))
+    await this.paint(topicId, topicControlsText(this.d.cfg.catalog, b, note, this.kbMode()), topicControlsKb(this.d.cfg.catalog, b, this.kbMode()))
+  }
+
+  private kbMode(): KbMode {
+    return { team: this.d.cfg.teamMode, profile: !!this.d.profile }
+  }
+
+  private memberOf(ctx: Context): Member {
+    return { firstName: ctx.from?.first_name, username: ctx.from?.username }
+  }
+
+  /** The topic's own name, carried by messages that reply to its creation. */
+  private topicTitleOf(ctx: Context): string | undefined {
+    return ctx.message?.reply_to_message?.forum_topic_created?.name
+  }
+
+  /** With a profile: a topic binds to it, never to a folder, model or approval choice. */
+  private bindProfileTopic(topicId: string, title: string): void {
+    const p = this.d.profile
+    const { prefs } = this.d.store
+    this.bind(topicId, { cwd: p?.cwd ?? this.d.store.defaultCwd(), model: p?.model ?? prefs.defaultModel, effort: p?.effort ?? prefs.defaultEffort, title, auto: false })
+    this.d.metrics.inc('topics_created')
+    this.topics.ensureLive(topicId)
+  }
+
+  private async newProfileTopic(title: string, intoTopic?: string): Promise<string | undefined> {
+    let topicId: string
+    try {
+      topicId = await this.createTopic(title)
+    } catch (e) {
+      await this.paint(intoTopic, `Couldn't create topic (is the bot admin with Manage Topics?): ${e}`, backKb())
+      return undefined
+    }
+    this.bindProfileTopic(topicId, title)
+    await this.postPinnedControls(topicId)
+    return topicId
   }
 
   private async newSession(name: string, cwd: string, model: string, effort: Effort | undefined, auto: boolean, intoTopic?: string): Promise<string | undefined> {
@@ -611,7 +659,7 @@ export class TelegramBot {
   // ── screens ──────────────────────────────────────────────────────────────
 
   private async showMainMenu(topicId: string | undefined): Promise<void> {
-    await this.paint(topicId, '👋 What would you like to do?', mainMenuKb())
+    await this.paint(topicId, '👋 What would you like to do?', mainMenuKb(this.kbMode()))
   }
 
   private async showSettings(topicId: string | undefined): Promise<void> {
@@ -698,6 +746,19 @@ export class TelegramBot {
     if (data === 'm:menu') return void (await ack(), this.showMainMenu(topicId))
     if (data === 'm:noop') return void ack()
     if (data === 'm:new' || data === 'm:newhere') {
+      if (this.d.profile) {
+        // No wizard: the profile decides everything but the title.
+        const title = parseTeamNew('', this.memberOf(ctx), new Date()).title
+        if (data === 'm:newhere' && topicId) {
+          if (!store.registry[topicId]) this.bindProfileTopic(topicId, title)
+          await ack()
+          return this.postPinnedControls(topicId)
+        }
+        await ack('Creating…')
+        const tid = await this.newProfileTopic(title, topicId)
+        if (tid) await this.paint(topicId, `✅ Created "${title}".`, openLinkKb(this.d.cfg.forumChatId, tid))
+        return
+      }
       await ack()
       this.wizard.set(uid, startWizard(listRepoFolders(this.d.cfg.reposDir, store.defaultCwd()), data === 'm:newhere' ? topicId : undefined))
       return this.renderWizard(uid, topicId)
@@ -728,7 +789,7 @@ export class TelegramBot {
     }
     if (data === 'm:settings') return void (await ack(), this.showSettings(topicId))
     if (data === 'm:status') return void (await ack(), this.paint(topicId, this.d.statusText(), backKb()))
-    if (data === 'm:help') return void (await ack(), this.send(topicId, help(this.d.cfg.reposDir), backKb()))
+    if (data === 'm:help') return void (await ack(), this.send(topicId, this.d.cfg.teamMode ? teamHelp() : help(this.d.cfg.reposDir), backKb()))
     if (data === 'm:cancel') {
       this.wizard.delete(uid)
       await ack('Cancelled')
@@ -935,9 +996,21 @@ export class TelegramBot {
     const typed = parseTyped(raw, this.d.cfg.catalog)
     this.d.log.debug('in.text', { topic: topicId ?? 'general', kind: typed.kind, len: raw.length })
 
+    const action = typed.kind === 'slash' ? `/${typed.cmd}` : typed.kind
+    if (!allowedAction(this.access, ctx.from ? String(ctx.from.id) : undefined, action)) {
+      this.d.metrics.inc('admin_only_refused')
+      return void this.say(topicId, '🔒 Admins only.')
+    }
+
     if (typed.kind === 'slash') {
       switch (typed.cmd) {
         case 'new': {
+          if (this.d.profile) {
+            const { title } = parseTeamNew(typed.args, this.memberOf(ctx), new Date())
+            const tid = await this.newProfileTopic(title, topicId)
+            if (tid) await this.paint(topicId, `✅ Created "${title}".`, openLinkKb(this.d.cfg.forumChatId, tid))
+            return
+          }
           const { name, cwd, auto, notes } = parseNew(typed.args, this.d.store.defaultCwd())
           for (const n of notes) await this.say(topicId, n)
           await this.newSession(name, cwd, this.d.store.prefs.defaultModel, this.d.store.prefs.defaultEffort, auto, topicId)
@@ -965,7 +1038,7 @@ export class TelegramBot {
         case 'menu':
           return topicId && this.d.store.registry[topicId] ? this.postPinnedControls(topicId) : this.showMainMenu(topicId)
         case 'help':
-          return void this.say(topicId, help(this.d.cfg.reposDir))
+          return void this.say(topicId, this.d.cfg.teamMode ? teamHelp() : help(this.d.cfg.reposDir))
         default:
           return this.showMainMenu(topicId)
       }
@@ -1005,7 +1078,12 @@ export class TelegramBot {
       return void this.say(topicId, typed.on ? '🔎 Activity feed ON — one line per tool call.' : '🔎 Activity feed OFF.')
     }
 
-    if (!b) return void this.send(topicId, 'This topic has no Claude session yet.', new InlineKeyboard().text('🆕 Start a session here', 'm:newhere'))
+    if (!b) {
+      if (!this.d.cfg.teamMode) return void this.send(topicId, 'This topic has no Claude session yet.', new InlineKeyboard().text('🆕 Start a session here', 'm:newhere'))
+      // Team mode: a fresh topic is a conversation from its first message.
+      this.bindProfileTopic(topicId, this.topicTitleOf(ctx) ?? parseTeamNew('', this.memberOf(ctx), new Date()).title)
+      await this.postPinnedControls(topicId)
+    }
     this.status.bump(topicId) // the user's own message now sits below the status
     await this.typing(topicId)
     if (!(await this.topics.sendToTopic(topicId, typed.text))) await this.say(topicId, 'No session bound to this topic. Use /new (or /attach) first.')
@@ -1014,18 +1092,28 @@ export class TelegramBot {
   // ── wiring ───────────────────────────────────────────────────────────────
 
   private allowed(ctx: Context): boolean {
-    return String(ctx.from?.id) === this.d.cfg.allowedUserId && String(ctx.chat?.id) === this.d.cfg.forumChatId
+    return admitted(this.access, { fromId: ctx.from ? String(ctx.from.id) : undefined, chatId: ctx.chat ? String(ctx.chat.id) : undefined })
+  }
+
+  /** The chat gate, then in team mode the forum's own member list; a failed lookup is a no. */
+  private async admit(ctx: Context): Promise<boolean> {
+    if (!this.allowed(ctx)) return false
+    if (!this.d.cfg.teamMode) return true
+    if (!ctx.from) return false
+    const member = await this.membership.isMember(String(ctx.from.id))
+    if (!member) this.d.metrics.inc('non_member_rejected')
+    return member
   }
 
   private wire(): void {
     const bot = this.bot
     bot.on('message:text', async ctx => {
-      if (!this.allowed(ctx)) return void this.d.metrics.inc('rejected_updates')
+      if (!(await this.admit(ctx))) return void this.d.metrics.inc('rejected_updates')
       await this.inOrder(ctx, () => this.handleText(ctx, ctx.message.text))
     })
 
     bot.on('message:photo', async ctx => {
-      if (!this.allowed(ctx)) return void this.d.metrics.inc('rejected_updates')
+      if (!(await this.admit(ctx))) return void this.d.metrics.inc('rejected_updates')
       await this.inOrder(ctx, async () => {
         const topicId = this.topicIdOf(ctx)
         if (!topicId) return await this.say(undefined, 'Send images inside a session topic.')
@@ -1047,20 +1135,20 @@ export class TelegramBot {
     // document field, so the document handler would otherwise claim them first. Each waits behind a
     // transcribing voice note in its topic (inOrder), as the other media handlers do.
     bot.on('message:video', async ctx => {
-      if (!this.allowed(ctx)) return void this.d.metrics.inc('rejected_updates')
+      if (!(await this.admit(ctx))) return void this.d.metrics.inc('rejected_updates')
       await this.inOrder(ctx, () => this.handleIncomingMedia(ctx, 'video'))
     })
     bot.on('message:animation', async ctx => {
-      if (!this.allowed(ctx)) return void this.d.metrics.inc('rejected_updates')
+      if (!(await this.admit(ctx))) return void this.d.metrics.inc('rejected_updates')
       await this.inOrder(ctx, () => this.handleIncomingMedia(ctx, 'animation'))
     })
     bot.on('message:video_note', async ctx => {
-      if (!this.allowed(ctx)) return void this.d.metrics.inc('rejected_updates')
+      if (!(await this.admit(ctx))) return void this.d.metrics.inc('rejected_updates')
       await this.inOrder(ctx, () => this.handleIncomingMedia(ctx, 'video_note'))
     })
 
     bot.on('message:document', async ctx => {
-      if (!this.allowed(ctx)) return void this.d.metrics.inc('rejected_updates')
+      if (!(await this.admit(ctx))) return void this.d.metrics.inc('rejected_updates')
       await this.inOrder(ctx, async () => {
         const topicId = this.topicIdOf(ctx)
         if (!topicId) return await this.say(undefined, 'Send files inside a session topic.')
@@ -1085,7 +1173,7 @@ export class TelegramBot {
     // Transcription takes 20 s or more on a CPU, and updates are handled one at a time, so it runs
     // in the background: awaiting it here would hold up every other message in every topic.
     bot.on(['message:voice', 'message:audio'], async ctx => {
-      if (!this.allowed(ctx)) return void this.d.metrics.inc('rejected_updates')
+      if (!(await this.admit(ctx))) return void this.d.metrics.inc('rejected_updates')
       const media = ctx.message.voice ?? ctx.message.audio
       if (!media) return
       const topicId = this.topicIdOf(ctx)
@@ -1103,9 +1191,13 @@ export class TelegramBot {
 
     bot.on('callback_query:data', async ctx => {
       const data = ctx.callbackQuery.data || ''
-      if (!this.allowed(ctx)) {
+      if (!(await this.admit(ctx))) {
         this.d.metrics.inc('rejected_updates')
         return void ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
+      }
+      if (data.startsWith('m:') && !allowedAction(this.access, ctx.from ? String(ctx.from.id) : undefined, data)) {
+        this.d.metrics.inc('admin_only_refused')
+        return void ctx.answerCallbackQuery({ text: '🔒 Admins only.' }).catch(() => {})
       }
       if (data.startsWith('m:')) {
         this.menuCtx = ctx
@@ -1200,6 +1292,19 @@ export function parseNew(args: string, fallbackCwd: string): { name: string; cwd
     else kept.push(t)
   }
   return { name: kept.join(' ') || `session-${Date.now().toString(36)}`, cwd, auto, notes }
+}
+
+/** Team mode's help: what a member can do, and nothing about folders, models or approvals. */
+export function teamHelp(): string {
+  return `This group shares one assistant. Every topic is a conversation anyone here can read and join.
+
+• Open a new topic and ask your question there — or tap 🆕 New topic in General, or type /new <title>.
+• Keep asking in the same topic to continue; open another topic for another subject.
+• 🎙️ A voice note is transcribed and answered like typed text (where the install supports it).
+• ⏹ Wrap up on the status message stops a long answer at its next step; ▶️ Resume picks it up again.
+• 🔎 Activity feed on the pinned panel shows which tools an answer used.
+
+Closing, deleting or wiping a topic, and changing the model, are for the admins.`
 }
 
 export function help(reposDir: string): string {

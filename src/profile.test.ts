@@ -1,0 +1,125 @@
+import { test, expect, describe } from 'bun:test'
+import { join } from 'path'
+import { parseProfile, profileOptions, ProfileError, type ProfileSource } from './profile'
+import type { OpenOptions } from './topics'
+
+const DIR = '/srv/bot'
+const WORK = join(DIR, 'work')
+
+function source(files: Record<string, string> = {}, dirs: string[] = [WORK]): ProfileSource {
+  return {
+    dir: DIR,
+    readFile: p => {
+      if (!(p in files)) throw new Error(`ENOENT: ${p}`)
+      return files[p]
+    },
+    isDirectory: p => dirs.includes(p),
+  }
+}
+
+const SERVERS = { kb: { type: 'http' as const, url: 'https://mcp.example.com/mcp', headers: { Authorization: 'Bearer x' } } }
+
+const raw = (over: Record<string, unknown> = {}) => ({
+  name: 'helpdesk',
+  systemPrompt: 'Answer from the knowledge tools only.',
+  mcpServers: SERVERS,
+  allowedTools: ['mcp__kb__search', 'mcp__kb__read'],
+  cwd: WORK,
+  model: 'claude-opus-5',
+  effort: 'medium',
+  maxTurns: 30,
+  maxBudgetUsd: 1.5,
+  ...over,
+})
+
+/** What a binding would open today: a repo, another model, the approval gate hook. */
+const gateHook = { PreToolUse: [{ hooks: [async () => ({})] }] }
+const open = (over: Partial<OpenOptions> = {}): OpenOptions => ({
+  topicId: '7',
+  cwd: '/home/someone/repo',
+  model: 'claude-sonnet-5',
+  effort: 'max',
+  resume: 'sess-1',
+  env: { PATH: '/bin', TELEPATH_OUTBOX: '/out/7' },
+  canUseTool: (async () => ({ behavior: 'deny', message: 'x' })) as any,
+  hooks: gateHook as any,
+  ...over,
+})
+
+describe('a profile session', () => {
+  test("a profile session runs with no built-in tools and only the profile's MCP servers", () => {
+    const o = profileOptions(parseProfile(raw(), source()), open())
+    expect(o.tools).toEqual([])
+    expect(o.mcpServers).toEqual(SERVERS)
+    expect(o.strictMcpConfig).toBe(true)
+    // a profile may keep a built-in tool by naming it
+    const kept = profileOptions(parseProfile(raw({ tools: ['WebFetch'], allowedTools: ['mcp__kb__search', 'WebFetch'] }), source()), open())
+    expect(kept.tools).toEqual(['WebFetch'])
+  })
+
+  test("a profile session auto-allows exactly the profile's tools and never prompts", () => {
+    const o = profileOptions(parseProfile(raw(), source()), open())
+    expect(o.allowedTools).toEqual(['mcp__kb__search', 'mcp__kb__read'])
+    expect(o.permissionMode).toBe('dontAsk')
+  })
+
+  test('a profile session reads no settings files and its only hook denies every tool outside the allowlist', async () => {
+    const o = profileOptions(parseProfile(raw(), source()), open())
+    expect(o.settingSources).toEqual([])
+    const matchers = o.hooks?.PreToolUse ?? []
+    expect(matchers.length).toBe(1)
+    expect(matchers[0].hooks.length).toBe(1)
+    expect(Object.keys(o.hooks ?? {})).toEqual(['PreToolUse'])
+    const hook = matchers[0].hooks[0]
+    const decide = async (tool_name: string) => hook({ tool_name } as any, undefined, { signal: new AbortController().signal })
+    expect(await decide('mcp__kb__search')).toEqual({})
+    expect(await decide('mcp__kb__read')).toEqual({})
+    for (const denied of ['Read', 'Bash', 'mcp__other__search', 'mcp__kb__delete', '']) {
+      const out = (await decide(denied)) as { hookSpecificOutput?: { permissionDecision?: string } }
+      expect([denied, out.hookSpecificOutput?.permissionDecision]).toEqual([denied, 'deny'])
+    }
+  })
+
+  test("a profile session uses the profile's prompt, cwd, model, effort and caps, not the binding's", () => {
+    const o = profileOptions(parseProfile(raw(), source()), open())
+    expect(o.systemPrompt).toBe('Answer from the knowledge tools only.')
+    expect(o.cwd).toBe(WORK)
+    expect(o.model).toBe('claude-opus-5')
+    expect(o.effort).toBe('medium')
+    expect(o.maxTurns).toBe(30)
+    expect(o.maxBudgetUsd).toBe(1.5)
+    expect(o.resume).toBe('sess-1')
+    expect(o.env).toEqual({ PATH: '/bin', TELEPATH_OUTBOX: '/out/7' })
+    // a profile that names no model or effort takes the topic's
+    const fallback = profileOptions(parseProfile(raw({ model: undefined, effort: undefined }), source()), open())
+    expect(fallback.model).toBe('claude-sonnet-5')
+    expect(fallback.effort).toBe('max')
+  })
+
+  test("a profile's prompt may come from a file beside it", () => {
+    const p = parseProfile(raw({ systemPrompt: undefined, systemPromptFile: 'prompt.md' }), source({ [join(DIR, 'prompt.md')]: 'From the file.' }))
+    expect(p.systemPrompt).toBe('From the file.')
+  })
+})
+
+describe('a profile is refused when', () => {
+  test('a profile names its MCP servers, a non-empty prompt and an existing cwd, or is refused', () => {
+    let err: unknown
+    try {
+      parseProfile(raw({ mcpServers: {}, systemPrompt: '   ', cwd: '/nowhere' }), source())
+    } catch (e) {
+      err = e
+    }
+    expect(err).toBeInstanceOf(ProfileError)
+    const msg = String((err as Error).message)
+    for (const k of ['mcpServers', 'systemPrompt', 'cwd']) expect(msg).toContain(k)
+  })
+
+  test('an allowed tool must name a declared MCP server or a kept built-in tool', () => {
+    expect(() => parseProfile(raw({ allowedTools: ['mcp__kb__search', 'mcp__other__search'] }), source())).toThrow(ProfileError)
+    expect(() => parseProfile(raw({ allowedTools: ['Bash'] }), source())).toThrow(ProfileError)
+    expect(() => parseProfile(raw({ tools: ['WebFetch'], allowedTools: ['WebFetch'] }), source())).not.toThrow()
+    // the converse: a kept built-in that is not allowed is a tool the hook would deny on every call
+    expect(() => parseProfile(raw({ tools: ['Read'] }), source())).toThrow(ProfileError)
+  })
+})

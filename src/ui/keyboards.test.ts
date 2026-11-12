@@ -104,3 +104,24 @@ describe('telegram limits', () => {
     }
   })
 })
+
+describe('team mode', () => {
+  test('the team main menu offers only a new topic, status and help', () => {
+    expect(callbackData(mainMenuKb({ team: true }))).toEqual(['m:new', 'm:status', 'm:help'])
+    expect(labels(mainMenuKb({ team: true }))[0]).toBe('🆕 New topic')
+    expect(callbackData(mainMenuKb())).toEqual(['m:new', 'm:quick', 'm:list', 'm:resume', 'm:settings', 'm:status', 'm:help'])
+  })
+
+  test('the team topic panel has no model, effort or auto buttons', () => {
+    for (const mode of [{ team: true }, { profile: true }, { team: true, profile: true }]) {
+      const data = callbackData(topicControlsKb(catalog, binding({ effort: 'high' }), mode))
+      expect(data.some(d => /^m:(tm|te):/.test(d) || d === 'm:ta')).toBe(false)
+      expect(data).toEqual(['m:tf', 'm:tclose', 'm:tdelete', 'm:twipe'])
+      const text = topicControlsText(catalog, binding({ effort: 'high' }), undefined, mode)
+      expect(text).not.toContain('Model:')
+      expect(text).not.toContain('approvals on')
+    }
+    expect(callbackData(topicControlsKb(catalog, binding({ effort: 'high' })))).toContain('m:tm:opus')
+    expect(topicControlsText(catalog, binding({ effort: 'high' }))).toContain('Model:')
+  })
+})

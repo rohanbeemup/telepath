@@ -10,17 +10,19 @@
  * This file is the bootstrap only: config → log → state → preflight → backend →
  * topics → bot. Behaviour lives in src/ and is tested there.
  *
- * Auth: subscription (inherits the user's `claude login`; no API key).
+ * Auth: the Claude Code child's own — the user's `claude login`, or an ANTHROPIC_API_KEY
+ * in .env, which reaches the child like the rest of the daemon's environment.
  * State: <state-dir>/.env, registry.json, prefs.json, outbox/, inbox/, health.json —
  * <state-dir> defaults to this file's directory (override TG_CLAUDE_STATE_DIR).
  */
-import { chmodSync, readFileSync, writeFileSync } from 'fs'
-import { join } from 'path'
+import { chmodSync, readFileSync, statSync, writeFileSync } from 'fs'
+import { dirname, join } from 'path'
 import { TelegramBot } from './src/bot'
 import { ConfigError, mergeEnvFile, parseConfig, parseEnvFile, type Config } from './src/config'
 import { Files } from './src/files'
 import { ErrorRing, Logger, Metrics } from './src/log'
 import { bundledClaudePath, checkClaudeVersion, MIN_CLAUDE_VERSION, readClaudeVersion } from './src/preflight'
+import { parseProfile, ProfileError, type Profile } from './src/profile'
 import { handOffToRotator, rotatorActive, rotatorEnabled, waitForRotation } from './src/rotator'
 import { drainSeedRequests } from './src/seed'
 import { SdkBackend } from './src/session'
@@ -85,8 +87,35 @@ const versionVerdict = checkClaudeVersion(claudeVersionRaw, MIN_CLAUDE_VERSION)
 if (!versionVerdict.ok) log.warn('preflight.claude_version', { message: versionVerdict.message, binary: claudeBin ?? '(sdk default)' })
 else log.info('preflight.claude_version', { message: versionVerdict.message, binary: claudeBin ?? '(sdk default)' })
 
+// ── session profile ─────────────────────────────────────────────────────────
+// The locked shape every session runs with (required in team mode). It may hold a bearer
+// header for its MCP servers, so it is kept private like .env; a profile that does not
+// parse stops the boot with every problem listed, never a bot with fewer limits than asked.
+let profile: Profile | undefined
+if (cfg.profileFile) {
+  try {
+    chmodSync(cfg.profileFile, 0o600)
+  } catch {}
+  try {
+    profile = parseProfile(JSON.parse(readFileSync(cfg.profileFile, 'utf8')), {
+      dir: dirname(cfg.profileFile),
+      readFile: p => readFileSync(p, 'utf8'),
+      isDirectory: p => {
+        try {
+          return statSync(p).isDirectory()
+        } catch {
+          return false
+        }
+      },
+    })
+  } catch (e) {
+    process.stderr.write((e instanceof ProfileError ? e.message : `session profile ${cfg.profileFile}: ${e instanceof Error ? e.message : String(e)}`) + '\n')
+    process.exit(2)
+  }
+}
+
 // ── wiring ──────────────────────────────────────────────────────────────────
-const backend = new SdkBackend({ settingSources: ['user', 'project', 'local'], pathToClaudeCodeExecutable: cfg.claudeBinary, log })
+const backend = new SdkBackend({ settingSources: ['user', 'project', 'local'], pathToClaudeCodeExecutable: cfg.claudeBinary, log, profile })
 
 const CHILD_ENV: Record<string, string | undefined> = { ...process.env }
 
@@ -99,14 +128,15 @@ function statusText(): string {
   return (
     `📊 telepath ${VERSION} · SDK ${SDK_VERSION} · ${versionVerdict.message}\n` +
     `up ${up} min · ${topics.live.size}/${cfg.maxLiveSessions} live · ${Object.keys(store.registry).length} topics bound · idle ${cfg.idleMinutes}m\n` +
-    `default ${store.prefs.defaultModel} @ ${store.prefs.defaultEffort ?? 'default'} · models ${cfg.catalog.enabled.join(',')} · rotator ${rotatorEnabled() ? 'on' : 'off'}\n\n` +
+    `default ${store.prefs.defaultModel} @ ${store.prefs.defaultEffort ?? 'default'} · models ${cfg.catalog.enabled.join(',')} · rotator ${rotatorEnabled() ? 'on' : 'off'}\n` +
+    `${cfg.teamMode ? `team mode · admins ${cfg.adminUserIds.join(',')} · ` : ''}${profile ? `profile ${profile.name} (${profile.allowedTools.length} tools)` : 'no profile'}\n\n` +
     (liveList.length ? `Live:\n${liveList.join('\n')}\n\n` : '') +
     (counters ? `Counters: ${counters}\n\n` : '') +
     (errors.length ? `Recent errors:\n${errors.join('\n')}` : 'No errors recorded.')
   )
 }
 
-const bot = new TelegramBot({ cfg, store, files, log, metrics, statusText })
+const bot = new TelegramBot({ cfg, store, files, log, metrics, statusText, profile })
 
 const topics = new TopicManager({
   store,
@@ -122,6 +152,7 @@ const topics = new TopicManager({
   rotator: { enabled: rotatorEnabled, active: rotatorActive, handOff: handOffToRotator, waitForRotation: b => waitForRotation(b) },
   log,
   metrics,
+  primeContract: !profile,
 })
 bot.attachTopics(topics)
 
@@ -189,6 +220,7 @@ process.on('SIGTERM', () => shutdown('SIGTERM'))
 try {
   const me = await bot.bot.api.getMe()
   await bot.bot.api.setMyCommands([
+    ...(cfg.teamMode ? [{ command: 'new', description: 'Start a new topic: /new <title>' }] : []),
     { command: 'menu', description: 'Open the menu — everything is buttons' },
     { command: 'status', description: 'Live sessions, counters, versions' },
   ])
@@ -198,6 +230,9 @@ try {
     bot: me.username,
     chat: cfg.forumChatId,
     user: cfg.allowedUserId,
+    teamMode: cfg.teamMode,
+    admins: cfg.adminUserIds,
+    profile: profile ? { name: profile.name, servers: Object.keys(profile.mcpServers), allowedTools: profile.allowedTools.length, tools: profile.tools.length } : null,
     defaultModel: store.prefs.defaultModel,
     defaultEffort: store.prefs.defaultEffort ?? 'default',
     models: cfg.catalog.enabled.join(','),

@@ -1,0 +1,18 @@
+{
+  "name": "helpdesk",
+  "systemPromptFile": "prompt.md",
+  "mcpServers": {
+    "kb": {
+      "type": "http",
+      "url": "https://mcp.example.com/mcp",
+      "headers": { "Authorization": "Bearer replace-me" }
+    }
+  },
+  "allowedTools": ["mcp__kb__search", "mcp__kb__read"],
+  "tools": [],
+  "cwd": "/srv/bot/work",
+  "model": "claude-opus-5",
+  "effort": "medium",
+  "maxTurns": 40,
+  "maxBudgetUsd": 1.5
+}

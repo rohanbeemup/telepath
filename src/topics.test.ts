@@ -61,7 +61,7 @@ function fakeRotator(over: Partial<Rotator> = {}): Rotator & { handedOff: unknow
 
 type FakeRotator = ReturnType<typeof fakeRotator>
 
-function harness(over: { maxLive?: number; idleMinutes?: number; rotator?: FakeRotator; now?: () => number; resumeBufferMs?: number } = {}) {
+function harness(over: { maxLive?: number; idleMinutes?: number; rotator?: FakeRotator; now?: () => number; resumeBufferMs?: number; primeContract?: boolean } = {}) {
   const store = new Store('/nowhere', {}, { defaultModel: 'claude-opus-5', defaultCwd: '/w' }, { defaultModel: 'claude-opus-5', defaultCwd: '/w' })
   // never touch disk in these tests
   store.saveRegistry = () => {}
@@ -87,6 +87,7 @@ function harness(over: { maxLive?: number; idleMinutes?: number; rotator?: FakeR
     metrics: new Metrics(),
     now: over.now,
     resumeBufferMs: over.resumeBufferMs,
+    primeContract: over.primeContract,
   })
   const bind = (topicId: string, b: Partial<{ model: string; effort: 'low' | 'high' | 'max'; sessionId: string; auto: boolean }> = {}) => {
     store.registry[topicId] = { cwd: '/w', model: b.model ?? 'claude-opus-5', effort: b.effort, sessionId: b.sessionId, title: 't' + topicId, lastActive: 0, auto: b.auto }
@@ -478,5 +479,20 @@ describe('outboxContract', () => {
     expect(c.toLowerCase()).toContain('video')
     expect(c.toLowerCase()).toContain('audio')
     expect(c.toLowerCase()).toContain('document')
+  })
+})
+
+describe('profile sessions', () => {
+  test("a profile session's first message carries no outbox contract", async () => {
+    const h = harness({ primeContract: false })
+    h.bind('p')
+    await h.tm.sendToTopic('p', 'what is the refund policy?')
+    await h.tm.sendToTopic('p', 'and for subscriptions?')
+    expect(h.backend.last().sent).toEqual(['what is the refund policy?', 'and for subscriptions?'])
+    // the default is unchanged: a session with file tools is told where to put files
+    const d = harness()
+    d.bind('q')
+    await d.tm.sendToTopic('q', 'hello')
+    expect(d.backend.last().sent[0]).toContain(outboxContract('/out/q'))
   })
 })

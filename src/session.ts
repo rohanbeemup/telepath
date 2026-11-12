@@ -6,6 +6,7 @@
  */
 import { query, listSessions as sdkListSessions, type SDKUserMessage, type SettingSource, type Options } from '@anthropic-ai/claude-agent-sdk'
 import { Mailbox, userMessage } from './mailbox'
+import { profileOptions, type Profile } from './profile'
 import type { LiveSession, OpenOptions, SessionBackend } from './topics'
 import type { Logger } from './log'
 
@@ -14,6 +15,8 @@ export type SdkBackendOptions = {
   /** Override for the SDK's bundled binary; undefined = bundled. */
   pathToClaudeCodeExecutable?: string
   log: Logger
+  /** A locked profile: every session runs its shape (profile.ts); the binding's cwd never applies. */
+  profile?: Profile
 }
 
 export class SdkBackend implements SessionBackend {
@@ -21,22 +24,27 @@ export class SdkBackend implements SessionBackend {
 
   open(opts: OpenOptions): LiveSession {
     const inbox = new Mailbox<SDKUserMessage>()
-    const options: Options = {
-      model: opts.model,
-      effort: opts.effort,
-      cwd: opts.cwd,
-      env: opts.env,
-      resume: opts.resume,
-      settingSources: this.o.settingSources,
-      permissionMode: 'default',
-      // No `allowedTools`: a bare entry there auto-approves the tool BEFORE canUseTool
-      // is consulted (the SDK warns about it). The read-only auto-allow list lives in
-      // the callback instead, so one gate sees every call and the counters are honest.
-      canUseTool: opts.canUseTool,
-      hooks: opts.hooks,
+    const own: Pick<Options, 'pathToClaudeCodeExecutable' | 'stderr'> = {
       pathToClaudeCodeExecutable: this.o.pathToClaudeCodeExecutable,
       stderr: (line: string) => this.o.log.debug('claude.stderr', { topic: opts.topicId, line: line.trimEnd() }),
     }
+    const options: Options = this.o.profile
+      ? { ...profileOptions(this.o.profile, opts), ...own }
+      : {
+          model: opts.model,
+          effort: opts.effort,
+          cwd: opts.cwd,
+          env: opts.env,
+          resume: opts.resume,
+          settingSources: this.o.settingSources,
+          permissionMode: 'default',
+          // No `allowedTools`: a bare entry there auto-approves the tool BEFORE canUseTool
+          // is consulted (the SDK warns about it). The read-only auto-allow list lives in
+          // the callback instead, so one gate sees every call and the counters are honest.
+          canUseTool: opts.canUseTool,
+          hooks: opts.hooks,
+          ...own,
+        }
     const q = query({ prompt: inbox, options })
     let closed = false
     return {

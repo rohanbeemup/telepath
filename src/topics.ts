@@ -93,6 +93,11 @@ export type TopicDeps = {
   now?: () => number
   /** Buffer past a rate-limit reset before nudging; small in tests. */
   resumeBufferMs?: number
+  /**
+   * Prepend the file-delivery contract to a session's first message (default). Off for
+   * sessions with no file tools (a profile): told where to save files, they cannot.
+   */
+  primeContract?: boolean
 }
 
 export const CONTINUE_AFTER_LIMIT =
@@ -207,7 +212,7 @@ export class TopicManager {
     let payload = text
     if (!this.primed.has(topicId)) {
       this.primed.add(topicId)
-      payload = `<telepath>\n${outboxContract(this.d.outboxDir(topicId))}\n</telepath>\n\n${text}`
+      if (this.d.primeContract !== false) payload = `<telepath>\n${outboxContract(this.d.outboxDir(topicId))}\n</telepath>\n\n${text}`
     }
     try {
       l.session.send(payload)

@@ -33,12 +33,13 @@ Telegram allows exactly **one poller per bot token**, and the Claude Agent SDK i
 - 🆔 **Resumable** — each new topic prints its session id + a `claude --resume …` command so you can pick it up on your laptop.
 - 📊 **Observable** — structured JSON logs, per-process counters, a Status screen and a `health.json` on disk, so a silent failure is a number you can read rather than a silence you have to notice.
 - 🪟 **Linux, macOS and Windows** — Bun everywhere; `install.sh` + systemd on Linux, `install.ps1` / `start.bat` on Windows (see [`WINDOWS.md`](WINDOWS.md)).
-- 🔒 **Single-user** — only your Telegram user id can talk to it or approve anything.
+- 🔒 **Single-user by default** — only your Telegram user id can talk to it or approve anything.
+- 👥 **Team mode** — one forum, a whole team: every member can open a topic and chat, every session runs a **locked profile** (one set of MCP servers, no built-in tools, no prompts), and closing, deleting, wiping or reconfiguring a topic stays with the admins. See [Team mode](#team-mode).
 
 ## Prerequisites
 
 - [**Bun**](https://bun.sh)
-- **Claude Code**, logged in with a **subscription** (`claude` → `/login`). No API key — usage runs on your plan. *(API-key auth is not used.)*
+- **Claude Code**, logged in with a **subscription** (`claude` → `/login`), so usage runs on your plan. An install that should bill a Console organization instead (a shared team bot, say) puts an `ANTHROPIC_API_KEY` in `.env`: the daemon's environment reaches the Claude Code child, so the key goes in the same file as the bot token.
 - A **Telegram bot** (from [@BotFather](https://t.me/BotFather)) and a **forum supergroup** with Topics enabled.
 
 ## Quick start
@@ -111,6 +112,44 @@ Clarifying questions appear as buttons — tap one, or type your own reply. Typi
 
 Each session gets a `TELEPATH_OUTBOX` directory in its environment, and is told once — at the start of the conversation — that anything it writes there is delivered to you in the topic. So "screenshot that", "chart it", "export the report" arrive as a photo, playable video, audio track, or document instead of a description. Delivered files are removed from the outbox after Telegram accepts them; a failed send stays put and is retried after the next turn.
 
+## Team mode
+
+One bot, one forum, a whole team. Every member of the forum supergroup can open a topic and chat, and every session runs a **locked profile** instead of Claude Code's full toolset. Built for a shared assistant over your own MCP server (a knowledge base, a ticket system, a docs index): members ask, the profile decides what an answer may reach.
+
+```ini
+TEAM_MODE=1
+ADMIN_USER_IDS=123456789,987654321   # besides ALLOWED_USER_ID
+PROFILE_FILE=profile.json            # relative to the state dir, or absolute
+```
+
+What changes with `TEAM_MODE=1`:
+
+- **Who may talk:** the forum's members, as the forum itself reports them. Every sender is checked with `getChatMember` (a yes is kept for ten minutes, a no for thirty seconds, a failed lookup is a no), so the group's member list is the access list even in a public supergroup that lets non-members post. Messages from any other chat, DMs included, are dropped as before.
+- **Who may change things:** closing, deleting and wiping a topic, switching model or effort, the settings, the session list and `/attach` are for `ALLOWED_USER_ID` and `ADMIN_USER_IDS`; a member's tap answers "Admins only". Members chat, open topics (`/new <title>`, the 🆕 button, or simply typing in a fresh topic), wrap up a turn and toggle the activity feed. The allowlist is in `src/access.ts`; an action not on it is an admin's.
+- **No wizard:** a topic binds to the profile. `cwd=` and `auto` in `/new` are words in the title, not instructions.
+- **A profile is required.** The daemon refuses to start without `PROFILE_FILE`: a forum open to a group needs a session that cannot reach the host.
+
+### Session profile
+
+`PROFILE_FILE` is JSON (see [`profile.example.json`](profile.example.json)). It works on its own too, for a single-user install that wants a read-only assistant; with a profile loaded, 🆕 and `/new <title>` bind a topic to it without the wizard, and the pinned panel shows no model, effort or approvals buttons, since the profile owns them:
+
+```json
+{
+  "name": "helpdesk",
+  "systemPromptFile": "prompt.md",
+  "mcpServers": { "kb": { "type": "http", "url": "https://mcp.example.com/mcp", "headers": { "Authorization": "Bearer …" } } },
+  "allowedTools": ["mcp__kb__search", "mcp__kb__read"],
+  "tools": [],
+  "cwd": "/srv/bot/work",
+  "model": "claude-opus-5",
+  "effort": "medium",
+  "maxTurns": 40,
+  "maxBudgetUsd": 1.5
+}
+```
+
+Every session then runs with `tools` as its only built-in tools (empty means none: no files, no shell, no web), `mcpServers` as its only MCP servers (the machine's own MCP config is ignored), `allowedTools` auto-approved and **everything else denied without a prompt** (a hook of the profile's own denies any other tool name, so the list holds even for the built-ins Claude Code would auto-approve), no settings files, `systemPrompt` (or `systemPromptFile`, read next to the profile) in place of Claude Code's own, a fixed `cwd`, and the caps. The pinned panel loses its model, effort and approvals buttons; the profile owns them. A profile that names no server, an empty prompt, a missing directory, or an allowed tool of an undeclared server is refused at boot with every problem listed. The file may hold a bearer header, so the daemon keeps it at mode 600 like `.env`.
+
 ## Run as a service (24/7)
 
 `./install.sh` offers to install a **systemd `--user` service** from [`telepath.service.template`](telepath.service.template) (the placeholders `__REPO_DIR__` / `__BUN__` are filled in automatically). That gives you:
@@ -142,7 +181,7 @@ sudo loginctl enable-linger "$USER"      # <-- don't skip this
 
 ## Configuration
 
-All via `.env` (see [`.env.example`](.env.example)). Key options: `DEFAULT_MODEL`, `DEFAULT_EFFORT`, `HAIKU_MODEL`, `SONNET_MODEL`, `OPUS_MODEL`, `FABLE_MODEL`, `ENABLED_MODELS`, `REPOS_DIR`, `IDLE_MINUTES`, `MAX_LIVE_SESSIONS`, `DEFAULT_CWD`, `TG_CLAUDE_STATE_DIR`, `CLAUDE_BINARY`, `ROTATOR_HANDOFF`, `TRANSCRIBE_CMD`.
+All via `.env` (see [`.env.example`](.env.example)). Key options: `DEFAULT_MODEL`, `DEFAULT_EFFORT`, `HAIKU_MODEL`, `SONNET_MODEL`, `OPUS_MODEL`, `FABLE_MODEL`, `ENABLED_MODELS`, `REPOS_DIR`, `IDLE_MINUTES`, `MAX_LIVE_SESSIONS`, `DEFAULT_CWD`, `TG_CLAUDE_STATE_DIR`, `CLAUDE_BINARY`, `ROTATOR_HANDOFF`, `TRANSCRIBE_CMD`, and for [team mode](#team-mode) `TEAM_MODE`, `ADMIN_USER_IDS`, `PROFILE_FILE` (plus `ANTHROPIC_API_KEY` for an install billed to a Console organization).
 
 - **Account rotator.** Sessions spawned here talk to the claude binary directly, so the rotator's VS Code shim never sees their `rate_limit_event`s. When `~/.claude-rotator/rotator.py` exists, the daemon relays every event itself (`rotator.py limit-event --stdin`, the shim's own contract) and appends it to `~/.claude-accounts/limit-events.log`, so the rotator sees the budget these topics burn on the shared account. After a rejection it watches the rotator's `.active` marker for about 30 s; when the account changes, the topic's claude process (still holding the old token) is closed and the session resumes at once on the new one, with its context intact. `ROTATOR_HANDOFF=off` disables this; `CLAUDE_ROTATOR_PY`, `CLAUDE_ROTATOR_SCRIPT` and `CLAUDE_ROTATOR_HOME` mirror the shim's overrides.
 
@@ -222,13 +261,13 @@ Claude Code ships a built-in [**Remote Control**](https://code.claude.com/docs/e
 
 This bot can run shell commands and edit files on your machine, so treat it accordingly.
 
-- **Single-user gate.** Every inbound message *and* every Allow/Deny tap is checked against **both** your `ALLOWED_USER_ID` and the `FORUM_CHAT_ID`; everything else is dropped.
+- **Single-user gate.** Every inbound message *and* every Allow/Deny tap is checked against **both** your `ALLOWED_USER_ID` and the `FORUM_CHAT_ID`; everything else is dropped. In [team mode](#team-mode) the forum's own member list is the gate (every sender is verified with `getChatMember`, cached briefly, failing closed), the destructive and configuring actions are checked against the admin ids, and every session is held to the profile, so nothing a member types can reach the host.
 - **The Allow/Deny prompt cannot be bypassed by your settings files.** A permissive `~/.claude/settings.json` (an allow rule for `Bash`, say) approves a tool before the SDK's permission callback is ever consulted. telepath registers a PreToolUse hook that forces the prompt for every tool that is not read-only, so the Telegram button is the decision on every machine, whatever the local settings allow. Measured against SDK 0.3.278; `bun run smoke` re-checks it.
 - **Keep the group private / solo.** Anyone *in* the forum group can read the bot's output (session content, tool results) even though only you can drive it. Don't add others.
 - **Auto mode = remote code execution.** A topic in `/auto` runs tools with no prompt. That's the point, but it means a single Telegram message can run arbitrary commands. It's per-topic, off by default — enable it only for topics/work you trust, and be aware that untrusted content a session fetches (web pages, files) could attempt prompt-injection.
 - **Bot token handling.** The `TELEGRAM_BOT_TOKEN` is scrubbed from the environment passed to child sessions (so a prompt-injected session can't read it from *its env*), and `.env` is force-chmod'd to `600` on load. This is **not** a sandbox, though: a session running tools (`Bash`/`Read`) — especially in `/auto` — can still read the `.env` file on disk like any other local file. The real protections are the single-user gate and keeping auto-mode off for untrusted work.
 - **Child sessions inherit your environment** (minus the bot token). If you export other secrets (e.g. `ANTHROPIC_API_KEY`, cloud credentials) in the shell that launches the daemon, child sessions can see them — run the daemon from a clean environment if that matters.
-- **Auth.** Runs on your `claude login` (subscription). No API key is stored or used.
+- **Auth.** Runs on your `claude login` (subscription), or on an `ANTHROPIC_API_KEY` from `.env` when you set one; the key is never logged and never reaches a topic.
 - **Your responsibility:** keep `.env` private (it's gitignored), keep the bot token secret, and don't expose the group.
 
 ## Caveats

@@ -3,6 +3,27 @@
 ## Unreleased
 
 ### Added
+- **Team mode and session profiles.** `TEAM_MODE=1` opens the forum to all its members: every
+  member of `FORUM_CHAT_ID`, as the forum itself reports them (`getChatMember` per sender,
+  cached briefly, failing closed, so a public forum that lets non-members post is no hole),
+  may chat and open topics (typing in a fresh topic, the 🆕 button, or
+  `/new <title>`), while closing, deleting and wiping a topic, switching model or effort, the
+  settings, the session list and `/attach` stay with `ALLOWED_USER_ID` plus `ADMIN_USER_IDS`
+  (an allowlist of member actions in `src/access.ts`; anything it has not heard of is an
+  admin's). Team mode requires `PROFILE_FILE`, a locked session profile (`src/profile.ts`,
+  `profile.example.json`): one set of MCP servers and nothing from the machine's own MCP
+  config, an explicit tool allowlist with everything else denied and never prompted
+  (`permissionMode: dontAsk`), no built-in tools unless named, no settings files, a prompt of
+  its own in place of Claude Code's, a fixed working directory, `maxTurns` and
+  `maxBudgetUsd`. The approval gate hook is left out of profile sessions on purpose: it
+  answers `ask` for every MCP tool, which under `dontAsk` would deny the very tools the
+  profile allows. In its place the profile installs an allowlist hook that denies any tool
+  name it does not list, because `dontAsk` alone denies only tools that would have
+  prompted and Claude Code auto-approves its read-only built-ins; a kept built-in that is
+  not allowed is refused at boot. A profile also works without team mode, for a read-only single-user
+  assistant. Profile sessions get no "save files here" contract, and the pinned panel loses
+  its model, effort and approvals buttons. An `ANTHROPIC_API_KEY` in `.env` reaches the
+  Claude Code child, for installs that bill a Console organization rather than a login.
 - **Video, GIFs and video notes, both ways.** Inbound: videos, GIFs/animations and round video
   notes are now downloaded (under Telegram's 20 MB bot-download cap) and handed to the session
   with the saved path and a frame-extraction hint, where before only photos and documents were

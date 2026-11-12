@@ -1,5 +1,6 @@
 import { test, expect, describe } from 'bun:test'
 import { parseEnvFile, parseConfig, ConfigError, mergeEnvFile } from './config'
+import { join } from 'path'
 
 const REQUIRED = { TELEGRAM_BOT_TOKEN: 't', ALLOWED_USER_ID: '1', FORUM_CHAT_ID: '-100' }
 
@@ -58,5 +59,34 @@ describe('config', () => {
   test('falls back to the first enabled model when the default is disabled', () => {
     const c = parseConfig({ ...REQUIRED, ENABLED_MODELS: 'opus,fable', DEFAULT_MODEL: 'claude-sonnet-5' }, '/s')
     expect(c.defaultModel).toBe('claude-opus-5')
+  })
+})
+
+describe('team mode', () => {
+  test('team mode is off unless TEAM_MODE says so', () => {
+    expect(parseConfig({ ...REQUIRED }, '/state').teamMode).toBe(false)
+    for (const v of ['0', 'false', 'off', '']) expect(parseConfig({ ...REQUIRED, TEAM_MODE: v }, '/state').teamMode).toBe(false)
+    for (const v of ['1', 'true', 'on', 'TRUE']) expect(parseConfig({ ...REQUIRED, TEAM_MODE: v, PROFILE_FILE: '/p.json' }, '/state').teamMode).toBe(true)
+  })
+
+  test('team mode refuses to start without PROFILE_FILE', () => {
+    let err: unknown
+    try {
+      parseConfig({ ...REQUIRED, TEAM_MODE: '1' }, '/state')
+    } catch (e) {
+      err = e
+    }
+    expect(err).toBeInstanceOf(ConfigError)
+    expect(String((err as Error).message)).toContain('PROFILE_FILE')
+    // a profile without team mode is fine: one user with a locked assistant
+    expect(parseConfig({ ...REQUIRED, PROFILE_FILE: '/p.json' }, '/state').profileFile).toBe('/p.json')
+    // a relative path is the state directory's
+    expect(parseConfig({ ...REQUIRED, PROFILE_FILE: 'profile.json' }, '/state').profileFile).toBe(join('/state', 'profile.json'))
+    expect(parseConfig({ ...REQUIRED }, '/state').profileFile).toBeUndefined()
+  })
+
+  test('admins are the allowed user plus ADMIN_USER_IDS', () => {
+    expect(parseConfig({ ...REQUIRED }, '/state').adminUserIds).toEqual(['1'])
+    expect(parseConfig({ ...REQUIRED, ADMIN_USER_IDS: ' 2, 3 ,1,,2 ' }, '/state').adminUserIds).toEqual(['1', '2', '3'])
   })
 })
