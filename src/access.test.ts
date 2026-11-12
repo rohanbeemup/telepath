@@ -1,5 +1,5 @@
 import { test, expect, describe } from 'bun:test'
-import { admitted, isAdmin, allowedAction, promptTapAllowed, profileLocked, Membership, type AccessConfig } from './access'
+import { admitted, isAdmin, allowedAction, promptTapAllowed, profileLocked, membershipRequired, Membership, type AccessConfig } from './access'
 
 const single: AccessConfig = { teamMode: false, allowedUserId: '1', forumChatId: '-100', adminUserIds: ['1'] }
 const team: AccessConfig = { teamMode: true, allowedUserId: '1', forumChatId: '-100', adminUserIds: ['1', '9'] }
@@ -62,8 +62,9 @@ describe('what a member may do', () => {
   })
 
   test('with a profile, the model, effort and approval actions are locked whoever taps them', () => {
-    for (const a of ['m:tm:opus', 'm:tm:haiku', 'm:te:high', 'm:te:auto', 'm:ta', '/auto', 'use', 'effort']) expect([a, profileLocked(a)]).toEqual([a, true])
-    for (const a of ['chat', '/new', '/help', '/menu', '/status', 'feed', 'wrap', 'm:menu', 'm:new', 'm:quick', 'm:tf', 'm:tclose', 'm:tdelete', 'm:twipe', 'm:settings', 'm:sdm:opus', '/attach', 'm:future']) {
+    for (const a of ['m:tm:opus', 'm:tm:haiku', 'm:te:high', 'm:te:auto', 'm:ta', '/auto']) expect([a, profileLocked(a)]).toEqual([a, true])
+    // typed use/effort configure nothing under a profile: they go to the session as chat, so they are not locked
+    for (const a of ['use', 'effort', 'chat', '/new', '/help', '/menu', '/status', 'feed', 'wrap', 'm:menu', 'm:new', 'm:quick', 'm:tf', 'm:tclose', 'm:tdelete', 'm:twipe', 'm:settings', 'm:sdm:opus', '/attach', 'm:future']) {
       expect([a, profileLocked(a)]).toEqual([a, false])
     }
   })
@@ -103,6 +104,12 @@ describe('membership', () => {
     const m = new Membership(async id => statuses[id] ?? { status: 'left' })
     for (const id of ['1', '2', '3', '4']) expect([id, await m.isMember(id)]).toEqual([id, true])
     for (const id of ['5', '6', '7', '8', '9']) expect([id, await m.isMember(id)]).toEqual([id, false])
+    // an admin from the config is admitted without asking the forum; a member is asked; outside team mode nobody is
+    expect(membershipRequired(team, '9')).toBe(false)
+    expect(membershipRequired(team, '1')).toBe(false)
+    expect(membershipRequired(team, '2')).toBe(true)
+    expect(membershipRequired(team, undefined)).toBe(true)
+    expect(membershipRequired(single, '2')).toBe(false)
   })
 
   test('a membership answer is cached, a failure only briefly, and a change the forum reports clears it', async () => {
@@ -134,16 +141,23 @@ describe('membership', () => {
     answer = () => ({ status: 'member' })
     expect(await m.isMember('2')).toBe(true)
     expect(calls).toBe(4)
-    // a thrown lookup is a no, kept for the grace only, then asked again
+    // a thrown lookup is unknown (so not a member), kept for the grace only, then asked again
     answer = () => {
       throw new Error('502')
     }
     t = 800_000
-    expect(await m.isMember('3')).toBe(false)
+    expect(await m.check('3')).toBe('unknown')
     expect(calls).toBe(5)
     t = 800_000 + 29_000
     expect(await m.isMember('3')).toBe(false)
+    expect(await m.check('3')).toBe('unknown') // remembered as unknown, not as a no
     expect(calls).toBe(5) // not one call per message
+    expect(await m.check('2')).toBe('member')
+    answer = () => ({ status: 'left' })
+    expect(await m.check('5')).toBe('no')
+    expect(calls).toBe(6)
+    answer = () => ({ status: 'member' })
+    calls = 5
     t = 800_000 + 31_000
     answer = () => ({ status: 'member' })
     expect(await m.isMember('3')).toBe(true)

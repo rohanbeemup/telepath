@@ -6,17 +6,27 @@ import { isModelKey, parseEffort, type Catalog, type Effort, type ModelKey } fro
 
 export type Typed =
   | { kind: 'slash'; cmd: string; args: string }
+  /** A command addressed to another bot (`/new@other_bot`): nothing for this one to do. */
+  | { kind: 'foreign' }
   | { kind: 'use'; model: ModelKey; effort: Effort | undefined }
   | { kind: 'effort'; effort: Effort | undefined }
   | { kind: 'feed'; on: boolean }
   | { kind: 'wrap' }
   | { kind: 'chat'; text: string }
 
-export function parseTyped(raw: string, catalog: Catalog): Typed {
+export function parseTyped(raw: string, catalog: Catalog, botUsername?: string): Typed {
   const text = raw.trim()
   if (text.startsWith('/')) {
-    const [cmd, ...rest] = text.slice(1).split(/\s+/)
-    return { kind: 'slash', cmd: cmd.toLowerCase(), args: rest.join(' ') }
+    const [word, ...rest] = text.slice(1).split(/\s+/)
+    const at = word.indexOf('@')
+    if (at >= 0) {
+      // A command tapped from a group's menu arrives as /new@bot_name. Ours when the handle
+      // is ours; another bot's otherwise, and not a command here at all.
+      const handle = word.slice(at + 1).toLowerCase()
+      if (!botUsername || handle !== botUsername.toLowerCase()) return { kind: 'foreign' }
+      return { kind: 'slash', cmd: word.slice(0, at).toLowerCase(), args: rest.join(' ') }
+    }
+    return { kind: 'slash', cmd: word.toLowerCase(), args: rest.join(' ') }
   }
   const use = /^use\s+(\S+)(?:\s+(\S+))?$/i.exec(text)
   if (use) {

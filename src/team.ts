@@ -18,3 +18,23 @@ export function parseTeamNew(args: string, member: Member, now: Date): { title: 
   const mm = String(now.getMinutes()).padStart(2, '0')
   return { title: `${who} · ${hh}:${mm}` }
 }
+
+/** How many topics one member may open per calendar day (UTC); in memory, so a restart starts the day over. */
+export class TopicQuota {
+  private readonly counts = new Map<string, { day: string; n: number }>()
+
+  constructor(
+    private readonly limit: number,
+    private readonly now: () => number = () => Date.now(),
+  ) {}
+
+  /** Count one opening for this member; false when the day's allowance is used up. */
+  take(userId: string): boolean {
+    const day = new Date(this.now()).toISOString().slice(0, 10)
+    const c = this.counts.get(userId)
+    const n = c && c.day === day ? c.n : 0
+    if (n >= this.limit) return false
+    this.counts.set(userId, { day, n: n + 1 })
+    return true
+  }
+}

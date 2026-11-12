@@ -4,16 +4,16 @@
  * interpret via TopicManager); this file is the plumbing between them and the
  * Telegram API, plus the permission prompts a session blocks on.
  */
-import { Bot, InlineKeyboard, InputFile, type Context } from 'grammy'
+import { Bot, InlineKeyboard, InputFile, type Api, type Context } from 'grammy'
 import type { Message } from 'grammy/types'
 import { autoRetry } from '@grammyjs/auto-retry'
 import type { CanUseTool, PermissionResult } from '@anthropic-ai/claude-agent-sdk'
 import { basename } from 'path'
 import type { Config } from './config'
-import { admitted, allowedAction, profileLocked, promptTapAllowed, Membership, type AccessConfig } from './access'
-import { parseTyped } from './commands'
+import { admitted, allowedAction, membershipRequired, profileLocked, promptTapAllowed, Membership, type AccessConfig } from './access'
+import { parseTyped, type Typed } from './commands'
 import type { Profile } from './profile'
-import { parseTeamNew, type Member } from './team'
+import { parseTeamNew, TopicQuota, type Member } from './team'
 import { describeTask } from './feed'
 import { TurnStatus, type StatusTransport } from './status'
 import { parseHandoff, resumePrompt } from './handoff'
@@ -72,6 +72,8 @@ const FREE_TEXT = Symbol('free-text')
 /** A profile session has no file tool, so an inbound file has nowhere to go and the host path stays out of the chat. */
 const TEXT_ONLY = '📎 This assistant reads text only: type your question. Voice notes are transcribed.'
 const PROFILE_OWNS = '🔒 This install runs a profile: the model, effort and approvals are set there.'
+/** grammy types its optional signal with the abort-controller polyfill; the platform's AbortSignal is what runs. */
+type ApiSignal = NonNullable<Parameters<Api['getChatMember']>[2]>
 
 export class TelegramBot {
   readonly bot: Bot
@@ -92,12 +94,17 @@ export class TelegramBot {
   private readonly access: AccessConfig
   /** Team mode's second gate: the forum's own member list, asked per sender and cached. */
   private readonly membership: Membership
+  /** Team mode: topics per member per day. */
+  private readonly quota: TopicQuota
+  /** When a sender was last told the forum could not be asked about them; one notice per grace. */
+  private readonly unknownNoticeUntil = new Map<string, number>()
 
   constructor(private readonly d: BotDeps) {
     this.bot = new Bot(d.cfg.telegramToken)
     this.access = { teamMode: d.cfg.teamMode, allowedUserId: d.cfg.allowedUserId, forumChatId: d.cfg.forumChatId, adminUserIds: d.cfg.adminUserIds }
     // Capped: bot.start() handles updates one at a time, so one slow answer here would hold every topic.
-    this.membership = new Membership(id => withTimeout(this.bot.api.getChatMember(d.cfg.forumChatId, Number(id)), 5_000))
+    this.membership = new Membership(id => this.bot.api.getChatMember(d.cfg.forumChatId, Number(id), AbortSignal.timeout(5_000) as unknown as ApiSignal))
+    this.quota = new TopicQuota(d.cfg.teamTopicsPerDay)
     // Every API call waits out a 429 for exactly the `retry_after` Telegram names (up to
     // 30 s, three attempts) instead of failing, so a burst of answers across topics is
     // delayed rather than lost. The status message has its own budget on top of this.
@@ -486,7 +493,7 @@ export class TelegramBot {
         return await this.handleText(ctx, turn)
       }
       await this.say(topicId, `🎙️ ${shared.audioFile ? 'Audio file' : 'Forwarded voice note'}, passed on as content: ${words}`)
-      if (!this.d.store.registry[topicId] && this.d.cfg.teamMode) await this.bindFreshTeamTopic(ctx, topicId)
+      if (!this.d.store.registry[topicId] && this.d.cfg.teamMode && !(await this.bindFreshProfileTopic(ctx, topicId))) return
       if (!(await this.topics.sendToTopic(topicId, turn))) await this.say(topicId, 'No session bound to this topic. Use /new (or /attach) first.')
     } catch (e) {
       await this.say(topicId, `🎙️ Voice note not transcribed: ${e instanceof Error ? e.message : String(e)}`)
@@ -601,32 +608,48 @@ export class TelegramBot {
     return ctx.message?.reply_to_message?.forum_topic_created?.name
   }
 
-  /** Team mode: a fresh topic is a conversation from its first message, typed or spoken. */
-  private async bindFreshTeamTopic(ctx: Context, topicId: string): Promise<void> {
-    this.bindProfileTopic(topicId, this.topicTitleOf(ctx) ?? this.defaultTitle(ctx))
-    await this.postPinnedControls(topicId)
+  /** Team mode: each member may open only so many topics a day; says so when the allowance is spent. */
+  private async topicAllowed(ctx: Context, where: string | undefined): Promise<boolean> {
+    if (!this.d.cfg.teamMode) return true
+    const uid = this.senderId(ctx)
+    if (uid && this.quota.take(uid)) return true
+    this.d.metrics.inc('topic_quota_refused')
+    await this.say(where, `🧮 You have opened ${this.d.cfg.teamTopicsPerDay} topics today, the daily allowance. Keep asking in one of them, or come back tomorrow.`)
+    return false
   }
 
-  /** With a profile: a topic binds to it, never to a folder, model or approval choice. */
+  /** A fresh topic a member typed or spoke into: bound to the profile, within the allowance. */
+  private async bindFreshProfileTopic(ctx: Context, topicId: string): Promise<boolean> {
+    if (!(await this.topicAllowed(ctx, topicId))) return false
+    this.bindProfileTopic(topicId, this.topicTitleOf(ctx) ?? this.defaultTitle(ctx))
+    await this.postPinnedControls(topicId)
+    return true
+  }
+
+  /**
+   * With a profile: a topic binds to it, never to a folder, model or approval choice. No
+   * session is opened here; the first message opens one, so a topic nobody writes in
+   * costs no process.
+   */
   private bindProfileTopic(topicId: string, title: string): void {
     const p = this.d.profile
     const { prefs } = this.d.store
     this.bind(topicId, { cwd: p?.cwd ?? this.d.store.defaultCwd(), model: p?.model ?? prefs.defaultModel, effort: p?.effort ?? prefs.defaultEffort, title, auto: false })
     this.d.metrics.inc('topics_created')
-    this.topics.ensureLive(topicId)
   }
 
-  private async newProfileTopic(title: string, intoTopic?: string): Promise<string | undefined> {
+  /** /new, 🆕 and ⚡ with a profile: one path, within the allowance. */
+  private async createProfileTopic(ctx: Context, title: string, intoTopic: string | undefined): Promise<void> {
+    if (!(await this.topicAllowed(ctx, intoTopic))) return
     let topicId: string
     try {
       topicId = await this.createTopic(title)
     } catch (e) {
-      await this.paint(intoTopic, `Couldn't create topic (is the bot admin with Manage Topics?): ${e}`, backKb())
-      return undefined
+      return void this.paint(intoTopic, `Couldn't create topic (is the bot admin with Manage Topics?): ${e}`, backKb())
     }
     this.bindProfileTopic(topicId, title)
     await this.postPinnedControls(topicId)
-    return topicId
+    await this.paint(intoTopic, `✅ Created "${title}".`, openLinkKb(this.d.cfg.forumChatId, topicId))
   }
 
   private async newSession(name: string, cwd: string, model: string, effort: Effort | undefined, auto: boolean, intoTopic?: string): Promise<string | undefined> {
@@ -770,15 +793,13 @@ export class TelegramBot {
       if (this.d.profile) {
         // No wizard: the profile decides everything but the title.
         if (data === 'm:newhere' && topicId) {
-          if (!store.registry[topicId]) this.bindProfileTopic(topicId, this.defaultTitle(ctx))
+          if (store.registry[topicId]) return void ack('Already a conversation')
           await ack()
-          return this.postPinnedControls(topicId)
+          await this.bindFreshProfileTopic(ctx, topicId)
+          return
         }
         await ack('Creating…')
-        const title = this.defaultTitle(ctx)
-        const tid = await this.newProfileTopic(title, topicId)
-        if (tid) await this.paint(topicId, `✅ Created "${title}".`, openLinkKb(this.d.cfg.forumChatId, tid))
-        return
+        return this.createProfileTopic(ctx, this.defaultTitle(ctx), topicId)
       }
       await ack()
       this.wizard.set(uid, startWizard(listRepoFolders(this.d.cfg.reposDir, store.defaultCwd()), data === 'm:newhere' ? topicId : undefined))
@@ -786,12 +807,7 @@ export class TelegramBot {
     }
     if (data === 'm:quick') {
       await ack('Creating…')
-      if (this.d.profile) {
-        const title = this.defaultTitle(ctx)
-        const tid = await this.newProfileTopic(title, topicId)
-        if (tid) await this.paint(topicId, `✅ Created "${title}".`, openLinkKb(this.d.cfg.forumChatId, tid))
-        return
-      }
+      if (this.d.profile) return this.createProfileTopic(ctx, this.defaultTitle(ctx), topicId)
       const cwd = store.defaultCwd()
       const tid = await this.newSession(basename(cwd), cwd, store.prefs.defaultModel, store.prefs.defaultEffort, false, topicId)
       if (tid) await this.paint(topicId, `✅ Created "${basename(cwd)}".`, openLinkKb(this.d.cfg.forumChatId, tid))
@@ -822,7 +838,8 @@ export class TelegramBot {
       await ack('Cancelled')
       return this.showMainMenu(topicId)
     }
-    if (data === 'm:ctl') return void (await ack(), topicId && store.registry[topicId] ? this.postPinnedControls(topicId) : this.showMainMenu(topicId))
+    // Repainted in place: a re-post would re-pin, and a pin notifies the whole forum.
+    if (data === 'm:ctl') return void (await ack(), topicId && store.registry[topicId] ? this.repaintControls(topicId, store.registry[topicId]) : this.showMainMenu(topicId))
 
     // Settings
     const sdm = /^m:sdm:(\w+)$/.exec(data)
@@ -1026,7 +1043,10 @@ export class TelegramBot {
 
   private async handleText(ctx: Context, raw: string): Promise<void> {
     const topicId = this.topicIdOf(ctx)
-    const typed = parseTyped(raw, this.d.cfg.catalog)
+    const parsed = parseTyped(raw, this.d.cfg.catalog, ctx.me?.username)
+    if (parsed.kind === 'foreign') return // another bot's command
+    // Under a profile, "use opus" or "effort high" configure nothing: they are what the user said.
+    const typed: Typed = this.d.profile && (parsed.kind === 'use' || parsed.kind === 'effort') ? { kind: 'chat', text: raw.trim() } : parsed
     this.d.log.debug('in.text', { topic: topicId ?? 'general', kind: typed.kind, len: raw.length })
 
     const fromId = this.senderId(ctx)
@@ -1040,12 +1060,7 @@ export class TelegramBot {
       if (this.d.profile && profileLocked(`/${typed.cmd}`)) return void this.say(topicId, PROFILE_OWNS)
       switch (typed.cmd) {
         case 'new': {
-          if (this.d.profile) {
-            const { title } = parseTeamNew(typed.args, this.memberOf(ctx), new Date())
-            const tid = await this.newProfileTopic(title, topicId)
-            if (tid) await this.paint(topicId, `✅ Created "${title}".`, openLinkKb(this.d.cfg.forumChatId, tid))
-            return
-          }
+          if (this.d.profile) return this.createProfileTopic(ctx, parseTeamNew(typed.args, this.memberOf(ctx), new Date()).title, topicId)
           const { name, cwd, auto, notes } = parseNew(typed.args, this.d.store.defaultCwd())
           for (const n of notes) await this.say(topicId, n)
           await this.newSession(name, cwd, this.d.store.prefs.defaultModel, this.d.store.prefs.defaultEffort, auto, topicId)
@@ -1122,7 +1137,7 @@ export class TelegramBot {
 
     if (!b) {
       if (!this.d.cfg.teamMode) return void this.send(topicId, 'This topic has no Claude session yet.', new InlineKeyboard().text('🆕 Start a session here', 'm:newhere'))
-      await this.bindFreshTeamTopic(ctx, topicId)
+      if (!(await this.bindFreshProfileTopic(ctx, topicId))) return
       b = this.d.store.registry[topicId]
     }
     this.status.bump(topicId) // the user's own message now sits below the status
@@ -1136,14 +1151,27 @@ export class TelegramBot {
     return admitted(this.access, { fromId: this.senderId(ctx), chatId: ctx.chat ? String(ctx.chat.id) : undefined })
   }
 
-  /** The chat gate, then in team mode the forum's own member list; a failed lookup is a no. */
+  /**
+   * The chat gate, then in team mode the forum's own member list for everyone but the
+   * configured admins. A lookup that failed is a no, said once per grace so a Telegram
+   * blip reads as a blip and not as a dead bot.
+   */
   private async admit(ctx: Context): Promise<boolean> {
     if (!this.allowed(ctx)) return false
-    if (!this.d.cfg.teamMode) return true
-    if (!ctx.from) return false
-    const member = await this.membership.isMember(String(ctx.from.id))
-    if (!member) this.d.metrics.inc('non_member_rejected')
-    return member
+    const uid = this.senderId(ctx)
+    if (!membershipRequired(this.access, uid)) return true
+    if (!uid) return false
+    const verdict = await this.membership.check(uid)
+    if (verdict === 'member') return true
+    this.d.metrics.inc(verdict === 'unknown' ? 'membership_unknown' : 'non_member_rejected')
+    if (verdict === 'unknown') {
+      const now = Date.now()
+      if ((this.unknownNoticeUntil.get(uid) ?? 0) <= now) {
+        this.unknownNoticeUntil.set(uid, now + 30_000)
+        await this.say(this.topicIdOf(ctx), '⚠️ Could not verify your membership just now. Try again in a moment.')
+      }
+    }
+    return false
   }
 
   private wire(): void {
@@ -1310,23 +1338,6 @@ export class TelegramBot {
 }
 
 // ── helpers ────────────────────────────────────────────────────────────────
-
-/** A promise bounded in time: the original keeps running, but a late outcome is dropped. */
-function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const t = setTimeout(() => reject(new Error(`timed out after ${ms} ms`)), ms)
-    p.then(
-      v => {
-        clearTimeout(t)
-        resolve(v)
-      },
-      e => {
-        clearTimeout(t)
-        reject(e)
-      },
-    )
-  })
-}
 
 function summarizeInput(tool: string, input: Record<string, unknown>): string {
   if (tool === 'Bash' && typeof input.command === 'string') return `\n<code>${htmlEsc(input.command.slice(0, 300))}</code>`

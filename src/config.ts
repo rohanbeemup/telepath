@@ -20,6 +20,8 @@ export type Config = {
   adminUserIds: string[]
   /** A locked session profile (profile.ts); required in team mode. */
   profileFile?: string
+  /** Team mode: topics one member may open per day. */
+  teamTopicsPerDay: number
   defaultCwd: string
   reposDir: string
   catalog: Catalog
@@ -81,6 +83,7 @@ export function parseConfig(env: Record<string, string | undefined>, stateDir: s
   const adminUserIds = [allowedUserId, ...(env.ADMIN_USER_IDS || '').split(',')].map(s => s.trim()).filter((s, i, all) => s !== '' && all.indexOf(s) === i)
   const profileFile = env.PROFILE_FILE ? (isAbsolute(env.PROFILE_FILE) ? env.PROFILE_FILE : join(stateDir, env.PROFILE_FILE)) : undefined
   if (teamMode && !profileFile) problems.push('TEAM_MODE requires PROFILE_FILE: a locked session profile is what makes a shared forum safe (README, Team mode)')
+  const teamTopicsPerDay = num('TEAM_TOPICS_PER_DAY', 20)
 
   const defaultCwd = env.DEFAULT_CWD || homedir()
   const reposDir = env.REPOS_DIR || dirname(defaultCwd)
@@ -121,6 +124,7 @@ export function parseConfig(env: Record<string, string | undefined>, stateDir: s
     teamMode,
     adminUserIds,
     profileFile,
+    teamTopicsPerDay,
     defaultCwd,
     reposDir,
     catalog,

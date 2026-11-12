@@ -43,8 +43,12 @@ const MEMBER_ACTIONS: ReadonlySet<string> = new Set([
   'm:tres',
 ])
 
-/** The actions a profile owns: model, effort and approvals. Consulted beside allowedAction. */
-const PROFILE_LOCKED: ReadonlySet<string> = new Set(['m:ta', '/auto', 'use', 'effort'])
+/**
+ * The actions a profile owns: model, effort and approvals, as taps and as /auto. Typed
+ * `use …` and `effort …` are not here: under a profile they configure nothing, so the bot
+ * hands them to the session as what the user said.
+ */
+const PROFILE_LOCKED: ReadonlySet<string> = new Set(['m:ta', '/auto'])
 
 /** The chat gate: the forum, and outside team mode the one allowed user. Membership is Membership's. */
 export function admitted(cfg: AccessConfig, s: Sender): boolean {
@@ -84,6 +88,9 @@ export function promptTapAllowed(cfg: AccessConfig, tap: PromptTap): boolean {
 /** What Telegram's getChatMember answers, reduced to what the gate reads. */
 export type ChatMemberLike = { status: string; is_member?: boolean }
 
+/** What the forum said, or that it could not be asked. */
+export type Verdict = 'member' | 'no' | 'unknown'
+
 /** Only what the forum calls a member; a status this code has never seen is not one. */
 export function isMemberStatus(m: ChatMemberLike): boolean {
   if (m.status === 'creator' || m.status === 'administrator' || m.status === 'member') return true
@@ -100,7 +107,7 @@ export function isMemberStatus(m: ChatMemberLike): boolean {
  * so a member removed just now is refused on their next message, not at the TTL.
  */
 export class Membership {
-  private readonly cache = new Map<string, { until: number; member: boolean }>()
+  private readonly cache = new Map<string, { until: number; verdict: Verdict }>()
   private readonly ttlMs: number
   private readonly graceMs: number
   private readonly now: () => number
@@ -114,17 +121,22 @@ export class Membership {
     this.now = opts.now ?? (() => Date.now())
   }
 
-  async isMember(userId: string): Promise<boolean> {
+  /** member, no, or unknown (the lookup failed); the bot tells unknown from no. */
+  async check(userId: string): Promise<Verdict> {
     const hit = this.cache.get(userId)
-    if (hit && this.now() < hit.until) return hit.member
-    let member = false
+    if (hit && this.now() < hit.until) return hit.verdict
+    let verdict: Verdict
     try {
-      member = isMemberStatus(await this.lookup(userId))
+      verdict = isMemberStatus(await this.lookup(userId)) ? 'member' : 'no'
     } catch {
-      member = false
+      verdict = 'unknown'
     }
-    this.cache.set(userId, { until: this.now() + (member ? this.ttlMs : this.graceMs), member })
-    return member
+    this.cache.set(userId, { until: this.now() + (verdict === 'member' ? this.ttlMs : this.graceMs), verdict })
+    return verdict
+  }
+
+  async isMember(userId: string): Promise<boolean> {
+    return (await this.check(userId)) === 'member'
   }
 
   /** The forum reported a change for this id: the next check asks again. */
@@ -140,4 +152,13 @@ export class Membership {
  */
 export function profileLocked(action: string): boolean {
   return PROFILE_LOCKED.has(action) || action.startsWith('m:tm:') || action.startsWith('m:te:')
+}
+
+/**
+ * Whether the forum must be asked about this sender: team mode, and not an admin from the
+ * config. An admin is configured, not inferred, so an API blip never locks out the people
+ * who could fix it.
+ */
+export function membershipRequired(cfg: AccessConfig, fromId: string | undefined): boolean {
+  return cfg.teamMode && !isAdmin(cfg, fromId)
 }

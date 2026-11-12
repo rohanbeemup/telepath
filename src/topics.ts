@@ -9,7 +9,7 @@ import { interpret, newPumpState, type Event } from './interpret'
 import { HANDOFF_MARKER, parseHandoff, WRAP_UP_PROMPT } from './handoff'
 import type { Effort } from './models'
 import { effortFor, type Catalog } from './models'
-import type { Store } from './state'
+import type { Binding, Store } from './state'
 import type { Logger, Metrics } from './log'
 
 export type SessionExtras = {
@@ -192,7 +192,7 @@ export class TopicManager {
     if (b.closed) return undefined // an admin closed it; ♻️ Reopen clears this
     // A stretch gets what is left of the topic's budget, so it cannot overshoot the cap by
     // a whole fresh budget; a topic with nothing left opens no session.
-    const budgetUsd = this.d.budgetUsd === undefined ? undefined : this.d.budgetUsd - (b.spentUsd ?? 0)
+    const budgetUsd = this.remainingBudget(b)
     if (budgetUsd !== undefined && budgetUsd <= 0) return undefined
     this.enforceCap()
     // Child sessions must not see the bot token: a prompt-injected session could read
@@ -218,6 +218,11 @@ export class TopicManager {
     return l
   }
 
+  /** What is left of the topic's budget; undefined when the install has none. */
+  private remainingBudget(b: Binding): number | undefined {
+    return this.d.budgetUsd === undefined ? undefined : this.d.budgetUsd - (b.spentUsd ?? 0)
+  }
+
   /** A user (or a nudge) message into the topic's session. */
   async sendToTopic(topicId: string, text: string, opts: { takeover?: boolean } = {}): Promise<boolean> {
     if (opts.takeover !== false) this.userTookOver(topicId)
@@ -227,9 +232,10 @@ export class TopicManager {
       await this.d.say(topicId, '🔒 An admin closed this topic. An admin can reopen it from the pinned panel.')
       return true
     }
-    if (bound && this.d.budgetUsd !== undefined && (bound.spentUsd ?? 0) >= this.d.budgetUsd) {
+    const cap = this.d.budgetUsd
+    if (bound && cap !== undefined && (this.remainingBudget(bound) ?? cap) <= 0) {
       this.d.metrics.inc('budget_refusals')
-      await this.d.say(topicId, `💸 This topic has used its budget ($${this.d.budgetUsd.toFixed(2)}). Open a new topic for the next question; an admin can delete this one.`)
+      await this.d.say(topicId, `💸 This topic has used its budget ($${cap.toFixed(2)}). Open a new topic for the next question; an admin can delete this one.`)
       return true
     }
     let l = this.ensureLive(topicId)
@@ -402,10 +408,11 @@ export class TopicManager {
               // The topic's spend, carried across stretches: a result's total, success or
               // failure, is this stretch's; a stretch the SDK ended for its budget counts as
               // the budget spent whatever it reported. Tracked only where a budget exists.
-              if (b && this.d.budgetUsd !== undefined) {
+              const budget = this.d.budgetUsd
+              if (b && budget !== undefined) {
                 let spent = b.spentUsd
                 if (ev.costUsd !== undefined) spent = l.spentAtOpen + ev.costUsd
-                if (ev.kind === 'turnError' && ev.subtype === 'error_max_budget_usd' && this.d.budgetUsd !== undefined) spent = Math.max(spent ?? 0, this.d.budgetUsd)
+                if (ev.kind === 'turnError' && ev.subtype === 'error_max_budget_usd') spent = Math.max(spent ?? 0, budget)
                 if (spent !== b.spentUsd) {
                   b.spentUsd = spent
                   this.d.store.saveRegistry()

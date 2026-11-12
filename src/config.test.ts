@@ -90,3 +90,12 @@ describe('team mode', () => {
     expect(parseConfig({ ...REQUIRED, ADMIN_USER_IDS: ' 2, 3 ,1,,2 ' }, '/state').adminUserIds).toEqual(['1', '2', '3'])
   })
 })
+
+describe('the per-member topic cap', () => {
+  test('the per-member topic cap defaults to twenty a day and must be positive', () => {
+    expect(parseConfig({ ...REQUIRED }, '/state').teamTopicsPerDay).toBe(20)
+    expect(parseConfig({ ...REQUIRED, TEAM_TOPICS_PER_DAY: '5' }, '/state').teamTopicsPerDay).toBe(5)
+    expect(() => parseConfig({ ...REQUIRED, TEAM_TOPICS_PER_DAY: '0' }, '/state')).toThrow(ConfigError)
+    expect(() => parseConfig({ ...REQUIRED, TEAM_TOPICS_PER_DAY: '-3' }, '/state')).toThrow(ConfigError)
+  })
+})
