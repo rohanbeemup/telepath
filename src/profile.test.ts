@@ -122,6 +122,24 @@ describe('a profile is refused when', () => {
     expect(err).toBeInstanceOf(ProfileError)
     const msg = String((err as Error).message)
     for (const k of ['mcpServers', 'systemPrompt', 'cwd']) expect(msg).toContain(k)
+    // each server entry is read, not passed through: a typo in url, a missing command, an unknown type
+    for (const servers of [
+      { kb: { type: 'http', urll: 'https://mcp.example.com/mcp' } },
+      { kb: { type: 'sse' } },
+      { kb: { type: 'stdio', args: ['x'] } },
+      { kb: { type: 'carrier-pigeon', url: 'https://mcp.example.com/mcp' } },
+      { kb: 'https://mcp.example.com/mcp' },
+    ]) {
+      let e: unknown
+      try {
+        parseProfile(raw({ mcpServers: servers }), source())
+      } catch (x) {
+        e = x
+      }
+      expect(e).toBeInstanceOf(ProfileError)
+      expect(String((e as Error).message)).toContain('kb')
+    }
+    expect(() => parseProfile(raw({ mcpServers: { local: { type: 'stdio', command: 'kb-server', args: ['--port', '0'] } }, allowedTools: ['mcp__local__search'] }), source())).not.toThrow()
   })
 
   test('an allowed tool must name a declared MCP server or a kept built-in tool', () => {

@@ -516,7 +516,12 @@ describe('a profile budget', () => {
     // the new stretch runs on what is left, not the full cap
     expect(h.backend.opens[0].budgetUsd).toBeCloseTo(1)
     expect(h.backend.opens[1].budgetUsd).toBeCloseTo(0.4)
-    h.backend.last().emit({ ...result('sb'), total_cost_usd: 0.5 })
+    // a resumed stretch's results carry the earlier stretches (the SDK's transcript-saved total):
+    // the latest total is the spend, never a sum across stretches
+    h.backend.last().emit({ ...result('sb'), total_cost_usd: 0.9 })
+    await h.tick()
+    expect(h.store.registry['b'].spentUsd).toBeCloseTo(0.9)
+    h.backend.last().emit({ ...result('sb'), total_cost_usd: 1.1 })
     await h.tick()
     expect(h.store.registry['b'].spentUsd).toBeCloseTo(1.1)
     // at or over the budget: a notice, no session

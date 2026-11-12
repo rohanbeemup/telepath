@@ -93,6 +93,21 @@ export function parseProfile(raw: unknown, src: ProfileSource): Profile {
   const servers = o.mcpServers && typeof o.mcpServers === 'object' && !Array.isArray(o.mcpServers) ? (o.mcpServers as Record<string, unknown>) : {}
   const serverNames = Object.keys(servers)
   if (!serverNames.length) problems.push('mcpServers must declare at least one server: it is all a profile session can reach')
+  // Each entry is read here, not handed through: a typo would otherwise boot clean and fail in every topic.
+  for (const [name, entry] of Object.entries(servers)) {
+    const s = entry && typeof entry === 'object' && !Array.isArray(entry) ? (entry as Record<string, unknown>) : undefined
+    if (!s) {
+      problems.push(`mcpServers.${name}: must be an object with a type (http, sse or stdio)`)
+      continue
+    }
+    if (s.type === 'http' || s.type === 'sse') {
+      if (typeof s.url !== 'string' || !s.url.trim()) problems.push(`mcpServers.${name}: a ${s.type} server needs a url`)
+    } else if (s.type === 'stdio') {
+      if (typeof s.command !== 'string' || !s.command.trim()) problems.push(`mcpServers.${name}: a stdio server needs a command`)
+    } else {
+      problems.push(`mcpServers.${name}: type must be http, sse or stdio; got ${JSON.stringify(s.type)}`)
+    }
+  }
 
   const allowedTools = stringList(o.allowedTools, 'allowedTools', problems)
   for (const t of allowedTools) {

@@ -3,8 +3,6 @@
  * refusal of `cwd=` and `auto` is tested without a bot.
  */
 
-import { isAdmin, type AccessConfig } from './access'
-
 export type Member = { firstName?: string; username?: string }
 
 /**
@@ -57,9 +55,4 @@ export class TopicQuota {
     const n = this.opened(userId, day)
     if (n > 0) this.counts.set(userId, { day, n: n - 1 })
   }
-}
-
-/** Whether the daily topic cap applies to this sender: team mode, and not a configured admin. */
-export function quotaApplies(cfg: AccessConfig, fromId: string | undefined): boolean {
-  return cfg.teamMode && !isAdmin(cfg, fromId)
 }

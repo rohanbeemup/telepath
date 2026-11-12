@@ -71,20 +71,6 @@ export function allowedAction(cfg: AccessConfig, fromId: string | undefined, act
   return MEMBER_ACTIONS.has(action)
 }
 
-/** A tap on a clarifying-question option (`qa:`) or an Allow/Deny button (`p:`). */
-export type PromptTap = { fromId: string | undefined; kind: 'question' | 'approval'; sameTopic: boolean }
-
-/**
- * A prompt belongs to the topic that asked: in team mode a question is anyone's there to
- * answer (the topic is shared), an approval is an admin's there, and neither counts from
- * another topic, so a token replayed elsewhere does nothing. Outside team mode, as before.
- */
-export function promptTapAllowed(cfg: AccessConfig, tap: PromptTap): boolean {
-  if (!cfg.teamMode) return true
-  if (!tap.sameTopic) return false
-  return tap.kind === 'question' || isAdmin(cfg, tap.fromId)
-}
-
 /** What Telegram's getChatMember answers, reduced to what the gate reads. */
 export type ChatMemberLike = { status: string; is_member?: boolean }
 
@@ -181,7 +167,8 @@ export function profileLocked(action: string): boolean {
 /**
  * Whether the forum must be asked about this sender: team mode, and not an admin from the
  * config. An admin is configured, not inferred, so an API blip never locks out the people
- * who could fix it.
+ * who could fix it. The same rule exempts admins from the daily topic cap: one rule, so
+ * the two gates cannot drift apart.
  */
 export function membershipRequired(cfg: AccessConfig, fromId: string | undefined): boolean {
   return cfg.teamMode && !isAdmin(cfg, fromId)

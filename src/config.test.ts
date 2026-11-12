@@ -88,6 +88,17 @@ describe('team mode', () => {
   test('admins are the allowed user plus ADMIN_USER_IDS', () => {
     expect(parseConfig({ ...REQUIRED }, '/state').adminUserIds).toEqual(['1'])
     expect(parseConfig({ ...REQUIRED, ADMIN_USER_IDS: ' 2, 3 ,1,,2 ' }, '/state').adminUserIds).toEqual(['1', '2', '3'])
+    // each a numeric Telegram id: a space for a comma, a handle or a stray letter is a config problem that names it
+    for (const bad of ['123 456', '@rohan', '12a']) {
+      let err: unknown
+      try {
+        parseConfig({ ...REQUIRED, ADMIN_USER_IDS: bad }, '/state')
+      } catch (e) {
+        err = e
+      }
+      expect(err).toBeInstanceOf(ConfigError)
+      expect(String((err as Error).message)).toContain('ADMIN_USER_IDS')
+    }
   })
 })
 

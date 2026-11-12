@@ -24,8 +24,9 @@
   assistant. Profile sessions get no "save files here" contract, the pinned panel loses
   its model, effort and approvals buttons (typed `use`, `effort` and `/auto` say so), an
   inbound photo, file or video is answered with a notice rather than a host path the session
-  cannot read, and `maxBudgetUsd` is enforced per topic across idle stretches (the SDK's own
-  cap is per stretch). In team mode the status screen is the admins' (it lists errors, admin
+  cannot read, and `maxBudgetUsd` is enforced per topic across idle stretches (the running
+  total the SDK carries across resumes is the spend; each stretch gets what is left; the
+  SDK's own cap counts one stretch at a time). In team mode the status screen is the admins' (it lists errors, admin
   ids and every topic), a clarifying question is answered only from the topic that asked and
   an approval only by an admin there, the forum's `chat_member` updates clear the membership
   cache, and plain text in General gets no menu. Reopening a closed topic is an admin's, and a
@@ -41,7 +42,9 @@
   another's; an unknown command (`/start`) shows the menu, or nothing in a team's General. The
   membership cache shares one lookup per sender in flight and sweeps expired strangers once
   full. Under a profile, a turn that ended for its budget says so at once and the "switch
-  model" hint is left off. An `ANTHROPIC_API_KEY` in `.env` reaches the Claude
+  model" hint is left off. A profile's server entries are read at boot (type, url or
+  command) and `ADMIN_USER_IDS` must be numeric ids, each refused with its name otherwise;
+  typed `/menu` refreshes the pinned panel like ⚙️ does. An `ANTHROPIC_API_KEY` in `.env` reaches the Claude
   Code child, for installs that bill a Console organization rather than a login.
 - **Video, GIFs and video notes, both ways.** Inbound: videos, GIFs/animations and round video
   notes are now downloaded (under Telegram's 20 MB bot-download cap) and handed to the session

@@ -63,8 +63,6 @@ export type Live = {
   /** Messages sent since the running turn began; the CLI folds them into it. Shown as "queued". */
   queued: number
   wrap?: Wrap
-  /** The topic's spend when this stretch opened; a result's total is this stretch's, added on top. */
-  spentAtOpen: number
 }
 
 export function isBusy(l: Live): boolean {
@@ -210,7 +208,7 @@ export class TopicManager {
       budgetUsd,
       ...this.d.extras(topicId),
     })
-    const l: Live = { session, topicId, model: b.model, cwd: b.cwd, lastActive: this.now(), running: false, queued: 0, spentAtOpen: b.spentUsd ?? 0 }
+    const l: Live = { session, topicId, model: b.model, cwd: b.cwd, lastActive: this.now(), running: false, queued: 0 }
     this.live.set(topicId, l)
     this.d.metrics.inc('sessions_opened')
     this.d.log.info('session.open', { topic: topicId, model: b.model, effort: effortFor(this.d.catalog, b) ?? null, resume: b.sessionId ?? null })
@@ -405,13 +403,15 @@ export class TopicManager {
             }
             case 'turnEnd':
             case 'turnError': {
-              // The topic's spend, carried across stretches: a result's total, success or
-              // failure, is this stretch's; a stretch the SDK ended for its budget counts as
-              // the budget spent whatever it reported. Tracked only where a budget exists.
+              // The topic's spend: a result's total, success or failure, is the running total
+              // of the whole topic (a resumed stretch continues from the transcript's saved
+              // total, per the SDK), so the latest total is the spend, never a sum across
+              // stretches. A stretch the SDK ended for its budget counts as the budget spent
+              // whatever it reported. Tracked only where a budget exists.
               const budget = this.d.budgetUsd
               if (b && budget !== undefined) {
                 let spent = b.spentUsd
-                if (ev.costUsd !== undefined) spent = l.spentAtOpen + ev.costUsd
+                if (ev.costUsd !== undefined) spent = Math.max(spent ?? 0, ev.costUsd)
                 if (ev.kind === 'turnError' && ev.subtype === 'error_max_budget_usd') spent = Math.max(spent ?? 0, budget)
                 if (spent !== b.spentUsd) {
                   b.spentUsd = spent

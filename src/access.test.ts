@@ -1,5 +1,5 @@
 import { test, expect, describe } from 'bun:test'
-import { admitted, isAdmin, allowedAction, promptTapAllowed, profileLocked, membershipRequired, Membership, type AccessConfig } from './access'
+import { admitted, isAdmin, allowedAction, profileLocked, membershipRequired, Membership, type AccessConfig } from './access'
 
 const single: AccessConfig = { teamMode: false, allowedUserId: '1', forumChatId: '-100', adminUserIds: ['1'] }
 const team: AccessConfig = { teamMode: true, allowedUserId: '1', forumChatId: '-100', adminUserIds: ['1', '9'] }
@@ -69,24 +69,6 @@ describe('what a member may do', () => {
     }
   })
 
-  test('a prompt tap is honoured only from its own topic, and an approval only by an admin in team mode', () => {
-    // outside team mode: as before, every tap passes
-    for (const kind of ['question', 'approval'] as const) {
-      expect(promptTapAllowed(single, { fromId: '1', kind, sameTopic: true })).toBe(true)
-      expect(promptTapAllowed(single, { fromId: '1', kind, sameTopic: false })).toBe(true)
-    }
-    // a question: anyone in the topic that asked, nobody from elsewhere
-    expect(promptTapAllowed(team, { fromId: '2', kind: 'question', sameTopic: true })).toBe(true)
-    expect(promptTapAllowed(team, { fromId: '9', kind: 'question', sameTopic: true })).toBe(true)
-    expect(promptTapAllowed(team, { fromId: '2', kind: 'question', sameTopic: false })).toBe(false)
-    expect(promptTapAllowed(team, { fromId: '9', kind: 'question', sameTopic: false })).toBe(false)
-    // an approval: an admin, in the topic that asked
-    expect(promptTapAllowed(team, { fromId: '9', kind: 'approval', sameTopic: true })).toBe(true)
-    expect(promptTapAllowed(team, { fromId: '1', kind: 'approval', sameTopic: true })).toBe(true)
-    expect(promptTapAllowed(team, { fromId: '2', kind: 'approval', sameTopic: true })).toBe(false)
-    expect(promptTapAllowed(team, { fromId: '9', kind: 'approval', sameTopic: false })).toBe(false)
-    expect(promptTapAllowed(team, { fromId: undefined, kind: 'approval', sameTopic: true })).toBe(false)
-  })
 })
 
 describe('membership', () => {

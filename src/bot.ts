@@ -10,10 +10,10 @@ import { autoRetry } from '@grammyjs/auto-retry'
 import type { CanUseTool, PermissionResult } from '@anthropic-ai/claude-agent-sdk'
 import { basename } from 'path'
 import type { Config } from './config'
-import { admitted, allowedAction, membershipRequired, profileLocked, promptTapAllowed, Membership, type AccessConfig } from './access'
+import { admitted, allowedAction, membershipRequired, profileLocked, Membership, type AccessConfig } from './access'
 import { parseTyped, type Typed } from './commands'
 import type { Profile } from './profile'
-import { parseTeamNew, quotaApplies, TopicQuota, type Member } from './team'
+import { parseTeamNew, TopicQuota, type Member } from './team'
 import { describeTask } from './feed'
 import { TurnStatus, type StatusTransport } from './status'
 import { parseHandoff, resumePrompt } from './handoff'
@@ -67,7 +67,7 @@ export type BotDeps = {
 }
 
 type Pending = { resolve: (r: PermissionResult) => void; topicId: string; messageId?: number }
-type AskBtn = { topicId: string; multi: boolean; selected: Set<number>; options: { label: string; description?: string }[]; messageId: number; resolve: (v: string | string[]) => void }
+type AskBtn = { multi: boolean; selected: Set<number>; options: { label: string; description?: string }[]; messageId: number; resolve: (v: string | string[]) => void }
 const FREE_TEXT = Symbol('free-text')
 /** A profile session has no file tool, so an inbound file has nowhere to go and the host path stays out of the chat. */
 const TEXT_ONLY = '📎 This assistant reads text only: type your question. Voice notes are transcribed.'
@@ -399,7 +399,7 @@ export class TelegramBot {
       .sendMessage(this.d.cfg.forumChatId, body, { message_thread_id: Number(topicId), reply_markup: askKeyboard(token, options, multi, selected) })
       .then(sent => {
         this.status.bump(topicId)
-        return new Promise<string | string[]>(resolve => this.askBtns.set(token, { topicId, multi, selected, options, messageId: sent.message_id, resolve }))
+        return new Promise<string | string[]>(resolve => this.askBtns.set(token, { multi, selected, options, messageId: sent.message_id, resolve }))
       })
   }
 
@@ -642,7 +642,7 @@ export class TelegramBot {
    */
   private async reserveTopic(ctx: Context, where: string | undefined): Promise<boolean> {
     const uid = this.senderId(ctx)
-    if (!quotaApplies(this.access, uid)) return true
+    if (!membershipRequired(this.access, uid)) return true // the cap is a member's; admins and single users are exempt
     if (uid && this.quota.take(uid)) return true
     this.d.metrics.inc('topic_quota_refused')
     await this.say(where, `🧮 You have opened ${this.d.cfg.teamTopicsPerDay} topics today, the daily allowance. Keep asking in one of them, or come back tomorrow.`)
@@ -651,7 +651,7 @@ export class TelegramBot {
 
   private refundTopic(ctx: Context): void {
     const uid = this.senderId(ctx)
-    if (uid && quotaApplies(this.access, uid)) this.quota.refund(uid)
+    if (uid && membershipRequired(this.access, uid)) this.quota.refund(uid)
   }
 
   /** A fresh topic a member typed or spoke into: bound to the profile, within the allowance. */
@@ -1130,8 +1130,10 @@ export class TelegramBot {
         }
         case 'status':
           return void this.send(topicId, this.d.statusText())
-        case 'menu':
-          return topicId && this.d.store.registry[topicId] ? this.postPinnedControls(topicId) : this.showMainMenu(topicId)
+        case 'menu': {
+          const mb = topicId ? this.d.store.registry[topicId] : undefined
+          return topicId && mb ? this.refreshPinnedControls(topicId, mb) : this.showMainMenu(topicId)
+        }
         case 'help':
           return void this.say(topicId, this.d.cfg.teamMode ? teamHelp() : help(this.d.cfg.reposDir))
         default:
@@ -1150,7 +1152,6 @@ export class TelegramBot {
     if (ft) return void ft(raw)
 
     if (!allowedAction(this.access, fromId, typed.kind)) return refuse()
-    if (this.d.profile && profileLocked(typed.kind)) return void this.say(topicId, PROFILE_OWNS)
 
     let b = this.d.store.registry[topicId]
     if (typed.kind === 'wrap') return this.offerWrapUp(topicId)
@@ -1212,6 +1213,8 @@ export class TelegramBot {
     if (verdict === 'unknown') {
       const now = Date.now()
       if ((this.unknownNoticeUntil.get(uid) ?? 0) <= now) {
+        // Swept like the membership cache: strangers during an outage must not pile up for the process's life.
+        if (this.unknownNoticeUntil.size >= 1000) for (const [id, until] of this.unknownNoticeUntil) if (until <= now) this.unknownNoticeUntil.delete(id)
         this.unknownNoticeUntil.set(uid, now + 30_000)
         await this.say(this.topicIdOf(ctx), '⚠️ Could not verify your membership just now. Try again in a moment.')
       }
@@ -1329,9 +1332,6 @@ export class TelegramBot {
       if (qm) {
         const b = this.askBtns.get(qm[1])
         if (!b) return void ctx.answerCallbackQuery({ text: 'Expired.' }).catch(() => {})
-        if (!promptTapAllowed(this.access, { fromId: this.senderId(ctx), kind: 'question', sameTopic: this.topicIdOf(ctx) === b.topicId })) {
-          return void ctx.answerCallbackQuery({ text: 'Not yours to answer.' }).catch(() => {})
-        }
         if (qm[2] === 'done') {
           this.askBtns.delete(qm[1])
           b.resolve([...b.selected].sort((a, z) => a - z).map(i => b.options[i].label))
@@ -1356,9 +1356,6 @@ export class TelegramBot {
       if (!m) return void ctx.answerCallbackQuery().catch(() => {})
       const entry = this.pending.get(m[1])
       if (!entry) return void ctx.answerCallbackQuery({ text: 'Expired.' }).catch(() => {})
-      if (!promptTapAllowed(this.access, { fromId: this.senderId(ctx), kind: 'approval', sameTopic: this.topicIdOf(ctx) === entry.topicId })) {
-        return void ctx.answerCallbackQuery({ text: '🔒 Admins only.' }).catch(() => {})
-      }
       this.pending.delete(m[1])
       const allow = m[2] === 'a'
       this.d.metrics.inc(allow ? 'approvals_allowed' : 'approvals_denied')

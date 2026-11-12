@@ -81,6 +81,9 @@ export function parseConfig(env: Record<string, string | undefined>, stateDir: s
 
   const teamMode = ['1', 'true', 'on', 'yes'].includes((env.TEAM_MODE || '').trim().toLowerCase())
   const adminUserIds = [allowedUserId, ...(env.ADMIN_USER_IDS || '').split(',')].map(s => s.trim()).filter((s, i, all) => s !== '' && all.indexOf(s) === i)
+  for (const id of adminUserIds.slice(1)) {
+    if (!/^\d+$/.test(id)) problems.push(`ADMIN_USER_IDS: "${id}" is not a numeric Telegram user id (comma-separated ids, from @userinfobot)`)
+  }
   const profileFile = env.PROFILE_FILE ? (isAbsolute(env.PROFILE_FILE) ? env.PROFILE_FILE : join(stateDir, env.PROFILE_FILE)) : undefined
   if (teamMode && !profileFile) problems.push('TEAM_MODE requires PROFILE_FILE: a locked session profile is what makes a shared forum safe (README, Team mode)')
   const teamTopicsPerDay = num('TEAM_TOPICS_PER_DAY', 20)
