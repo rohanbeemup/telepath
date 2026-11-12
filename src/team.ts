@@ -3,6 +3,8 @@
  * refusal of `cwd=` and `auto` is tested without a bot.
  */
 
+import { isAdmin, type AccessConfig } from './access'
+
 export type Member = { firstName?: string; username?: string }
 
 /**
@@ -28,13 +30,36 @@ export class TopicQuota {
     private readonly now: () => number = () => Date.now(),
   ) {}
 
-  /** Count one opening for this member; false when the day's allowance is used up. */
-  take(userId: string): boolean {
-    const day = new Date(this.now()).toISOString().slice(0, 10)
+  private today(): string {
+    return new Date(this.now()).toISOString().slice(0, 10)
+  }
+
+  private opened(userId: string, day: string): number {
     const c = this.counts.get(userId)
-    const n = c && c.day === day ? c.n : 0
+    return c && c.day === day ? c.n : 0
+  }
+
+  /**
+   * Reserve one opening for this member; false when the day's allowance is used up.
+   * Synchronous, so two openings in flight cannot both pass the cap.
+   */
+  take(userId: string): boolean {
+    const day = this.today()
+    const n = this.opened(userId, day)
     if (n >= this.limit) return false
     this.counts.set(userId, { day, n: n + 1 })
     return true
   }
+
+  /** The opening did not happen (Telegram refused it): give the reservation back. */
+  refund(userId: string): void {
+    const day = this.today()
+    const n = this.opened(userId, day)
+    if (n > 0) this.counts.set(userId, { day, n: n - 1 })
+  }
+}
+
+/** Whether the daily topic cap applies to this sender: team mode, and not a configured admin. */
+export function quotaApplies(cfg: AccessConfig, fromId: string | undefined): boolean {
+  return cfg.teamMode && !isAdmin(cfg, fromId)
 }

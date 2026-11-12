@@ -1,5 +1,5 @@
 import { test, expect } from 'bun:test'
-import { parseTeamNew, TopicQuota } from './team'
+import { parseTeamNew, quotaApplies, TopicQuota } from './team'
 
 test('/new in team mode takes the rest of the line as the title and ignores cwd= and auto', () => {
   const at = new Date(2026, 10, 12, 9, 5)
@@ -24,4 +24,20 @@ test('a member may open only so many topics a day', () => {
   expect(q.take('a')).toBe(true)
   expect(q.take('a')).toBe(true)
   expect(q.take('a')).toBe(false)
+  // an opening is reserved first and given back when Telegram refuses it, so a failed creation is not charged
+  q.refund('a')
+  expect(q.take('a')).toBe(true)
+  expect(q.take('a')).toBe(false)
+  // a refund never goes below zero
+  q.refund('fresh')
+  q.refund('fresh')
+  expect(q.take('fresh')).toBe(true)
+  expect(q.take('fresh')).toBe(true)
+  expect(q.take('fresh')).toBe(false)
+  // the cap is a member's: admins and single-user installs are exempt
+  const cfg = { teamMode: true, allowedUserId: '1', forumChatId: '-100', adminUserIds: ['1', '9'] }
+  expect(quotaApplies(cfg, '2')).toBe(true)
+  expect(quotaApplies(cfg, '9')).toBe(false)
+  expect(quotaApplies(cfg, '1')).toBe(false)
+  expect(quotaApplies({ ...cfg, teamMode: false }, '2')).toBe(false)
 })

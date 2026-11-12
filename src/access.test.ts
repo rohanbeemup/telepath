@@ -170,5 +170,18 @@ describe('membership', () => {
     expect(calls).toBe(7)
     // forgetting an id nobody cached is fine
     m.forget('nobody')
+    // a burst from one sender shares one lookup
+    answer = () => ({ status: 'member' })
+    const before = calls
+    const burst = await Promise.all([m.check('burst'), m.check('burst'), m.check('burst')])
+    expect(burst).toEqual(['member', 'member', 'member'])
+    expect(calls).toBe(before + 1)
+    // expired entries are swept once the cache passes its size, so strangers do not pile up
+    const small = new Membership(async () => ({ status: 'left' }), { ttlMs: 600_000, graceMs: 30_000, now: () => t, maxEntries: 3 })
+    for (const id of ['s1', 's2', 's3']) await small.check(id)
+    expect(small.size).toBe(3)
+    t += 31_000 // all three have expired
+    await small.check('s4')
+    expect(small.size).toBe(1)
   })
 })

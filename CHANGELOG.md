@@ -33,10 +33,15 @@
   `maxBudgetUsd`; `AskUserQuestion` is refused in a profile (it could never prompt); the
   membership lookup is capped at five seconds, skipped for the configured admins, and a failed
   lookup is said once rather than dropped in silence; the boot warns when the bot is not an
-  admin of the forum. Each member may open `TEAM_TOPICS_PER_DAY` topics a day (default 20); a
-  topic costs no process until someone writes in it; ⚙️ Controls repaints the pinned panel in
-  place instead of re-posting and re-pinning it. A command tapped from the group's menu
-  (`/new@bot_name`) is read as its command. An `ANTHROPIC_API_KEY` in `.env` reaches the Claude
+  admin of the forum. Each member may open `TEAM_TOPICS_PER_DAY` topics a day (default 20;
+  admins exempt; a refused creation not counted); a topic costs no process until someone writes
+  in it; ⚙️ Controls refreshes the pinned panel itself instead of re-posting and re-pinning it,
+  or painting over the notice it was tapped on. A command tapped from the group's menu
+  (`/new@bot_name`) is read as its command when the handle is this bot's and ignored when it is
+  another's; an unknown command (`/start`) shows the menu, or nothing in a team's General. The
+  membership cache shares one lookup per sender in flight and sweeps expired strangers once
+  full. Under a profile, a turn that ended for its budget says so at once and the "switch
+  model" hint is left off. An `ANTHROPIC_API_KEY` in `.env` reaches the Claude
   Code child, for installs that bill a Console organization rather than a login.
 - **Video, GIFs and video notes, both ways.** Inbound: videos, GIFs/animations and round video
   notes are now downloaded (under Telegram's 20 MB bot-download cap) and handed to the session

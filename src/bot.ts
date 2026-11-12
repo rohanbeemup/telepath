@@ -13,7 +13,7 @@ import type { Config } from './config'
 import { admitted, allowedAction, membershipRequired, profileLocked, promptTapAllowed, Membership, type AccessConfig } from './access'
 import { parseTyped, type Typed } from './commands'
 import type { Profile } from './profile'
-import { parseTeamNew, TopicQuota, type Member } from './team'
+import { parseTeamNew, quotaApplies, TopicQuota, type Member } from './team'
 import { describeTask } from './feed'
 import { TurnStatus, type StatusTransport } from './status'
 import { parseHandoff, resumePrompt } from './handoff'
@@ -74,6 +74,8 @@ const TEXT_ONLY = '📎 This assistant reads text only: type your question. Voic
 const PROFILE_OWNS = '🔒 This install runs a profile: the model, effort and approvals are set there.'
 /** grammy types its optional signal with the abort-controller polyfill; the platform's AbortSignal is what runs. */
 type ApiSignal = NonNullable<Parameters<Api['getChatMember']>[2]>
+/** The slash commands this bot answers; anything else is not a command to gate. */
+const KNOWN_COMMANDS: ReadonlySet<string> = new Set(['new', 'list', 'attach', 'auto', 'status', 'menu', 'help'])
 
 export class TelegramBot {
   readonly bot: Bot
@@ -278,6 +280,12 @@ export class TelegramBot {
         await this.flushOutbox(topicId)
         if (ev.afterRateLimit) return // the friendlier rate-limit notice was already shown
         const detail = ev.errors.length ? `\n${ev.errors.map(e => e.slice(0, 300)).join('\n')}` : ''
+        if (this.d.profile) {
+          // Nothing to switch under a profile; a spent budget is said now, not at the next message.
+          const budget = ev.subtype === 'error_max_budget_usd' ? '\n💸 This topic has used its budget. Open a new topic for the next question.' : ''
+          await this.send(topicId, `⚠️ turn ended: ${ev.subtype}.${detail}${budget}`)
+          return
+        }
         await this.send(topicId, `⚠️ turn ended: ${ev.subtype}.${detail}\nTap ⚙️ to switch model or adjust this session.`, controlsKb())
         return
       }
@@ -298,7 +306,8 @@ export class TelegramBot {
         return
       case 'assistantError':
         this.d.metrics.inc('assistant_errors')
-        await this.send(topicId, `⚠️ model error: ${ev.error}. Tap ⚙️ to switch model or adjust this session.`, controlsKb())
+        if (this.d.profile) await this.send(topicId, `⚠️ model error: ${ev.error}.`)
+        else await this.send(topicId, `⚠️ model error: ${ev.error}. Tap ⚙️ to switch model or adjust this session.`, controlsKb())
         return
       case 'state':
         // The stream ended (close, eviction, crash): a turn that never got its result must
@@ -590,6 +599,24 @@ export class TelegramBot {
     await this.paint(topicId, topicControlsText(this.d.cfg.catalog, b, note, this.kbMode()), topicControlsKb(this.d.cfg.catalog, b, this.kbMode()))
   }
 
+  /**
+   * ⚙️ from a notice: refresh the pinned panel itself, never the notice the button sat
+   * on, and never a re-post (a re-post re-pins, and a pin notifies the whole forum).
+   */
+  private async refreshPinnedControls(topicId: string, b: Binding): Promise<void> {
+    if (b.controlMsgId) {
+      try {
+        await this.bot.api.editMessageText(this.d.cfg.forumChatId, b.controlMsgId, topicControlsText(this.d.cfg.catalog, b, undefined, this.kbMode()), {
+          reply_markup: topicControlsKb(this.d.cfg.catalog, b, this.kbMode()),
+        })
+        return
+      } catch (e) {
+        if (/not modified/i.test(String((e as { description?: string })?.description ?? e))) return
+      }
+    }
+    await this.postPinnedControls(topicId)
+  }
+
   private kbMode(): KbMode {
     return { team: this.d.cfg.teamMode, profile: !!this.d.profile }
   }
@@ -608,19 +635,28 @@ export class TelegramBot {
     return ctx.message?.reply_to_message?.forum_topic_created?.name
   }
 
-  /** Team mode: each member may open only so many topics a day; says so when the allowance is spent. */
-  private async topicAllowed(ctx: Context, where: string | undefined): Promise<boolean> {
-    if (!this.d.cfg.teamMode) return true
+  /**
+   * Team mode: each member may open only so many topics a day. Reserves the opening
+   * (synchronously, so two in flight cannot both pass) and says so when the allowance is
+   * spent; a creation Telegram then refuses is given back with refundTopic.
+   */
+  private async reserveTopic(ctx: Context, where: string | undefined): Promise<boolean> {
     const uid = this.senderId(ctx)
+    if (!quotaApplies(this.access, uid)) return true
     if (uid && this.quota.take(uid)) return true
     this.d.metrics.inc('topic_quota_refused')
     await this.say(where, `🧮 You have opened ${this.d.cfg.teamTopicsPerDay} topics today, the daily allowance. Keep asking in one of them, or come back tomorrow.`)
     return false
   }
 
+  private refundTopic(ctx: Context): void {
+    const uid = this.senderId(ctx)
+    if (uid && quotaApplies(this.access, uid)) this.quota.refund(uid)
+  }
+
   /** A fresh topic a member typed or spoke into: bound to the profile, within the allowance. */
   private async bindFreshProfileTopic(ctx: Context, topicId: string): Promise<boolean> {
-    if (!(await this.topicAllowed(ctx, topicId))) return false
+    if (!(await this.reserveTopic(ctx, topicId))) return false
     this.bindProfileTopic(topicId, this.topicTitleOf(ctx) ?? this.defaultTitle(ctx))
     await this.postPinnedControls(topicId)
     return true
@@ -640,11 +676,12 @@ export class TelegramBot {
 
   /** /new, 🆕 and ⚡ with a profile: one path, within the allowance. */
   private async createProfileTopic(ctx: Context, title: string, intoTopic: string | undefined): Promise<void> {
-    if (!(await this.topicAllowed(ctx, intoTopic))) return
+    if (!(await this.reserveTopic(ctx, intoTopic))) return
     let topicId: string
     try {
       topicId = await this.createTopic(title)
     } catch (e) {
+      this.refundTopic(ctx) // only an opening that happened counts
       return void this.paint(intoTopic, `Couldn't create topic (is the bot admin with Manage Topics?): ${e}`, backKb())
     }
     this.bindProfileTopic(topicId, title)
@@ -838,8 +875,11 @@ export class TelegramBot {
       await ack('Cancelled')
       return this.showMainMenu(topicId)
     }
-    // Repainted in place: a re-post would re-pin, and a pin notifies the whole forum.
-    if (data === 'm:ctl') return void (await ack(), topicId && store.registry[topicId] ? this.repaintControls(topicId, store.registry[topicId]) : this.showMainMenu(topicId))
+    if (data === 'm:ctl') {
+      await ack()
+      const cb = topicId ? store.registry[topicId] : undefined
+      return topicId && cb ? this.refreshPinnedControls(topicId, cb) : this.showMainMenu(topicId)
+    }
 
     // Settings
     const sdm = /^m:sdm:(\w+)$/.exec(data)
@@ -971,8 +1011,8 @@ export class TelegramBot {
     if (data === 'm:tclose') {
       this.topics.userTookOver(topicId)
       this.topics.closeLive(topicId, 'closed & kept by user')
-      if (b) {
-        b.closed = true // no session opens here until ♻️ Reopen
+      if (b && this.d.cfg.teamMode) {
+        b.closed = true // no session opens here until an admin's ♻️ Reopen; a single user's kept topic resumes on its next message
         store.saveRegistry()
       }
       void this.status.drop(topicId)
@@ -1056,6 +1096,11 @@ export class TelegramBot {
     }
 
     if (typed.kind === 'slash') {
+      // An unknown command (/start, a typo) is nobody's to refuse: the menu, or silence in a team's General.
+      if (!KNOWN_COMMANDS.has(typed.cmd)) {
+        if (!topicId && this.d.cfg.teamMode) return
+        return this.showMainMenu(topicId)
+      }
       if (!allowedAction(this.access, fromId, `/${typed.cmd}`)) return refuse()
       if (this.d.profile && profileLocked(`/${typed.cmd}`)) return void this.say(topicId, PROFILE_OWNS)
       switch (typed.cmd) {

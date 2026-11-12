@@ -160,8 +160,8 @@ export function profileOptions(p: Profile, open: OpenOptions): Options {
     maxBudgetUsd: open.budgetUsd ?? p.maxBudgetUsd,
     resume: open.resume,
     env: open.env,
-    canUseTool: open.canUseTool,
-    // The allowlist, enforced: not the approval gate (see the module comment).
+    // No canUseTool: under dontAsk the CLI never prompts, so the Telegram Allow/Deny gate
+    // would be dead configuration. The allowlist, enforced, is the hook below.
     hooks: { PreToolUse: [{ hooks: [async (input: any) => profileToolDecision(allowed, String(input?.tool_name ?? '')) as any] }] },
   }
 }
