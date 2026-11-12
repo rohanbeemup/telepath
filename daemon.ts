@@ -23,7 +23,7 @@ import { ConfigError, mergeEnvFile, parseConfig, parseEnvFile, type Config } fro
 import { Files } from './src/files'
 import { ErrorRing, Logger, Metrics } from './src/log'
 import { bundledClaudePath, checkClaudeVersion, MIN_CLAUDE_VERSION, readClaudeVersion } from './src/preflight'
-import { parseProfile, ProfileError, type Profile } from './src/profile'
+import { parseProfile, ProfileError, teamProfileProblems, type Profile } from './src/profile'
 import { handOffToRotator, rotatorActive, rotatorEnabled, waitForRotation } from './src/rotator'
 import { drainSeedRequests } from './src/seed'
 import { SdkBackend } from './src/session'
@@ -112,6 +112,13 @@ if (cfg.profileFile) {
   } catch (e) {
     process.stderr.write((e instanceof ProfileError ? e.message : `session profile ${cfg.profileFile}: ${e instanceof Error ? e.message : String(e)}`) + '\n')
     process.exit(2)
+  }
+  if (cfg.teamMode) {
+    const problems = teamProfileProblems(profile)
+    if (problems.length) {
+      process.stderr.write(`session profile ${cfg.profileFile}, in team mode:\n  - ${problems.join('\n  - ')}\n`)
+      process.exit(2)
+    }
   }
 }
 
@@ -221,6 +228,17 @@ process.on('SIGTERM', () => shutdown('SIGTERM'))
 // ── boot ────────────────────────────────────────────────────────────────────
 try {
   const me = await bot.bot.api.getMe()
+  if (cfg.teamMode) {
+    // chat_member updates reach admins only; without them a removed member keeps access until the TTL.
+    try {
+      const self = await bot.bot.api.getChatMember(cfg.forumChatId, me.id)
+      if (self.status !== 'administrator' && self.status !== 'creator') {
+        log.warn('preflight.bot_not_admin', { status: self.status, hint: 'make the bot an admin of the forum (Manage Topics), so membership changes reach it' })
+      }
+    } catch (e) {
+      log.warn('preflight.bot_membership_unknown', { error: e })
+    }
+  }
   await bot.bot.api.setMyCommands([
     ...(cfg.teamMode ? [{ command: 'new', description: 'Start a new topic: /new <title>' }] : []),
     { command: 'menu', description: 'Open the menu — everything is buttons' },

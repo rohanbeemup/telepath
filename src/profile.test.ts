@@ -1,6 +1,6 @@
 import { test, expect, describe } from 'bun:test'
 import { join } from 'path'
-import { parseProfile, profileOptions, ProfileError, type ProfileSource } from './profile'
+import { parseProfile, profileOptions, teamProfileProblems, ProfileError, type ProfileSource } from './profile'
 import type { OpenOptions } from './topics'
 
 const DIR = '/srv/bot'
@@ -130,5 +130,14 @@ describe('a profile is refused when', () => {
     expect(() => parseProfile(raw({ tools: ['WebFetch'], allowedTools: ['WebFetch'] }), source())).not.toThrow()
     // the converse: a kept built-in that is not allowed is a tool the hook would deny on every call
     expect(() => parseProfile(raw({ tools: ['Read'] }), source())).toThrow(ProfileError)
+    // a question tool can never prompt in a profile session, so it is refused outright
+    expect(() => parseProfile(raw({ tools: ['AskUserQuestion'], allowedTools: ['mcp__kb__search', 'AskUserQuestion'] }), source())).toThrow(ProfileError)
+  })
+
+  test('team mode refuses a profile without a budget', () => {
+    expect(teamProfileProblems(parseProfile(raw(), source()))).toEqual([])
+    const problems = teamProfileProblems(parseProfile(raw({ maxBudgetUsd: undefined }), source()))
+    expect(problems.length).toBe(1)
+    expect(problems[0]).toContain('maxBudgetUsd')
   })
 })

@@ -86,6 +86,9 @@ export function parseProfile(raw: unknown, src: ProfileSource): Profile {
   if (!systemPrompt.trim()) problems.push('systemPrompt (or systemPromptFile) must hold a non-empty prompt: a profile session has no prompt of Claude Code\'s own')
 
   const tools = stringList(o.tools, 'tools', problems)
+  if (tools.includes('AskUserQuestion')) {
+    problems.push('tools: AskUserQuestion cannot work in a profile session: it never prompts (dontAsk), and an allowed tool is approved before a question could be shown, so the model would get an empty answer')
+  }
 
   const servers = o.mcpServers && typeof o.mcpServers === 'object' && !Array.isArray(o.mcpServers) ? (o.mcpServers as Record<string, unknown>) : {}
   const serverNames = Object.keys(servers)
@@ -161,4 +164,11 @@ export function profileOptions(p: Profile, open: OpenOptions): Options {
     // The allowlist, enforced: not the approval gate (see the module comment).
     hooks: { PreToolUse: [{ hooks: [async (input: any) => profileToolDecision(allowed, String(input?.tool_name ?? '')) as any] }] },
   }
+}
+
+/** What team mode needs of a profile beyond what any profile needs; the daemon refuses to boot on these. */
+export function teamProfileProblems(p: Profile): string[] {
+  const problems: string[] = []
+  if (p.maxBudgetUsd === undefined) problems.push('maxBudgetUsd is required in team mode: a shared forum needs a per-topic cap, or any member can spend without limit')
+  return problems
 }

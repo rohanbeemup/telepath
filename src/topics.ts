@@ -189,6 +189,7 @@ export class TopicManager {
     if (existing) return existing
     const b = this.d.store.registry[topicId]
     if (!b) return undefined
+    if (b.closed) return undefined // an admin closed it; ♻️ Reopen clears this
     // A stretch gets what is left of the topic's budget, so it cannot overshoot the cap by
     // a whole fresh budget; a topic with nothing left opens no session.
     const budgetUsd = this.d.budgetUsd === undefined ? undefined : this.d.budgetUsd - (b.spentUsd ?? 0)
@@ -221,6 +222,11 @@ export class TopicManager {
   async sendToTopic(topicId: string, text: string, opts: { takeover?: boolean } = {}): Promise<boolean> {
     if (opts.takeover !== false) this.userTookOver(topicId)
     const bound = this.d.store.registry[topicId]
+    if (bound?.closed) {
+      this.d.metrics.inc('closed_refusals')
+      await this.d.say(topicId, '🔒 An admin closed this topic. An admin can reopen it from the pinned panel.')
+      return true
+    }
     if (bound && this.d.budgetUsd !== undefined && (bound.spentUsd ?? 0) >= this.d.budgetUsd) {
       this.d.metrics.inc('budget_refusals')
       await this.d.say(topicId, `💸 This topic has used its budget ($${this.d.budgetUsd.toFixed(2)}). Open a new topic for the next question; an admin can delete this one.`)
@@ -395,8 +401,8 @@ export class TopicManager {
             case 'turnError': {
               // The topic's spend, carried across stretches: a result's total, success or
               // failure, is this stretch's; a stretch the SDK ended for its budget counts as
-              // the budget spent whatever it reported.
-              if (b) {
+              // the budget spent whatever it reported. Tracked only where a budget exists.
+              if (b && this.d.budgetUsd !== undefined) {
                 let spent = b.spentUsd
                 if (ev.costUsd !== undefined) spent = l.spentAtOpen + ev.costUsd
                 if (ev.kind === 'turnError' && ev.subtype === 'error_max_budget_usd' && this.d.budgetUsd !== undefined) spent = Math.max(spent ?? 0, this.d.budgetUsd)

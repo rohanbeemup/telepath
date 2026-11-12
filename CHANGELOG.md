@@ -28,8 +28,12 @@
   cap is per stretch). In team mode the status screen is the admins' (it lists errors, admin
   ids and every topic), a clarifying question is answered only from the topic that asked and
   an approval only by an admin there, the forum's `chat_member` updates clear the membership
-  cache, and plain text in General gets no menu. An `ANTHROPIC_API_KEY` in `.env` reaches the
-  Claude Code child, for installs that bill a Console organization rather than a login.
+  cache, and plain text in General gets no menu. Reopening a closed topic is an admin's, and a
+  closed topic opens no session for anyone until then; team mode requires the profile to carry
+  `maxBudgetUsd`; `AskUserQuestion` is refused in a profile (it could never prompt); the
+  membership lookup is capped at five seconds; the boot warns when the bot is not an admin of
+  the forum. An `ANTHROPIC_API_KEY` in `.env` reaches the Claude Code child, for installs that
+  bill a Console organization rather than a login.
 - **Video, GIFs and video notes, both ways.** Inbound: videos, GIFs/animations and round video
   notes are now downloaded (under Telegram's 20 MB bot-download cap) and handed to the session
   with the saved path and a frame-extraction hint, where before only photos and documents were

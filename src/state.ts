@@ -22,6 +22,8 @@ export type Binding = {
   handoff?: { at: number; text: string }
   /** USD this topic's sessions have reported, across idle stretches; read against a profile's budget. */
   spentUsd?: number
+  /** 💾 Close & keep: no session opens here until ♻️ Reopen clears it (admins only in team mode). */
+  closed?: boolean
 }
 export type Registry = Record<string, Binding>
 export type Prefs = { defaultModel: string; defaultCwd: string; defaultEffort?: Effort }

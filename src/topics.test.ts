@@ -550,5 +550,26 @@ describe('a profile budget', () => {
     await free.tick()
     await free.tm.sendToTopic('f', 'y')
     expect(free.said.find(([topic, text]) => topic === 'f' && /budget/i.test(text))).toBeFalsy()
+    expect(free.store.registry['f'].spentUsd).toBeUndefined() // nothing tracked, nothing written
+  })
+})
+
+describe('an admin-closed topic', () => {
+  test('a topic an admin closed opens no session until an admin reopens it', async () => {
+    const h = harness()
+    h.bind('z')
+    await h.tm.sendToTopic('z', 'before the close')
+    expect(h.backend.opens.length).toBe(1)
+    // 💾 Close & keep: the binding is marked closed and the live session ends
+    h.store.registry['z'].closed = true
+    h.tm.closeLive('z', 'closed & kept by an admin')
+    expect(await h.tm.sendToTopic('z', 'a member types anyway')).toBe(true)
+    expect(h.backend.opens.length).toBe(1)
+    expect(h.tm.ensureLive('z')).toBeUndefined()
+    expect(h.said.find(([topic, text]) => topic === 'z' && /closed/i.test(text))).toBeTruthy()
+    // ♻️ Reopen (admins only, in the bot): the flag is cleared and the topic lives again
+    h.store.registry['z'].closed = false
+    await h.tm.sendToTopic('z', 'after the reopen')
+    expect(h.backend.opens.length).toBe(2)
   })
 })

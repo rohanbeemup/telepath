@@ -1,5 +1,5 @@
 import { test, expect, describe } from 'bun:test'
-import { admitted, isAdmin, allowedAction, promptTapAllowed, Membership, type AccessConfig } from './access'
+import { admitted, isAdmin, allowedAction, promptTapAllowed, profileLocked, Membership, type AccessConfig } from './access'
 
 const single: AccessConfig = { teamMode: false, allowedUserId: '1', forumChatId: '-100', adminUserIds: ['1'] }
 const team: AccessConfig = { teamMode: true, allowedUserId: '1', forumChatId: '-100', adminUserIds: ['1', '9'] }
@@ -27,10 +27,10 @@ describe('who is admitted', () => {
 const MEMBER_OK = [
   'chat', '/new', '/help', '/menu', 'feed', 'wrap',
   'm:menu', 'm:new', 'm:newhere', 'm:help', 'm:ctl', 'm:cancel', 'm:noop',
-  'm:tf', 'm:twrap', 'm:tw:now', 'm:tw:turn', 'm:tres', 'm:treopen',
+  'm:tf', 'm:twrap', 'm:tw:now', 'm:tw:turn', 'm:tres',
 ]
 const ADMIN_ONLY = [
-  'm:tclose', 'm:tdelete', 'm:tdelyes', 'm:twipe', 'm:twipeyes',
+  'm:tclose', 'm:treopen', 'm:tdelete', 'm:tdelyes', 'm:twipe', 'm:twipeyes',
   'm:tm:opus', 'm:te:high', 'm:ta',
   'm:settings', 'm:sdm:opus', 'm:sde:high', 'm:sdf', 'm:sdfp:1', 'm:sdfi:0',
   'm:list', 'm:sess:abcd1234', 'm:spage:1', 'm:resume', 'm:quick', 'm:fpage:1', 'm:nf:0',
@@ -59,6 +59,13 @@ describe('what a member may do', () => {
     for (const a of [...MEMBER_OK, ...ADMIN_ONLY]) expect([a, allowedAction(single, '1', a)]).toEqual([a, true])
     // whatever the admin list holds: the two lists are independent concerns
     for (const a of ADMIN_ONLY) expect([a, allowedAction({ ...single, adminUserIds: ['7'] }, '1', a)]).toEqual([a, true])
+  })
+
+  test('with a profile, the model, effort and approval actions are locked whoever taps them', () => {
+    for (const a of ['m:tm:opus', 'm:tm:haiku', 'm:te:high', 'm:te:auto', 'm:ta', '/auto', 'use', 'effort']) expect([a, profileLocked(a)]).toEqual([a, true])
+    for (const a of ['chat', '/new', '/help', '/menu', '/status', 'feed', 'wrap', 'm:menu', 'm:new', 'm:quick', 'm:tf', 'm:tclose', 'm:tdelete', 'm:twipe', 'm:settings', 'm:sdm:opus', '/attach', 'm:future']) {
+      expect([a, profileLocked(a)]).toEqual([a, false])
+    }
   })
 
   test('a prompt tap is honoured only from its own topic, and an approval only by an admin in team mode', () => {

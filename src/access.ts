@@ -41,8 +41,10 @@ const MEMBER_ACTIONS: ReadonlySet<string> = new Set([
   'm:tw:now',
   'm:tw:turn',
   'm:tres',
-  'm:treopen',
 ])
+
+/** The actions a profile owns: model, effort and approvals. Consulted beside allowedAction. */
+const PROFILE_LOCKED: ReadonlySet<string> = new Set(['m:ta', '/auto', 'use', 'effort'])
 
 /** The chat gate: the forum, and outside team mode the one allowed user. Membership is Membership's. */
 export function admitted(cfg: AccessConfig, s: Sender): boolean {
@@ -129,4 +131,13 @@ export class Membership {
   forget(userId: string): void {
     this.cache.delete(userId)
   }
+}
+
+/**
+ * Whether a profile owns this action. One rule at the two gates (taps and typed text),
+ * so an entry point that changes a binding's model, effort or approvals cannot escape by
+ * being new: it is either on this list or it is not a model, effort or approval change.
+ */
+export function profileLocked(action: string): boolean {
+  return PROFILE_LOCKED.has(action) || action.startsWith('m:tm:') || action.startsWith('m:te:')
 }
