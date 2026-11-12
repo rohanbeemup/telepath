@@ -24,6 +24,8 @@ export type OpenOptions = {
   effort?: Effort
   resume?: string
   env: Record<string, string | undefined>
+  /** What is left of the topic's budget for this stretch; unset when there is no budget. */
+  budgetUsd?: number
 } & SessionExtras
 
 export interface LiveSession {
@@ -61,6 +63,8 @@ export type Live = {
   /** Messages sent since the running turn began; the CLI folds them into it. Shown as "queued". */
   queued: number
   wrap?: Wrap
+  /** The topic's spend when this stretch opened; a result's total is this stretch's, added on top. */
+  spentAtOpen: number
 }
 
 export function isBusy(l: Live): boolean {
@@ -98,6 +102,11 @@ export type TopicDeps = {
    * sessions with no file tools (a profile): told where to save files, they cannot.
    */
   primeContract?: boolean
+  /**
+   * A per-topic budget in USD, across idle stretches. The SDK's own `maxBudgetUsd` is per
+   * `query()`, so on its own every idle eviction and resume hands a topic a fresh budget.
+   */
+  budgetUsd?: number
 }
 
 export const CONTINUE_AFTER_LIMIT =
@@ -180,6 +189,10 @@ export class TopicManager {
     if (existing) return existing
     const b = this.d.store.registry[topicId]
     if (!b) return undefined
+    // A stretch gets what is left of the topic's budget, so it cannot overshoot the cap by
+    // a whole fresh budget; a topic with nothing left opens no session.
+    const budgetUsd = this.d.budgetUsd === undefined ? undefined : this.d.budgetUsd - (b.spentUsd ?? 0)
+    if (budgetUsd !== undefined && budgetUsd <= 0) return undefined
     this.enforceCap()
     // Child sessions must not see the bot token: a prompt-injected session could read
     // it from the environment and exfiltrate it. Nothing else of ours leaks either.
@@ -193,9 +206,10 @@ export class TopicManager {
       effort: effortFor(this.d.catalog, b),
       resume: b.sessionId,
       env,
+      budgetUsd,
       ...this.d.extras(topicId),
     })
-    const l: Live = { session, topicId, model: b.model, cwd: b.cwd, lastActive: this.now(), running: false, queued: 0 }
+    const l: Live = { session, topicId, model: b.model, cwd: b.cwd, lastActive: this.now(), running: false, queued: 0, spentAtOpen: b.spentUsd ?? 0 }
     this.live.set(topicId, l)
     this.d.metrics.inc('sessions_opened')
     this.d.log.info('session.open', { topic: topicId, model: b.model, effort: effortFor(this.d.catalog, b) ?? null, resume: b.sessionId ?? null })
@@ -206,6 +220,12 @@ export class TopicManager {
   /** A user (or a nudge) message into the topic's session. */
   async sendToTopic(topicId: string, text: string, opts: { takeover?: boolean } = {}): Promise<boolean> {
     if (opts.takeover !== false) this.userTookOver(topicId)
+    const bound = this.d.store.registry[topicId]
+    if (bound && this.d.budgetUsd !== undefined && (bound.spentUsd ?? 0) >= this.d.budgetUsd) {
+      this.d.metrics.inc('budget_refusals')
+      await this.d.say(topicId, `💸 This topic has used its budget ($${this.d.budgetUsd.toFixed(2)}). Open a new topic for the next question; an admin can delete this one.`)
+      return true
+    }
     let l = this.ensureLive(topicId)
     if (!l) return false
     l.lastActive = this.now()
@@ -373,6 +393,18 @@ export class TopicManager {
             }
             case 'turnEnd':
             case 'turnError': {
+              // The topic's spend, carried across stretches: a result's total, success or
+              // failure, is this stretch's; a stretch the SDK ended for its budget counts as
+              // the budget spent whatever it reported.
+              if (b) {
+                let spent = b.spentUsd
+                if (ev.costUsd !== undefined) spent = l.spentAtOpen + ev.costUsd
+                if (ev.kind === 'turnError' && ev.subtype === 'error_max_budget_usd' && this.d.budgetUsd !== undefined) spent = Math.max(spent ?? 0, this.d.budgetUsd)
+                if (spent !== b.spentUsd) {
+                  b.spentUsd = spent
+                  this.d.store.saveRegistry()
+                }
+              }
               // One result ends the turn and every message folded into it.
               l.running = false
               l.queued = 0

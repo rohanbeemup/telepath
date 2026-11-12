@@ -17,7 +17,8 @@ export const PAGE_SIZE = 10
 export type KbMode = { team?: boolean; profile?: boolean }
 
 export function mainMenuKb(mode: KbMode = {}): InlineKeyboard {
-  if (mode.team) return new InlineKeyboard().text('🆕 New topic', 'm:new').row().text('📊 Status', 'm:status').text('❓ Help', 'm:help')
+  // Status is the admins' (typed /status): it lists the box's errors, the admin ids and every topic.
+  if (mode.team) return new InlineKeyboard().text('🆕 New topic', 'm:new').row().text('❓ Help', 'm:help')
   return new InlineKeyboard()
     .text('🆕 New session', 'm:new').text('⚡ Quick new', 'm:quick').row()
     .text('📋 My sessions', 'm:list').text('▶️ Resume last', 'm:resume').row()

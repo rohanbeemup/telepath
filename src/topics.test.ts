@@ -61,7 +61,7 @@ function fakeRotator(over: Partial<Rotator> = {}): Rotator & { handedOff: unknow
 
 type FakeRotator = ReturnType<typeof fakeRotator>
 
-function harness(over: { maxLive?: number; idleMinutes?: number; rotator?: FakeRotator; now?: () => number; resumeBufferMs?: number; primeContract?: boolean } = {}) {
+function harness(over: { maxLive?: number; idleMinutes?: number; rotator?: FakeRotator; now?: () => number; resumeBufferMs?: number; primeContract?: boolean; budgetUsd?: number } = {}) {
   const store = new Store('/nowhere', {}, { defaultModel: 'claude-opus-5', defaultCwd: '/w' }, { defaultModel: 'claude-opus-5', defaultCwd: '/w' })
   // never touch disk in these tests
   store.saveRegistry = () => {}
@@ -88,6 +88,7 @@ function harness(over: { maxLive?: number; idleMinutes?: number; rotator?: FakeR
     now: over.now,
     resumeBufferMs: over.resumeBufferMs,
     primeContract: over.primeContract,
+    budgetUsd: over.budgetUsd,
   })
   const bind = (topicId: string, b: Partial<{ model: string; effort: 'low' | 'high' | 'max'; sessionId: string; auto: boolean }> = {}) => {
     store.registry[topicId] = { cwd: '/w', model: b.model ?? 'claude-opus-5', effort: b.effort, sessionId: b.sessionId, title: 't' + topicId, lastActive: 0, auto: b.auto }
@@ -494,5 +495,60 @@ describe('profile sessions', () => {
     d.bind('q')
     await d.tm.sendToTopic('q', 'hello')
     expect(d.backend.last().sent[0]).toContain(outboxContract('/out/q'))
+  })
+})
+
+describe('a profile budget', () => {
+  test("a topic that has spent the profile's budget stays closed across idle stretches", async () => {
+    let t = 0
+    const h = harness({ idleMinutes: 1, now: () => t, budgetUsd: 1 })
+    h.bind('b')
+    await h.tm.sendToTopic('b', 'first question')
+    h.backend.last().emit({ ...result('sb'), total_cost_usd: 0.6 })
+    await h.tick()
+    expect(h.store.registry['b'].spentUsd).toBeCloseTo(0.6)
+    // idle eviction, then a resume: the SDK's own cap would start over here
+    t = 5 * 60_000
+    h.tm.evictIdle()
+    expect(h.tm.isLive('b')).toBe(false)
+    await h.tm.sendToTopic('b', 'second question')
+    expect(h.backend.opens.length).toBe(2)
+    // the new stretch runs on what is left, not the full cap
+    expect(h.backend.opens[0].budgetUsd).toBeCloseTo(1)
+    expect(h.backend.opens[1].budgetUsd).toBeCloseTo(0.4)
+    h.backend.last().emit({ ...result('sb'), total_cost_usd: 0.5 })
+    await h.tick()
+    expect(h.store.registry['b'].spentUsd).toBeCloseTo(1.1)
+    // at or over the budget: a notice, no session
+    await h.tm.sendToTopic('b', 'third question')
+    expect(h.backend.opens.length).toBe(2)
+    expect(h.said.find(([topic, text]) => topic === 'b' && /budget/i.test(text))).toBeTruthy()
+    // a stretch the SDK ended for its budget counts as spent, whatever it reported
+    h.bind('c')
+    await h.tm.sendToTopic('c', 'hello')
+    h.backend.last().emit({ type: 'result', subtype: 'error_max_budget_usd', is_error: true, session_id: 'sc' })
+    await h.tick()
+    expect(h.store.registry['c'].spentUsd).toBeGreaterThanOrEqual(1)
+    const opensBefore = h.backend.opens.length
+    await h.tm.sendToTopic('c', 'again')
+    expect(h.backend.opens.length).toBe(opensBefore)
+    // a stretch that failed for another reason still spent what it reports
+    h.bind('d')
+    await h.tm.sendToTopic('d', 'hello')
+    h.backend.last().emit({ type: 'result', subtype: 'error_max_turns', is_error: true, session_id: 'sd', total_cost_usd: 0.7 })
+    await h.tick()
+    expect(h.store.registry['d'].spentUsd).toBeCloseTo(0.7)
+    // a failed turn leaves the stretch live; the next stretch, after an eviction, gets what is left
+    h.tm.closeLive('d', 'evicted in test')
+    await h.tm.sendToTopic('d', 'more')
+    expect(h.backend.opens[h.backend.opens.length - 1].budgetUsd).toBeCloseTo(0.3)
+    // a topic without a budget is never refused
+    const free = harness()
+    free.bind('f')
+    await free.tm.sendToTopic('f', 'x')
+    free.backend.last().emit({ ...result('sf'), total_cost_usd: 99 })
+    await free.tick()
+    await free.tm.sendToTopic('f', 'y')
+    expect(free.said.find(([topic, text]) => topic === 'f' && /budget/i.test(text))).toBeFalsy()
   })
 })

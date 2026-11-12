@@ -94,11 +94,20 @@ describe('a profile session', () => {
     const fallback = profileOptions(parseProfile(raw({ model: undefined, effort: undefined }), source()), open())
     expect(fallback.model).toBe('claude-sonnet-5')
     expect(fallback.effort).toBe('max')
+    // a stretch opened with what is left of the topic's budget runs on that, not the full cap
+    expect(profileOptions(parseProfile(raw(), source()), open({ budgetUsd: 0.4 })).maxBudgetUsd).toBe(0.4)
   })
 
-  test("a profile's prompt may come from a file beside it", () => {
+  test("a profile's prompt file and cwd resolve against the profile's directory, absolute paths as given", () => {
     const p = parseProfile(raw({ systemPrompt: undefined, systemPromptFile: 'prompt.md' }), source({ [join(DIR, 'prompt.md')]: 'From the file.' }))
     expect(p.systemPrompt).toBe('From the file.')
+    const abs = join('/etc', 'telepath', 'prompt.md')
+    const q = parseProfile(raw({ systemPrompt: undefined, systemPromptFile: abs }), source({ [abs]: 'Absolute.' }))
+    expect(q.systemPrompt).toBe('Absolute.')
+    // a relative cwd is the profile directory's, checked and handed on resolved
+    const r = parseProfile(raw({ cwd: 'work' }), source())
+    expect(r.cwd).toBe(WORK)
+    expect(profileOptions(r, open()).cwd).toBe(WORK)
   })
 })
 

@@ -106,8 +106,8 @@ describe('telegram limits', () => {
 })
 
 describe('team mode', () => {
-  test('the team main menu offers only a new topic, status and help', () => {
-    expect(callbackData(mainMenuKb({ team: true }))).toEqual(['m:new', 'm:status', 'm:help'])
+  test('the team main menu offers only a new topic and help', () => {
+    expect(callbackData(mainMenuKb({ team: true }))).toEqual(['m:new', 'm:help'])
     expect(labels(mainMenuKb({ team: true }))[0]).toBe('🆕 New topic')
     expect(callbackData(mainMenuKb())).toEqual(['m:new', 'm:quick', 'm:list', 'm:resume', 'm:settings', 'm:status', 'm:help'])
   })

@@ -20,6 +20,8 @@ export type Binding = {
   controlMsgId?: number
   /** The last hand-off the model wrote after a wrap-up; Resume sends it back. */
   handoff?: { at: number; text: string }
+  /** USD this topic's sessions have reported, across idle stretches; read against a profile's budget. */
+  spentUsd?: number
 }
 export type Registry = Record<string, Binding>
 export type Prefs = { defaultModel: string; defaultCwd: string; defaultEffort?: Effort }

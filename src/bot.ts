@@ -10,7 +10,7 @@ import { autoRetry } from '@grammyjs/auto-retry'
 import type { CanUseTool, PermissionResult } from '@anthropic-ai/claude-agent-sdk'
 import { basename } from 'path'
 import type { Config } from './config'
-import { admitted, allowedAction, Membership, type AccessConfig } from './access'
+import { admitted, allowedAction, promptTapAllowed, Membership, type AccessConfig } from './access'
 import { parseTyped } from './commands'
 import type { Profile } from './profile'
 import { parseTeamNew, type Member } from './team'
@@ -67,8 +67,10 @@ export type BotDeps = {
 }
 
 type Pending = { resolve: (r: PermissionResult) => void; topicId: string; messageId?: number }
-type AskBtn = { multi: boolean; selected: Set<number>; options: { label: string; description?: string }[]; messageId: number; resolve: (v: string | string[]) => void }
+type AskBtn = { topicId: string; multi: boolean; selected: Set<number>; options: { label: string; description?: string }[]; messageId: number; resolve: (v: string | string[]) => void }
 const FREE_TEXT = Symbol('free-text')
+/** A profile session has no file tool, so an inbound file has nowhere to go and the host path stays out of the chat. */
+const TEXT_ONLY = '📎 This assistant reads text only: type your question. Voice notes are transcribed.'
 
 export class TelegramBot {
   readonly bot: Bot
@@ -379,7 +381,7 @@ export class TelegramBot {
       .sendMessage(this.d.cfg.forumChatId, body, { message_thread_id: Number(topicId), reply_markup: askKeyboard(token, options, multi, selected) })
       .then(sent => {
         this.status.bump(topicId)
-        return new Promise<string | string[]>(resolve => this.askBtns.set(token, { multi, selected, options, messageId: sent.message_id, resolve }))
+        return new Promise<string | string[]>(resolve => this.askBtns.set(token, { topicId, multi, selected, options, messageId: sent.message_id, resolve }))
       })
   }
 
@@ -493,6 +495,7 @@ export class TelegramBot {
   private async handleIncomingMedia(ctx: Context, kind: InboundKind): Promise<void> {
     const topicId = this.topicIdOf(ctx)
     if (!topicId) return void this.say(undefined, 'Send media inside a session topic.')
+    if (this.d.profile) return void this.say(topicId, TEXT_ONLY)
     this.status.bump(topicId)
     const m = ctx.message
     const src = kind === 'video' ? m?.video : kind === 'animation' ? m?.animation : m?.video_note
@@ -579,6 +582,11 @@ export class TelegramBot {
 
   private memberOf(ctx: Context): Member {
     return { firstName: ctx.from?.first_name, username: ctx.from?.username }
+  }
+
+  /** A topic opened without a title: the member and the time. */
+  private defaultTitle(ctx: Context): string {
+    return parseTeamNew('', this.memberOf(ctx), new Date()).title
   }
 
   /** The topic's own name, carried by messages that reply to its creation. */
@@ -748,13 +756,13 @@ export class TelegramBot {
     if (data === 'm:new' || data === 'm:newhere') {
       if (this.d.profile) {
         // No wizard: the profile decides everything but the title.
-        const title = parseTeamNew('', this.memberOf(ctx), new Date()).title
         if (data === 'm:newhere' && topicId) {
-          if (!store.registry[topicId]) this.bindProfileTopic(topicId, title)
+          if (!store.registry[topicId]) this.bindProfileTopic(topicId, this.defaultTitle(ctx))
           await ack()
           return this.postPinnedControls(topicId)
         }
         await ack('Creating…')
+        const title = this.defaultTitle(ctx)
         const tid = await this.newProfileTopic(title, topicId)
         if (tid) await this.paint(topicId, `✅ Created "${title}".`, openLinkKb(this.d.cfg.forumChatId, tid))
         return
@@ -876,6 +884,7 @@ export class TelegramBot {
     const tm = /^m:tm:(\w+)$/.exec(data)
     if (tm && isEnabledModelKey(catalog, tm[1])) {
       if (!b) return void ack('No session here')
+      if (this.d.profile) return void ack('Set in the profile')
       b.model = catalog.ids[tm[1]]
       store.saveRegistry()
       this.topics.closeLive(topicId, 'model switch')
@@ -885,6 +894,7 @@ export class TelegramBot {
     const te = /^m:te:(\w+)$/.exec(data)
     if (te && (te[1] === 'auto' || parseEffort(te[1]))) {
       if (!b) return void ack('No session here')
+      if (this.d.profile) return void ack('Set in the profile')
       b.effort = parseEffort(te[1])
       store.saveRegistry()
       this.topics.closeLive(topicId, 'effort switch')
@@ -919,6 +929,7 @@ export class TelegramBot {
     }
     if (data === 'm:ta') {
       if (!b) return void ack('No session here')
+      if (this.d.profile) return void ack('Set in the profile')
       b.auto = !b.auto
       store.saveRegistry()
       await ack(b.auto ? '⚡ Auto ON' : '🔐 Approvals ON')
@@ -996,13 +1007,14 @@ export class TelegramBot {
     const typed = parseTyped(raw, this.d.cfg.catalog)
     this.d.log.debug('in.text', { topic: topicId ?? 'general', kind: typed.kind, len: raw.length })
 
-    const action = typed.kind === 'slash' ? `/${typed.cmd}` : typed.kind
-    if (!allowedAction(this.access, ctx.from ? String(ctx.from.id) : undefined, action)) {
+    const fromId = ctx.from ? String(ctx.from.id) : undefined
+    const refuse = (): Promise<void> => {
       this.d.metrics.inc('admin_only_refused')
-      return void this.say(topicId, '🔒 Admins only.')
+      return this.say(topicId, '🔒 Admins only.')
     }
 
     if (typed.kind === 'slash') {
+      if (!allowedAction(this.access, fromId, `/${typed.cmd}`)) return refuse()
       switch (typed.cmd) {
         case 'new': {
           if (this.d.profile) {
@@ -1026,6 +1038,7 @@ export class TelegramBot {
         }
         case 'auto': {
           if (!topicId) return void this.say(undefined, '/auto must be used inside a session topic.')
+          if (this.d.profile) return void this.say(topicId, '🔒 This install runs a profile: tools never ask, and what they may do is set there.')
           const b = this.d.store.registry[topicId]
           if (!b) return void this.say(topicId, 'No session bound to this topic yet — send a message first, or /new.')
           const arg = typed.args.trim().toLowerCase()
@@ -1044,16 +1057,23 @@ export class TelegramBot {
       }
     }
 
-    if (!topicId) return this.showMainMenu(undefined) // plain text in General → the menu
+    if (!topicId) {
+      if (this.d.cfg.teamMode) return // General is the members' own; the bot answers commands there, not chatter
+      return this.showMainMenu(undefined) // plain text in General → the menu
+    }
 
-    // A pending clarifying question takes any typed reply as its free-text answer.
+    // A pending clarifying question takes any typed reply as its free-text answer, before
+    // the admin gate: the answer is the session's, whatever words it happens to be.
     const ft = this.askFreeText.get(topicId)
     if (ft) return void ft(raw)
+
+    if (!allowedAction(this.access, fromId, typed.kind)) return refuse()
 
     const b = this.d.store.registry[topicId]
     if (typed.kind === 'wrap') return this.offerWrapUp(topicId)
     if (typed.kind === 'use' || typed.kind === 'effort' || typed.kind === 'feed') {
       if (!b) return void this.say(topicId, 'No session bound here.')
+      if (this.d.profile && typed.kind !== 'feed') return void this.say(topicId, '🔒 This install runs a profile: the model, effort and approvals are set there.')
       if (typed.kind === 'use') {
         const label = MODEL_MENU[typed.model].short
         if (!isEnabledModelKey(this.d.cfg.catalog, typed.model)) {
@@ -1081,7 +1101,7 @@ export class TelegramBot {
     if (!b) {
       if (!this.d.cfg.teamMode) return void this.send(topicId, 'This topic has no Claude session yet.', new InlineKeyboard().text('🆕 Start a session here', 'm:newhere'))
       // Team mode: a fresh topic is a conversation from its first message.
-      this.bindProfileTopic(topicId, this.topicTitleOf(ctx) ?? parseTeamNew('', this.memberOf(ctx), new Date()).title)
+      this.bindProfileTopic(topicId, this.topicTitleOf(ctx) ?? this.defaultTitle(ctx))
       await this.postPinnedControls(topicId)
     }
     this.status.bump(topicId) // the user's own message now sits below the status
@@ -1117,6 +1137,7 @@ export class TelegramBot {
       await this.inOrder(ctx, async () => {
         const topicId = this.topicIdOf(ctx)
         if (!topicId) return await this.say(undefined, 'Send images inside a session topic.')
+        if (this.d.profile) return await this.say(topicId, TEXT_ONLY)
         this.status.bump(topicId)
         try {
           const best = ctx.message.photo[ctx.message.photo.length - 1]
@@ -1152,6 +1173,7 @@ export class TelegramBot {
       await this.inOrder(ctx, async () => {
         const topicId = this.topicIdOf(ctx)
         if (!topicId) return await this.say(undefined, 'Send files inside a session topic.')
+        if (this.d.profile) return await this.say(topicId, TEXT_ONLY)
         this.status.bump(topicId)
         const doc = ctx.message.document
         try {
@@ -1212,6 +1234,9 @@ export class TelegramBot {
       if (qm) {
         const b = this.askBtns.get(qm[1])
         if (!b) return void ctx.answerCallbackQuery({ text: 'Expired.' }).catch(() => {})
+        if (!promptTapAllowed(this.access, { fromId: ctx.from ? String(ctx.from.id) : undefined, kind: 'question', sameTopic: this.topicIdOf(ctx) === b.topicId })) {
+          return void ctx.answerCallbackQuery({ text: 'Not yours to answer.' }).catch(() => {})
+        }
         if (qm[2] === 'done') {
           this.askBtns.delete(qm[1])
           b.resolve([...b.selected].sort((a, z) => a - z).map(i => b.options[i].label))
@@ -1236,6 +1261,9 @@ export class TelegramBot {
       if (!m) return void ctx.answerCallbackQuery().catch(() => {})
       const entry = this.pending.get(m[1])
       if (!entry) return void ctx.answerCallbackQuery({ text: 'Expired.' }).catch(() => {})
+      if (!promptTapAllowed(this.access, { fromId: ctx.from ? String(ctx.from.id) : undefined, kind: 'approval', sameTopic: this.topicIdOf(ctx) === entry.topicId })) {
+        return void ctx.answerCallbackQuery({ text: '🔒 Admins only.' }).catch(() => {})
+      }
       this.pending.delete(m[1])
       const allow = m[2] === 'a'
       this.d.metrics.inc(allow ? 'approvals_allowed' : 'approvals_denied')
@@ -1243,6 +1271,13 @@ export class TelegramBot {
       entry.resolve(allow ? { behavior: 'allow' } : { behavior: 'deny', message: 'denied by user' })
       await ctx.answerCallbackQuery({ text: allow ? '✅ Allowed' : '❌ Denied' }).catch(() => {})
       if (entry.messageId) await bot.api.editMessageReplyMarkup(this.d.cfg.forumChatId, entry.messageId, { reply_markup: undefined }).catch(() => {})
+    })
+
+    // The forum reports a membership change: that user's cached answer is dropped, so a
+    // member removed just now is refused on their next message rather than at the TTL.
+    bot.on('chat_member', ctx => {
+      if (String(ctx.chat.id) !== this.d.cfg.forumChatId) return
+      this.membership.forget(String(ctx.chatMember.new_chat_member.user.id))
     })
 
     bot.catch(err => {

@@ -13,7 +13,7 @@
  * an exclusive list. The profile's hook answers `{}` for a listed tool and `deny` for any
  * other name, whatever the CLI auto-approves now or later.
  */
-import { join } from 'path'
+import { resolve } from 'path'
 import type { Options } from '@anthropic-ai/claude-agent-sdk'
 import { EFFORT_LEVELS, parseEffort, type Effort } from './models'
 import type { OpenOptions } from './topics'
@@ -76,7 +76,7 @@ export function parseProfile(raw: unknown, src: ProfileSource): Profile {
   let systemPrompt = ''
   if (typeof o.systemPrompt === 'string') systemPrompt = o.systemPrompt
   else if (typeof o.systemPromptFile === 'string') {
-    const path = join(src.dir, o.systemPromptFile)
+    const path = resolve(src.dir, o.systemPromptFile) // an absolute path stays as it is
     try {
       systemPrompt = src.readFile(path)
     } catch (e) {
@@ -104,7 +104,8 @@ export function parseProfile(raw: unknown, src: ProfileSource): Profile {
     if (!allowedTools.includes(t)) problems.push(`tools: ${t} is kept but not in allowedTools, so the session would see a tool it may never call; allow it or drop it`)
   }
 
-  const cwd = typeof o.cwd === 'string' ? o.cwd.trim() : ''
+  // Resolved against the profile's directory, so the child is handed the same path that was checked.
+  const cwd = typeof o.cwd === 'string' && o.cwd.trim() ? resolve(src.dir, o.cwd.trim()) : ''
   if (!cwd) problems.push('cwd must name the directory every session runs in')
   else if (!src.isDirectory(cwd)) problems.push(`cwd: ${cwd} is not a directory`)
 
@@ -152,7 +153,8 @@ export function profileOptions(p: Profile, open: OpenOptions): Options {
     model: p.model ?? open.model,
     effort: p.effort ?? open.effort,
     maxTurns: p.maxTurns,
-    maxBudgetUsd: p.maxBudgetUsd,
+    // The stretch's remaining budget when the topic manager passes one; the cap otherwise.
+    maxBudgetUsd: open.budgetUsd ?? p.maxBudgetUsd,
     resume: open.resume,
     env: open.env,
     canUseTool: open.canUseTool,

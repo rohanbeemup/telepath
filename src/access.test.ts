@@ -1,5 +1,5 @@
 import { test, expect, describe } from 'bun:test'
-import { admitted, isAdmin, allowedAction, Membership, type AccessConfig } from './access'
+import { admitted, isAdmin, allowedAction, promptTapAllowed, Membership, type AccessConfig } from './access'
 
 const single: AccessConfig = { teamMode: false, allowedUserId: '1', forumChatId: '-100', adminUserIds: ['1'] }
 const team: AccessConfig = { teamMode: true, allowedUserId: '1', forumChatId: '-100', adminUserIds: ['1', '9'] }
@@ -25,8 +25,8 @@ describe('who is admitted', () => {
 })
 
 const MEMBER_OK = [
-  'chat', '/new', '/help', '/menu', '/status', 'feed', 'wrap',
-  'm:menu', 'm:new', 'm:newhere', 'm:help', 'm:status', 'm:ctl', 'm:cancel', 'm:noop',
+  'chat', '/new', '/help', '/menu', 'feed', 'wrap',
+  'm:menu', 'm:new', 'm:newhere', 'm:help', 'm:ctl', 'm:cancel', 'm:noop',
   'm:tf', 'm:twrap', 'm:tw:now', 'm:tw:turn', 'm:tres', 'm:treopen',
 ]
 const ADMIN_ONLY = [
@@ -34,6 +34,7 @@ const ADMIN_ONLY = [
   'm:tm:opus', 'm:te:high', 'm:ta',
   'm:settings', 'm:sdm:opus', 'm:sde:high', 'm:sdf', 'm:sdfp:1', 'm:sdfi:0',
   'm:list', 'm:sess:abcd1234', 'm:spage:1', 'm:resume', 'm:quick', 'm:fpage:1', 'm:nf:0',
+  'm:status', '/status',
   '/attach', '/auto', '/list', 'use', 'effort',
   'm:future', '/anything', 'something-new',
 ]
@@ -59,6 +60,25 @@ describe('what a member may do', () => {
     // whatever the admin list holds: the two lists are independent concerns
     for (const a of ADMIN_ONLY) expect([a, allowedAction({ ...single, adminUserIds: ['7'] }, '1', a)]).toEqual([a, true])
   })
+
+  test('a prompt tap is honoured only from its own topic, and an approval only by an admin in team mode', () => {
+    // outside team mode: as before, every tap passes
+    for (const kind of ['question', 'approval'] as const) {
+      expect(promptTapAllowed(single, { fromId: '1', kind, sameTopic: true })).toBe(true)
+      expect(promptTapAllowed(single, { fromId: '1', kind, sameTopic: false })).toBe(true)
+    }
+    // a question: anyone in the topic that asked, nobody from elsewhere
+    expect(promptTapAllowed(team, { fromId: '2', kind: 'question', sameTopic: true })).toBe(true)
+    expect(promptTapAllowed(team, { fromId: '9', kind: 'question', sameTopic: true })).toBe(true)
+    expect(promptTapAllowed(team, { fromId: '2', kind: 'question', sameTopic: false })).toBe(false)
+    expect(promptTapAllowed(team, { fromId: '9', kind: 'question', sameTopic: false })).toBe(false)
+    // an approval: an admin, in the topic that asked
+    expect(promptTapAllowed(team, { fromId: '9', kind: 'approval', sameTopic: true })).toBe(true)
+    expect(promptTapAllowed(team, { fromId: '1', kind: 'approval', sameTopic: true })).toBe(true)
+    expect(promptTapAllowed(team, { fromId: '2', kind: 'approval', sameTopic: true })).toBe(false)
+    expect(promptTapAllowed(team, { fromId: '9', kind: 'approval', sameTopic: false })).toBe(false)
+    expect(promptTapAllowed(team, { fromId: undefined, kind: 'approval', sameTopic: true })).toBe(false)
+  })
 })
 
 describe('membership', () => {
@@ -78,7 +98,7 @@ describe('membership', () => {
     for (const id of ['5', '6', '7', '8', '9']) expect([id, await m.isMember(id)]).toEqual([id, false])
   })
 
-  test('a membership answer is cached and a failed lookup is not', async () => {
+  test('a membership answer is cached, a failure only briefly, and a change the forum reports clears it', async () => {
     let t = 0
     let calls = 0
     let answer: () => { status: string } = () => ({ status: 'member' })
@@ -107,15 +127,27 @@ describe('membership', () => {
     answer = () => ({ status: 'member' })
     expect(await m.isMember('2')).toBe(true)
     expect(calls).toBe(4)
-    // a thrown lookup is a no, and is asked again next time
+    // a thrown lookup is a no, kept for the grace only, then asked again
     answer = () => {
       throw new Error('502')
     }
     t = 800_000
     expect(await m.isMember('3')).toBe(false)
     expect(calls).toBe(5)
+    t = 800_000 + 29_000
+    expect(await m.isMember('3')).toBe(false)
+    expect(calls).toBe(5) // not one call per message
+    t = 800_000 + 31_000
     answer = () => ({ status: 'member' })
     expect(await m.isMember('3')).toBe(true)
     expect(calls).toBe(6)
+    // the forum reports a change: the cached yes is dropped and the next check asks again
+    t = 800_000 + 32_000
+    answer = () => ({ status: 'kicked' })
+    m.forget('3')
+    expect(await m.isMember('3')).toBe(false)
+    expect(calls).toBe(7)
+    // forgetting an id nobody cached is fine
+    m.forget('nobody')
   })
 })

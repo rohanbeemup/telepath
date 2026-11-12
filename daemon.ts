@@ -17,6 +17,7 @@
  */
 import { chmodSync, readFileSync, statSync, writeFileSync } from 'fs'
 import { dirname, join } from 'path'
+import { API_CONSTANTS } from 'grammy'
 import { TelegramBot } from './src/bot'
 import { ConfigError, mergeEnvFile, parseConfig, parseEnvFile, type Config } from './src/config'
 import { Files } from './src/files'
@@ -153,6 +154,7 @@ const topics = new TopicManager({
   log,
   metrics,
   primeContract: !profile,
+  budgetUsd: profile?.maxBudgetUsd,
 })
 bot.attachTopics(topics)
 
@@ -245,4 +247,5 @@ try {
   process.exit(3)
 }
 writeHealth()
-bot.bot.start({ onStart: i => log.info('telegram.polling', { as: i.username }) })
+// chat_member updates are off by default; team mode's membership cache is cleared by them.
+bot.bot.start({ allowed_updates: [...API_CONSTANTS.DEFAULT_UPDATE_TYPES, 'chat_member'], onStart: i => log.info('telegram.polling', { as: i.username }) })

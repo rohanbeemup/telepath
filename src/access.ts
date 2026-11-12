@@ -1,8 +1,8 @@
 /**
  * Who may talk to the bot, and who may change a topic: pure decisions over the config.
- * Single-user mode admits one Telegram user in one forum. Team mode admits every member
- * of that forum (Telegram delivers a group's messages from its members only) and keeps
- * the destructive and configuring actions for the admins.
+ * Single-user mode admits one Telegram user in one forum. Team mode admits the forum's
+ * members, as the forum itself reports them, and keeps the destructive and configuring
+ * actions for the admins.
  */
 
 export type AccessConfig = {
@@ -19,21 +19,20 @@ export type Sender = { fromId: string | undefined; chatId: string | undefined }
  * What a member may do in team mode. An allowlist, not a denylist: an action this file
  * has never heard of is an admin's until someone decides otherwise. Everything in it is
  * reversible and local to a topic: chatting, opening a topic, wrapping up a turn, the
- * activity feed, and the screens that change nothing.
+ * activity feed, and the screens that change nothing. Not the status screen: it lists
+ * the box's recent errors, the admin ids and every topic's title.
  */
 const MEMBER_ACTIONS: ReadonlySet<string> = new Set([
   'chat',
   '/new',
   '/help',
   '/menu',
-  '/status',
   'feed',
   'wrap',
   'm:menu',
   'm:new',
   'm:newhere',
   'm:help',
-  'm:status',
   'm:ctl',
   'm:cancel',
   'm:noop',
@@ -45,6 +44,7 @@ const MEMBER_ACTIONS: ReadonlySet<string> = new Set([
   'm:treopen',
 ])
 
+/** The chat gate: the forum, and outside team mode the one allowed user. Membership is Membership's. */
 export function admitted(cfg: AccessConfig, s: Sender): boolean {
   if (!s.chatId || s.chatId !== cfg.forumChatId) return false
   return cfg.teamMode || (!!s.fromId && s.fromId === cfg.allowedUserId)
@@ -65,6 +65,20 @@ export function allowedAction(cfg: AccessConfig, fromId: string | undefined, act
   return MEMBER_ACTIONS.has(action)
 }
 
+/** A tap on a clarifying-question option (`qa:`) or an Allow/Deny button (`p:`). */
+export type PromptTap = { fromId: string | undefined; kind: 'question' | 'approval'; sameTopic: boolean }
+
+/**
+ * A prompt belongs to the topic that asked: in team mode a question is anyone's there to
+ * answer (the topic is shared), an approval is an admin's there, and neither counts from
+ * another topic, so a token replayed elsewhere does nothing. Outside team mode, as before.
+ */
+export function promptTapAllowed(cfg: AccessConfig, tap: PromptTap): boolean {
+  if (!cfg.teamMode) return true
+  if (!tap.sameTopic) return false
+  return tap.kind === 'question' || isAdmin(cfg, tap.fromId)
+}
+
 /** What Telegram's getChatMember answers, reduced to what the gate reads. */
 export type ChatMemberLike = { status: string; is_member?: boolean }
 
@@ -78,8 +92,10 @@ export function isMemberStatus(m: ChatMemberLike): boolean {
 /**
  * Team mode's second gate: the forum itself says who is a member. A public supergroup can
  * let anyone post without joining, so the chat id alone proves nothing. A yes is kept for
- * the TTL; a no only for a short grace, so a member added a moment ago is not locked out
- * for long; a failed lookup is a no that is asked again on the next message.
+ * the TTL; a no, and a failed lookup, only for a short grace: a member added a moment ago
+ * is not locked out for long, and a non-member or an API error costs one call per grace
+ * rather than one per message. `forget` drops an entry when the forum reports a change,
+ * so a member removed just now is refused on their next message, not at the TTL.
  */
 export class Membership {
   private readonly cache = new Map<string, { until: number; member: boolean }>()
@@ -99,14 +115,18 @@ export class Membership {
   async isMember(userId: string): Promise<boolean> {
     const hit = this.cache.get(userId)
     if (hit && this.now() < hit.until) return hit.member
-    let member: boolean
+    let member = false
     try {
       member = isMemberStatus(await this.lookup(userId))
     } catch {
-      this.cache.delete(userId)
-      return false
+      member = false
     }
     this.cache.set(userId, { until: this.now() + (member ? this.ttlMs : this.graceMs), member })
     return member
+  }
+
+  /** The forum reported a change for this id: the next check asks again. */
+  forget(userId: string): void {
+    this.cache.delete(userId)
   }
 }
