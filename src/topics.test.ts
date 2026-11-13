@@ -211,6 +211,22 @@ describe('TopicManager', () => {
     expect(h.tm.isLive('parked')).toBe(false)
     // and its scheduled resume went with it: the notice said a message resumes it, not a timer
     expect(h.tm.scheduledResume('parked')).toBe(false)
+    // for one user the timer stays: the rate-limit notice promised a continuation at the reset, so the cap's
+    // pause leaves it to reopen the topic then, as main did (twenty-ninth review: the cancellation was unconditional)
+    const solo = harness({ maxLive: 2, now: () => t })
+    solo.bind('sp')
+    await solo.tm.sendToTopic('sp', 'x')
+    solo.backend.last().emit({ type: 'rate_limit_event', rate_limit_info: { status: 'rejected', resetsAt: Math.floor((t + 3_600_000) / 1000) } })
+    await solo.tick()
+    expect(solo.tm.scheduledResume('sp')).toBe(true)
+    t += 10
+    solo.bind('s2')
+    await solo.tm.sendToTopic('s2', 'x')
+    t += 10
+    solo.bind('s3')
+    await solo.tm.sendToTopic('s3', 'x')
+    expect(solo.tm.isLive('sp')).toBe(false)
+    expect(solo.tm.scheduledResume('sp')).toBe(true)
     // where the forum is one person's, the longest-idle session is paused for the new topic, running or not, as before
     const own = harness({ maxLive: 1 })
     own.bind('p')

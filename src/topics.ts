@@ -236,9 +236,12 @@ export class TopicManager {
       // rule, so a member alternating between their own topics cannot post there at will.
       if (!this.d.replyMuted(oldest.topicId, 'paused')) void this.d.say(oldest.topicId, this.stuck(oldest) ? STUCK_PAUSED : `💤 Paused to free a slot (max ${this.d.maxLiveSessions} live sessions). Send a message here to resume — your context is kept.`)
       this.d.metrics.inc('sessions_evicted_cap')
-      // A parked session's scheduled resume goes with it: the notice said a message resumes it, and
-      // the timer would otherwise reopen it on its own and pause the newcomer (twenty-fourth review).
-      this.userTookOver(oldest.topicId)
+      // In a shared forum a parked session's scheduled resume goes with it: the notice said a message
+      // resumes it, and the timer would otherwise reopen it on its own and pause the newcomer
+      // (twenty-fourth review). For one user the timer stays, as on main: the rate-limit notice
+      // promised a continuation at the reset, and it is their own topics it reopens among
+      // (twenty-ninth review).
+      if (this.d.shared) this.userTookOver(oldest.topicId)
       this.closeLive(oldest.topicId, 'evicted (session cap)')
     }
   }

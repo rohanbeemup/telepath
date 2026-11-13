@@ -263,6 +263,13 @@ try {
         process.stderr.write(`team mode: the bot is "${self.status}" in ${cfg.forumChatId}, not an admin. Make it an admin of the forum with Manage Topics: topics are created with it, and chat_member updates, which end a removed member's cached access early, reach admin bots only.\n`)
         process.exit(2)
       }
+      // An admin without the right the check is named for creates no topic: every /new would fail at
+      // runtime, ten times a minute per member (twenty-ninth review). The payload carries the right,
+      // and may leave it out when it is not granted, so absent is a no (Codex hook).
+      if (self.status === 'administrator' && !self.can_manage_topics) {
+        process.stderr.write(`team mode: the bot is an admin of ${cfg.forumChatId} without Manage Topics, so it can create no topic. Give it that right in the forum's admin settings.\n`)
+        process.exit(2)
+      }
     } catch (e) {
       log.warn('preflight.bot_membership_unknown', { error: e })
     }

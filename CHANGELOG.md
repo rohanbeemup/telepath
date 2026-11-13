@@ -17,11 +17,13 @@
   approvals, settings, the session list, `/attach`, `/status` and wrapping up at the next step stay with `ALLOWED_USER_ID`
   plus `ADMIN_USER_IDS` (numeric ids; an allowlist of member actions in `src/access.ts`, so
   an action it has not heard of is an admin's); a closed topic opens no session for anyone
-  until an admin reopens it. General is the members' own: commands are answered there,
+  until an admin reopens it; the delete and wipe confirmations are their own message in team
+  mode, with a Cancel that removes it, so the pinned panel stays everyone's. General is the members' own: commands are answered there,
   chatter and media are not. The published menu is `new`, `menu` and `help`; `/status` in team mode
   is a reduced screen (counts, uptime, the profile's name) safe wherever it is shown.
-  Team mode requires the bot to be an admin of the forum (the boot refuses otherwise: topics are
-  created with Manage Topics, and the forum's membership changes reach admin bots only) and
+  Team mode requires the bot to be an admin of the forum with Manage Topics (the boot refuses
+  otherwise: topics are created with that right, and the forum's membership changes reach admin
+  bots only) and
   `PROFILE_FILE`, a locked session profile (`src/profile.ts`,
   `profile.example.json`): one set of MCP servers and nothing from the machine's own MCP
   config, an explicit tool allowlist (exact names, no patterns) with everything else denied

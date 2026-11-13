@@ -1011,8 +1011,9 @@ export class TelegramBot {
     const store = this.d.store
 
     if (data === 'm:menu') {
+      // A muted tap is told so in its toast (no message is sent), or it looks dead (twenty-ninth review).
+      if (this.muted(topicId, 'menu', this.senderId(ctx))) return void ack('Try again in a moment')
       await ack()
-      if (this.muted(topicId, 'menu', this.senderId(ctx))) return
       return this.showMainMenu(topicId)
     }
     if (data === 'm:noop') return void ack()
@@ -1062,8 +1063,8 @@ export class TelegramBot {
     if (data === 'm:settings') return void (await ack(), this.showSettings(topicId))
     if (data === 'm:status') return void (await ack(), this.paint(topicId, this.d.statusText(), backKb()))
     if (data === 'm:help') {
+      if (this.muted(topicId, 'help', this.senderId(ctx))) return void ack('Try again in a moment')
       await ack()
-      if (this.muted(topicId, 'help', this.senderId(ctx))) return
       return void this.send(topicId, this.helpText(), backKb())
     }
     if (data === 'm:cancel') {
@@ -1073,7 +1074,7 @@ export class TelegramBot {
       return this.showMainMenu(topicId)
     }
     if (data === 'm:ctl') {
-      if (this.muted(topicId, 'menu', this.senderId(ctx))) return void ack()
+      if (this.muted(topicId, 'menu', this.senderId(ctx))) return void ack('Try again in a moment')
       const shown = await this.controlsOrMenu(topicId)
       // A panel already current edits to nothing: say where it is, or the tap looks dead.
       return void ack(shown === 'unchanged' ? '⚙️ The controls are pinned at the top of this topic' : undefined)
@@ -1260,13 +1261,19 @@ export class TelegramBot {
     }
     if (data === 'm:tdelete') {
       await ack()
-      return this.paint(
+      return this.confirm(
         topicId,
         this.d.profile
           ? '🗑 Delete this topic and forget its session here?\nThe transcript stays on disk. To remove everything, use 🧹 instead.'
           : '🗑 Delete this topic and forget its session here?\nThe transcript stays on disk and can be reopened later from 📋 My sessions or /attach. To remove everything, use 🧹 instead.',
-        new InlineKeyboard().text('🗑 Yes, delete', 'm:tdelyes').text('↩️ Cancel', 'm:ctl'),
+        new InlineKeyboard().text('🗑 Yes, delete', 'm:tdelyes').text('↩️ Cancel', this.d.cfg.teamMode ? 'm:tdelno' : 'm:ctl'),
       )
+    }
+    if (data === 'm:tdelno') {
+      // The team-mode confirmation is its own message: cancelling removes it, so no live "Yes" stays behind.
+      await ack('Cancelled')
+      await ctx.deleteMessage().catch(() => {})
+      return
     }
     if (data === 'm:tdelyes') {
       this.removeTopic(topicId, false)
@@ -1276,10 +1283,10 @@ export class TelegramBot {
     }
     if (data === 'm:twipe') {
       await ack()
-      return this.paint(
+      return this.confirm(
         topicId,
         '🧹 Remove EVERYTHING for this topic — the session, its transcript (no longer resumable), delivered files, and the topic itself?\nThis cannot be undone.',
-        new InlineKeyboard().text('🧹 Yes, wipe it all', 'm:twipeyes').text('↩️ Cancel', 'm:ctl'),
+        new InlineKeyboard().text('🧹 Yes, wipe it all', 'm:twipeyes').text('↩️ Cancel', this.d.cfg.teamMode ? 'm:tdelno' : 'm:ctl'),
       )
     }
     if (data === 'm:twipeyes') {
@@ -1289,6 +1296,19 @@ export class TelegramBot {
       return
     }
     await ack()
+  }
+
+  /**
+   * A delete or wipe confirmation: painted over the tapped panel for one user, as on main; in team
+   * mode the pinned panel is everyone's, so the confirmation is its own message and its Cancel
+   * removes it (twenty-ninth review: an abandoned one left every member a pinned "Yes, delete").
+   */
+  private async confirm(topicId: string | undefined, text: string, kb: InlineKeyboard): Promise<void> {
+    if (this.d.cfg.teamMode) {
+      await this.send(topicId, text, kb)
+      return
+    }
+    return this.paint(topicId, text, kb)
   }
 
   /** Topics deleted this process: a note still being heard there must not bind it again while Telegram removes it. */
