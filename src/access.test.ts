@@ -267,10 +267,27 @@ describe('membership', () => {
     t += 31_000 // all three have expired
     await small.check('s4')
     expect(small.size).toBe(1)
-    // when nothing has expired, the oldest entry goes instead: a forum larger than the cache cannot grow it
+    // when nothing has expired, the entry expiring soonest goes instead: a forum larger than the cache cannot grow it
     const full = new Membership(async () => ({ status: 'member' }), { ttlMs: 600_000, graceMs: 30_000, now: () => t, maxEntries: 3 })
     for (const id of ['f1', 'f2', 'f3', 'f4', 'f5']) await full.check(id)
     expect(full.size).toBe(3)
+    // soonest, not first in: a member who was first to write outlives the strangers' graces
+    let mixedCalls = 0
+    const mixed = new Membership(
+      async id => {
+        mixedCalls++
+        return { status: id === 'M' ? 'member' : 'left' }
+      },
+      { ttlMs: 600_000, graceMs: 30_000, now: () => t, maxEntries: 3 },
+    )
+    await mixed.check('M')
+    await mixed.check('x1')
+    await mixed.check('x2')
+    t += 10_000 // nothing has expired
+    await mixed.check('x3') // full: a stranger's grace goes, not the member's TTL
+    expect(mixed.size).toBe(3)
+    expect(await mixed.check('M')).toBe('member')
+    expect(mixedCalls).toBe(4) // M was still cached
   })
 })
 

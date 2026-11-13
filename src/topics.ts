@@ -110,6 +110,8 @@ export type TopicDeps = {
    * binding from before the profile would hand a full session's transcript to the topic.
    */
   profileSessions?: boolean
+  /** Honour a binding's `closed` flag (team mode): no session opens there until an admin reopens it. Elsewhere the flag is written but ignored, so a single user's kept topic resumes on its next message. */
+  honourClosed?: boolean
 }
 
 export const CONTINUE_AFTER_LIMIT =
@@ -176,10 +178,16 @@ export class TopicManager {
     for (const id of [...this.live.keys()]) this.closeLive(id, why)
   }
 
+  /**
+   * Frees a slot for a new session by pausing the longest-idle one. A session mid-turn is
+   * never paused for another topic: in a shared forum that would let one member kill a
+   * colleague's turn by opening topics (security review). openRefusal() refuses the open
+   * while every slot is running, so a pause is always found here when one is needed.
+   */
   private enforceCap(): void {
     while (this.live.size >= this.d.maxLiveSessions) {
       let oldest: Live | undefined
-      for (const l of this.live.values()) if (!oldest || l.lastActive < oldest.lastActive) oldest = l
+      for (const l of this.live.values()) if (!isBusy(l) && (!oldest || l.lastActive < oldest.lastActive)) oldest = l
       if (!oldest) break
       void this.d.say(oldest.topicId, `💤 Paused to free a slot (max ${this.d.maxLiveSessions} live sessions). Send a message here to resume — your context is kept.`)
       this.d.metrics.inc('sessions_evicted_cap')
@@ -187,16 +195,30 @@ export class TopicManager {
     }
   }
 
+  /**
+   * Why no session may open for this topic now, or undefined when one may: closed by an
+   * admin (honoured in team mode), its budget spent, or every slot running a turn. Read by
+   * sendToTopic for its notice and by ensureLive, so the two cannot disagree.
+   */
+  openRefusal(topicId: string): 'closed' | 'budget' | 'busy' | undefined {
+    const b = this.d.store.registry[topicId]
+    if (!b) return undefined
+    if (b.closed && this.d.honourClosed) return 'closed' // ♻️ Reopen clears it
+    const left = this.remainingBudget(b)
+    if (left !== undefined && left <= 0) return 'budget'
+    if (!this.live.has(topicId) && this.live.size >= this.d.maxLiveSessions && ![...this.live.values()].some(l => !isBusy(l))) return 'busy'
+    return undefined
+  }
+
   ensureLive(topicId: string): Live | undefined {
     const existing = this.live.get(topicId)
     if (existing) return existing
     const b = this.d.store.registry[topicId]
     if (!b) return undefined
-    if (b.closed) return undefined // an admin closed it; ♻️ Reopen clears this
+    if (this.openRefusal(topicId)) return undefined
     // A stretch gets what is left of the topic's budget, so it cannot overshoot the cap by
-    // a whole fresh budget; a topic with nothing left opens no session.
+    // a whole fresh budget.
     const budgetUsd = this.remainingBudget(b)
-    if (budgetUsd !== undefined && budgetUsd <= 0) return undefined
     this.enforceCap()
     // Child sessions must not see the bot token: a prompt-injected session could read
     // it from the environment and exfiltrate it. Nothing else of ours leaks either.
@@ -244,18 +266,11 @@ export class TopicManager {
    */
   async sendToTopic(topicId: string, text: string, opts: { takeover?: boolean; quiet?: boolean } = {}): Promise<boolean> {
     if (opts.takeover !== false) this.userTookOver(topicId)
-    const bound = this.d.store.registry[topicId]
-    if (bound?.closed) {
+    const why = this.openRefusal(topicId)
+    if (why) {
       if (opts.quiet) return false
-      this.d.metrics.inc('closed_refusals')
-      await this.d.say(topicId, '🔒 An admin closed this topic. An admin can reopen it from the pinned panel.')
-      return true
-    }
-    const left = bound ? this.remainingBudget(bound) : undefined
-    if (bound && left !== undefined && left <= 0) {
-      if (opts.quiet) return false
-      this.d.metrics.inc('budget_refusals')
-      await this.d.say(topicId, `💸 This topic has used its budget ($${(this.d.budgetUsd ?? 0).toFixed(2)}). Open a new topic for the next question; an admin can delete this one.`)
+      this.d.metrics.inc(`${why}_refusals`)
+      await this.d.say(topicId, this.refusalNotice(why))
       return true
     }
     let l = this.ensureLive(topicId)
@@ -374,9 +389,20 @@ export class TopicManager {
       await this.d.say(topicId, announce)
       return
     }
-    const b = this.d.store.registry[topicId]
-    const left = b ? this.remainingBudget(b) : undefined
-    if (left !== undefined && left <= 0) await this.d.say(topicId, '💸 Not resumed: this topic has used its budget. Open a new topic for the next question.')
+    const why = this.openRefusal(topicId)
+    if (why === 'budget') await this.d.say(topicId, '💸 Not resumed: this topic has used its budget. Open a new topic for the next question.')
+    else if (why === 'busy') await this.d.say(topicId, '⏳ Not resumed: every session slot is busy. Send a message here when one is free.')
+  }
+
+  private refusalNotice(why: 'closed' | 'budget' | 'busy'): string {
+    switch (why) {
+      case 'closed':
+        return '🔒 An admin closed this topic. An admin can reopen it from the pinned panel.'
+      case 'budget':
+        return `💸 This topic has used its budget ($${(this.d.budgetUsd ?? 0).toFixed(2)}). Open a new topic for the next question; an admin can delete this one.`
+      case 'busy':
+        return `⏳ Every session slot is busy (max ${this.d.maxLiveSessions} live sessions, all running a turn). Send your message again in a moment.`
+    }
   }
 
   private async pump(l: Live): Promise<void> {

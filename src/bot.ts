@@ -24,7 +24,7 @@ import type { Logger, Metrics } from './log'
 import { htmlEsc, htmlToPlain, renderWithDeadline, chunkHtml, chunkPlain } from './markdown'
 import { isEnabledModelKey, modelLabel, parseEffort, supportsEffort, MODEL_MENU, type Effort } from './models'
 import { listSessions } from './session'
-import { transcribe, TopicOrder, voiceTurn, type Heard } from './voice'
+import { transcribe, TopicOrder, voiceTurn, NO_TRANSCRIBER, type Heard } from './voice'
 import { feedOn, type Binding, type Store } from './state'
 import { isBusy, type SessionExtras, type TopicManager } from './topics'
 import {
@@ -71,6 +71,8 @@ type AskBtn = { topicId: string; multi: boolean; selected: Set<number>; options:
 const FREE_TEXT = Symbol('free-text')
 /** A profile session has no file tool, so an inbound file has nowhere to go and the host path stays out of the chat. */
 const TEXT_ONLY = '📎 This assistant reads text only: type your question.'
+/** Transcriptions at once: one sender's run of audio is otherwise that many transcriber processes and files. */
+const MAX_TRANSCRIBING = 2
 const PROFILE_OWNS = '🔒 This install runs a profile: the model, effort and approvals are set there.'
 const PROFILE_FRESH = '🔒 Not under a profile: every topic starts fresh.'
 /** grammy types its optional signal with the abort-controller polyfill; the platform's AbortSignal is what runs. */
@@ -287,13 +289,15 @@ export class TelegramBot {
       case 'turnError': {
         await this.flushOutbox(topicId)
         if (ev.afterRateLimit) return // the friendlier rate-limit notice was already shown
-        const detail = ev.errors.length ? `\n${ev.errors.map(e => e.slice(0, 300)).join('\n')}` : ''
         if (this.d.profile) {
           // Nothing to switch under a profile; a spent budget is said now, not at the next message.
+          // The CLI's error strings can name host paths: logged for the operator, not posted.
+          if (ev.errors.length) this.d.log.warn('turn.error_detail', { topic: topicId, subtype: ev.subtype, errors: ev.errors })
           const budget = ev.subtype === 'error_max_budget_usd' ? '\n💸 This topic has used its budget. Open a new topic for the next question.' : ''
-          await this.send(topicId, `⚠️ turn ended: ${ev.subtype}.${detail}${budget}`)
+          await this.send(topicId, `⚠️ turn ended: ${ev.subtype}.${budget}`)
           return
         }
+        const detail = ev.errors.length ? `\n${ev.errors.map(e => e.slice(0, 300)).join('\n')}` : ''
         await this.send(topicId, `⚠️ turn ended: ${ev.subtype}.${detail}\nTap ⚙️ to switch model or adjust this session.`, controlsKb())
         return
       }
@@ -493,15 +497,44 @@ export class TelegramBot {
     this.order.queue(key, fn, e => this.d.log.error('message.failed', { topic: key, error: e }))
   }
 
-  /** A voice note becomes the words in it, then goes the way typed text does. Any failure is said in the topic. */
+  /** Media in General: outside team mode a hint; in team mode nothing, General being the members' own (commands only). */
+  private async generalOnly(hint: string): Promise<void> {
+    if (!this.d.cfg.teamMode) await this.say(undefined, hint)
+  }
+
+  /** Transcriptions running now; at most MAX_TRANSCRIBING, so one sender's run of audio is not that many transcriber processes. */
+  private transcribing = 0
+
+  /**
+   * A voice note becomes the words in it, then goes the way typed text does. Any failure is
+   * said in the topic (under a profile without its detail, which can name host paths; the
+   * log has it). Nothing is downloaded that cannot be heard, and the audio is removed once
+   * it has been: nothing reads it afterwards.
+   */
   private async handleVoice(ctx: Context, topicId: string, media: { file_id: string; file_unique_id: string; file_size?: number; file_name?: string }, shared: Omit<Heard, 'words'>): Promise<void> {
     try {
       if (media.file_size && media.file_size > MAX_DOWNLOAD_BYTES) {
         return await this.say(topicId, `🎙️ Voice note too large (${(media.file_size / 1048576).toFixed(1)} MB): Telegram caps bot downloads at 20 MB.`)
       }
-      if (topicId) await this.typing(topicId)
-      const path = this.d.files.saveInbox(media.file_name || `${media.file_unique_id}.ogg`, await this.download(media.file_id))
-      const words = await transcribe(path, this.d.cfg.transcribeCmd)
+      if (!this.d.cfg.transcribeCmd) {
+        return await this.say(topicId, this.d.profile ? '🎙️ Voice notes are not transcribed on this install: type your question.' : `🎙️ Voice note not transcribed: ${NO_TRANSCRIBER}`)
+      }
+      if (this.transcribing >= MAX_TRANSCRIBING) return await this.say(topicId, `🎙️ ${MAX_TRANSCRIBING} voice notes are being transcribed already. Send it again in a moment.`)
+      // Reserved before any await, so notes arriving in other topics meanwhile cannot all pass
+      // the check; the download counts too, which bounds the disk as well as the processes.
+      this.transcribing++
+      let words: string
+      try {
+        if (topicId) await this.typing(topicId)
+        const path = this.d.files.saveInbox(media.file_name || `${media.file_unique_id}.ogg`, await this.download(media.file_id))
+        try {
+          words = await transcribe(path, this.d.cfg.transcribeCmd)
+        } finally {
+          this.d.files.removeInbox(path)
+        }
+      } finally {
+        this.transcribing--
+      }
       this.d.metrics.inc('voice_notes')
       const turn = voiceTurn({ words, ...shared })
       if (!shared.forwarded && !shared.audioFile) {
@@ -513,7 +546,10 @@ export class TelegramBot {
       if (!this.d.store.registry[topicId] && this.d.cfg.teamMode && !(await this.bindFreshProfileTopic(ctx, topicId))) return
       if (!(await this.topics.sendToTopic(topicId, turn))) await this.say(topicId, this.noSessionHint())
     } catch (e) {
-      await this.say(topicId, `🎙️ Voice note not transcribed: ${e instanceof Error ? e.message : String(e)}`)
+      const reason = e instanceof Error ? e.message : String(e)
+      if (!this.d.profile) return await this.say(topicId, `🎙️ Voice note not transcribed: ${reason}`)
+      this.d.log.warn('voice.failed', { topic: topicId, error: reason })
+      await this.say(topicId, '🎙️ Voice note not transcribed; the operator has the detail. Type your question instead.')
     }
   }
 
@@ -521,7 +557,7 @@ export class TelegramBot {
    *  Voice and audio go through handleVoice (transcription) instead. */
   private async handleIncomingMedia(ctx: Context, kind: InboundKind): Promise<void> {
     const topicId = this.topicIdOf(ctx)
-    if (!topicId) return void this.say(undefined, 'Send media inside a session topic.')
+    if (!topicId) return void this.generalOnly('Send media inside a session topic.')
     if (await this.mediaRefusedUnderProfile(topicId)) return
     this.status.bump(topicId)
     const m = ctx.message
@@ -563,9 +599,14 @@ export class TelegramBot {
 
   // ── topics: create / bind / controls ─────────────────────────────────────
 
+  /**
+   * The forum topic an update is in; undefined in General. A reply in General carries a
+   * `message_thread_id` too (its reply chain), and `is_topic_message` is what tells a topic
+   * from one: without it a reply in General would bind and pay for a topic that is not there.
+   */
   private topicIdOf(ctx: Context): string | undefined {
-    const id = ctx.message?.message_thread_id ?? ctx.callbackQuery?.message?.message_thread_id
-    return id ? String(id) : undefined
+    const m = ctx.message ?? ctx.callbackQuery?.message
+    return m?.is_topic_message && m.message_thread_id ? String(m.message_thread_id) : undefined
   }
 
   private senderId(ctx: Context): string | undefined {
@@ -1047,8 +1088,8 @@ export class TelegramBot {
     if (data === 'm:tclose') {
       this.topics.userTookOver(topicId)
       this.topics.closeLive(topicId, 'closed & kept by user')
-      if (b && this.d.cfg.teamMode) {
-        b.closed = true // no session opens here until an admin's ♻️ Reopen; a single user's kept topic resumes on its next message
+      if (b) {
+        b.closed = true // honoured in team mode only (TopicManager's honourClosed): no session opens here until an admin's ♻️ Reopen; a single user's kept topic resumes on its next message
         store.saveRegistry()
       }
       void this.status.drop(topicId)
@@ -1250,7 +1291,7 @@ export class TelegramBot {
    */
   private async noticeAnonymous(ctx: Context): Promise<void> {
     const topicId = this.topicIdOf(ctx)
-    if (!ctx.message?.sender_chat || !topicId || !ctx.chat || String(ctx.chat.id) !== this.access.forumChatId) return
+    if (!this.d.cfg.teamMode || !ctx.message?.sender_chat || !topicId || !ctx.chat || String(ctx.chat.id) !== this.access.forumChatId) return
     if (this.anonymousNoticed.has(topicId)) return
     this.anonymousNoticed.add(topicId)
     await this.say(topicId, '🎭 Posts made as the group get no answer: Telegram hides who wrote them. Turn off "Remain anonymous" to chat here.')
@@ -1287,7 +1328,7 @@ export class TelegramBot {
       if (!(await this.admit(ctx))) return void this.d.metrics.inc('rejected_updates')
       await this.inOrder(ctx, async () => {
         const topicId = this.topicIdOf(ctx)
-        if (!topicId) return await this.say(undefined, 'Send images inside a session topic.')
+        if (!topicId) return await this.generalOnly('Send images inside a session topic.')
         if (await this.mediaRefusedUnderProfile(topicId)) return
         this.status.bump(topicId)
         try {
@@ -1323,7 +1364,7 @@ export class TelegramBot {
       if (!(await this.admit(ctx))) return void this.d.metrics.inc('rejected_updates')
       await this.inOrder(ctx, async () => {
         const topicId = this.topicIdOf(ctx)
-        if (!topicId) return await this.say(undefined, 'Send files inside a session topic.')
+        if (!topicId) return await this.generalOnly('Send files inside a session topic.')
         if (await this.mediaRefusedUnderProfile(topicId)) return
         this.status.bump(topicId)
         const doc = ctx.message.document
@@ -1350,7 +1391,7 @@ export class TelegramBot {
       const media = ctx.message.voice ?? ctx.message.audio
       if (!media) return
       const topicId = this.topicIdOf(ctx)
-      if (!topicId) return await this.say(undefined, 'Send voice notes inside a session topic.')
+      if (!topicId) return await this.generalOnly('Send voice notes inside a session topic.')
       this.status.bump(topicId)
       const shared = {
         audioFile: !ctx.message.voice,

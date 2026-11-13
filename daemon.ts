@@ -80,20 +80,6 @@ try {
   }
   throw e
 }
-// 💾 Close & keep writes `closed` in team mode only (a single user's kept topic resumes on its
-// next message) and every mode honours it, so a team-mode run must not leave it behind.
-if (!cfg.teamMode) {
-  let cleared = 0
-  for (const b of Object.values(store.registry)) {
-    if (!b.closed) continue
-    delete b.closed
-    cleared++
-  }
-  if (cleared) {
-    store.saveRegistry()
-    log.info('state.closed_cleared', { topics: cleared, reason: 'closed is team mode\'s; outside it a topic resumes on its next message' })
-  }
-}
 const files = new Files(stateDir)
 
 // ── preflight ───────────────────────────────────────────────────────────────
@@ -162,7 +148,7 @@ function statusText(): string {
     `📊 telepath ${VERSION} · SDK ${SDK_VERSION} · ${versionVerdict.message}\n` +
     `up ${up} min · ${topics.live.size}/${cfg.maxLiveSessions} live · ${Object.keys(store.registry).length} topics bound · idle ${cfg.idleMinutes}m\n` +
     `default ${store.prefs.defaultModel} @ ${store.prefs.defaultEffort ?? 'default'} · models ${cfg.catalog.enabled.join(',')} · rotator ${rotatorEnabled() ? 'on' : 'off'}\n` +
-    `${cfg.teamMode ? `team mode · admins ${cfg.adminUserIds.join(',')} · ` : ''}${profile ? `profile ${profile.name} (${profile.allowedTools.length} tools)` : 'no profile'}\n\n` +
+    `${profile ? `profile ${profile.name} (${profile.allowedTools.length} tools)` : 'no profile'}\n\n` +
     (liveList.length ? `Live:\n${liveList.join('\n')}\n\n` : '') +
     (counters ? `Counters: ${counters}\n\n` : '') +
     (errors.length ? `Recent errors:\n${errors.join('\n')}` : 'No errors recorded.')
@@ -187,7 +173,7 @@ const topics = new TopicManager({
   metrics,
   primeContract: !profile,
   budgetUsd: profile?.maxBudgetUsd,
-  profileSessions: !!profile,
+  profileSessions: !!profile, honourClosed: cfg.teamMode,
 })
 bot.attachTopics(topics)
 

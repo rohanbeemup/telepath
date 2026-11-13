@@ -150,12 +150,19 @@ export class Membership {
     if (!stillPending()) return verdict
     this.inflight.delete(userId)
     // Strangers come and go; once the cache is full the expired ones leave, and when nothing
-    // has expired the oldest does, so a forum larger than the cache cannot grow it.
+    // has expired the entry expiring soonest does (a stranger's grace before a member's TTL,
+    // whoever arrived first), so a forum larger than the cache cannot grow it.
     if (this.cache.size >= this.maxEntries && !this.cache.has(userId)) {
       this.sweep()
       if (this.cache.size >= this.maxEntries) {
-        const oldest = this.cache.keys().next().value
-        if (oldest !== undefined) this.cache.delete(oldest)
+        let soonest: string | undefined
+        let at = Infinity
+        for (const [id, entry] of this.cache) {
+          if (entry.until >= at) continue
+          at = entry.until
+          soonest = id
+        }
+        if (soonest !== undefined) this.cache.delete(soonest)
       }
     }
     this.cache.set(userId, { until: this.now() + (verdict === 'member' ? this.ttlMs : this.graceMs), verdict, noticed: false })

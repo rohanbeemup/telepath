@@ -61,7 +61,7 @@ function fakeRotator(over: Partial<Rotator> = {}): Rotator & { handedOff: unknow
 
 type FakeRotator = ReturnType<typeof fakeRotator>
 
-function harness(over: { maxLive?: number; idleMinutes?: number; rotator?: FakeRotator; now?: () => number; resumeBufferMs?: number; primeContract?: boolean; budgetUsd?: number; profileSessions?: boolean } = {}) {
+function harness(over: { maxLive?: number; idleMinutes?: number; rotator?: FakeRotator; now?: () => number; resumeBufferMs?: number; primeContract?: boolean; budgetUsd?: number; profileSessions?: boolean; honourClosed?: boolean } = {}) {
   const store = new Store('/nowhere', {}, { defaultModel: 'claude-opus-5', defaultCwd: '/w' }, { defaultModel: 'claude-opus-5', defaultCwd: '/w' })
   // never touch disk in these tests
   store.saveRegistry = () => {}
@@ -90,6 +90,7 @@ function harness(over: { maxLive?: number; idleMinutes?: number; rotator?: FakeR
     primeContract: over.primeContract,
     budgetUsd: over.budgetUsd,
     profileSessions: over.profileSessions,
+    honourClosed: over.honourClosed,
   })
   const bind = (topicId: string, b: Partial<{ model: string; effort: 'low' | 'high' | 'max'; sessionId: string; auto: boolean }> = {}) => {
     store.registry[topicId] = { cwd: '/w', model: b.model ?? 'claude-opus-5', effort: b.effort, sessionId: b.sessionId, title: 't' + topicId, lastActive: 0, auto: b.auto }
@@ -120,6 +121,8 @@ describe('TopicManager', () => {
     h.bind('b')
     h.bind('c')
     await h.tm.sendToTopic('a', 'x')
+    h.backend.last().emit(result('sa')) // a's turn ends: idle, and the least recently active
+    await h.tick()
     t += 10
     await h.tm.sendToTopic('b', 'x')
     t += 10
@@ -129,6 +132,36 @@ describe('TopicManager', () => {
     expect(h.tm.isLive('c')).toBe(true)
     expect(h.backend.sessions[0].closed).toBe(true)
     expect(h.said.find(([topic, text]) => topic === 'a' && text.includes('Paused'))).toBeTruthy()
+  })
+
+  test('a session mid-turn is never paused for another topic; when every slot is running the newcomer waits', async () => {
+    let t = 1000
+    const h = harness({ maxLive: 2, now: () => t })
+    h.bind('busy')
+    h.bind('idle')
+    h.bind('next')
+    await h.tm.sendToTopic('busy', 'think hard') // running: no result yet, and the least recently active
+    t += 10
+    await h.tm.sendToTopic('idle', 'quick one')
+    h.backend.last().emit(result('s-idle'))
+    await h.tick()
+    t += 10
+    // the idle session is the one paused, not the older one still running
+    expect(await h.tm.sendToTopic('next', 'me too')).toBe(true)
+    expect(h.tm.isLive('busy')).toBe(true)
+    expect(h.tm.isLive('idle')).toBe(false)
+    expect(h.tm.isLive('next')).toBe(true)
+    expect(h.said.find(([topic, text]) => topic === 'idle' && text.includes('Paused'))).toBeTruthy()
+    // every slot running: the newcomer is told to wait, nobody's turn is killed, a quiet nudge reports undelivered
+    h.bind('late')
+    expect(await h.tm.sendToTopic('late', 'and me')).toBe(true)
+    expect(h.tm.isLive('late')).toBe(false)
+    expect(h.tm.isLive('busy')).toBe(true)
+    expect(h.tm.isLive('next')).toBe(true)
+    expect(h.said.find(([topic, text]) => topic === 'late' && /slot/i.test(text))).toBeTruthy()
+    expect(h.said.find(([topic, text]) => topic === 'busy' && text.includes('Paused'))).toBeFalsy()
+    expect(await h.tm.sendToTopic('late', 'continue', { takeover: false, quiet: true })).toBe(false)
+    expect(h.backend.opens.length).toBe(3)
   })
 
   test('evicts idle sessions and leaves a session mid-turn alone', async () => {
@@ -633,7 +666,7 @@ describe('a profile budget', () => {
 
 describe('an admin-closed topic', () => {
   test('a topic an admin closed opens no session until an admin reopens it', async () => {
-    const h = harness()
+    const h = harness({ honourClosed: true })
     h.bind('z')
     await h.tm.sendToTopic('z', 'before the close')
     expect(h.backend.opens.length).toBe(1)
@@ -644,6 +677,13 @@ describe('an admin-closed topic', () => {
     expect(h.backend.opens.length).toBe(1)
     expect(h.tm.ensureLive('z')).toBeUndefined()
     expect(h.said.find(([topic, text]) => topic === 'z' && /closed/i.test(text))).toBeTruthy()
+    // outside team mode the flag is written but not honoured: a single user's kept topic resumes on its next message
+    const single = harness()
+    single.bind('y')
+    single.store.registry['y'].closed = true
+    expect(await single.tm.sendToTopic('y', 'back again')).toBe(true)
+    expect(single.backend.opens.length).toBe(1)
+    expect(single.said.find(([topic, text]) => topic === 'y' && /closed/i.test(text))).toBeFalsy()
     // a nudge into a closed topic posts nothing and reports undelivered
     const closedNotices = h.said.filter(([topic, text]) => topic === 'z' && /closed/i.test(text)).length
     expect(await h.tm.sendToTopic('z', 'continue', { takeover: false, quiet: true })).toBe(false)

@@ -20,9 +20,11 @@ export function parseTranscript(out: string): string {
   return words
 }
 
+export const NO_TRANSCRIBER = "voice notes need TRANSCRIBE_CMD in telepath's .env (a command that prints the words of the audio file it is given)"
+
 /** Transcribe one audio file. Async, so a slow transcription holds up nothing else. */
 export async function transcribe(path: string, cmd: string | undefined, timeoutMs = 180_000): Promise<string> {
-  if (!cmd) throw new VoiceError("voice notes need TRANSCRIBE_CMD in telepath's .env (a command that prints the words of the audio file it is given)")
+  if (!cmd) throw new VoiceError(NO_TRANSCRIBER)
   const out = await new Promise<string>((resolve, reject) => {
     // Its own process group, so a timeout ends everything it started: a wrapper script's own
     // children (python, ffmpeg) would otherwise outlive every kill of the script and pile up.

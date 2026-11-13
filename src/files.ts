@@ -75,6 +75,13 @@ export class Files {
     writeFileSync(path, data)
     return path
   }
+
+  /** An inbox file nothing will read again (audio, once heard). */
+  removeInbox(path: string): void {
+    try {
+      rmSync(path, { force: true })
+    } catch {}
+  }
 }
 
 /** Delete a session's transcript from ~/.claude/projects (makes it unresumable). */

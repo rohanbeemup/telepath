@@ -146,6 +146,8 @@ describe('a profile is refused when', () => {
     expect(() => parseProfile(raw({ allowedTools: ['mcp__kb__search', 'mcp__other__search'] }), source())).toThrow(ProfileError)
     expect(() => parseProfile(raw({ allowedTools: ['Bash'] }), source())).toThrow(ProfileError)
     expect(() => parseProfile(raw({ tools: ['WebFetch'], allowedTools: ['WebFetch'] }), source())).not.toThrow()
+    // no patterns: the hook matches exact names, so a pattern would be accepted here and allow nothing there
+    expect(() => parseProfile(raw({ allowedTools: ['mcp__kb__*'] }), source())).toThrow(/no patterns/)
     // the converse: a kept built-in that is not allowed is a tool the hook would deny on every call
     expect(() => parseProfile(raw({ tools: ['Read'] }), source())).toThrow(ProfileError)
     // a question tool can never prompt in a profile session, so it is refused outright
@@ -157,5 +159,9 @@ describe('a profile is refused when', () => {
     const problems = teamProfileProblems(parseProfile(raw({ maxBudgetUsd: undefined }), source()))
     expect(problems.length).toBe(1)
     expect(problems[0]).toContain('maxBudgetUsd')
+    // and one that keeps any built-in tool: a shell, the files (the .env among them) or the web from the box
+    const shell = teamProfileProblems(parseProfile(raw({ tools: ['Read', 'WebFetch'], allowedTools: ['mcp__kb__search', 'Read', 'WebFetch'] }), source()))
+    expect(shell.length).toBe(1)
+    expect(shell[0]).toMatch(/^tools: .*Read, WebFetch/)
   })
 })

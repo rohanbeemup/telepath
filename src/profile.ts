@@ -111,7 +111,10 @@ export function parseProfile(raw: unknown, src: ProfileSource): Profile {
 
   const allowedTools = stringList(o.allowedTools, 'allowedTools', problems)
   for (const t of allowedTools) {
-    if (t.startsWith('mcp__')) {
+    if (t.includes('*')) {
+      // The hook matches exact names, so a pattern would be accepted here and allow nothing there.
+      problems.push(`allowedTools: ${t}: no patterns; name each tool`)
+    } else if (t.startsWith('mcp__')) {
       const rest = t.slice('mcp__'.length)
       if (!serverNames.some(s => rest.startsWith(`${s}__`))) problems.push(`allowedTools: ${t} names no declared MCP server (declared: ${serverNames.join(', ') || 'none'})`)
     } else if (!tools.includes(t)) {
@@ -185,5 +188,8 @@ export function profileOptions(p: Profile, open: OpenOptions): Options {
 export function teamProfileProblems(p: Profile): string[] {
   const problems: string[] = []
   if (p.maxBudgetUsd === undefined) problems.push('maxBudgetUsd is required in team mode: a shared forum needs a per-topic cap, or any member can spend without limit')
+  // Every built-in reaches the host or the network from the box (a shell, the files, which hold
+  // the .env, the web), which no member may: team mode runs on the profile's MCP servers alone.
+  if (p.tools.length) problems.push(`tools: team mode keeps no built-in tool (${p.tools.join(', ')}); a shared forum reaches only the profile's MCP servers`)
   return problems
 }
