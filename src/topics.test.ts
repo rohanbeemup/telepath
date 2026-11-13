@@ -1,6 +1,7 @@
 import { test, expect, describe } from 'bun:test'
 import { TopicManager, outboxContract, type LiveSession, type OpenOptions, type SessionBackend, type Rotator } from './topics'
 import { Mailbox } from './mailbox'
+import { Throttle } from './throttle'
 import { Store } from './state'
 import { buildCatalog } from './models'
 import { Logger, Metrics } from './log'
@@ -71,6 +72,7 @@ function harness(over: { maxLive?: number; idleMinutes?: number; rotator?: FakeR
   const events: [string, Event][] = []
   const rotator = over.rotator ?? fakeRotator()
   const extras = { canUseTool: (async () => ({ behavior: 'allow' })) as any, hooks: {} }
+  const refusals = new Throttle(60_000, over.now)
   const tm = new TopicManager({
     store,
     catalog,
@@ -92,6 +94,8 @@ function harness(over: { maxLive?: number; idleMinutes?: number; rotator?: FakeR
     profileSessions: over.profileSessions,
     shared: over.shared,
     stuckTurnMs: over.stuckTurnMs,
+    // the bot's rule, stood in for by its own kind of throttle: one notice a minute per topic and kind
+    replyAllowed: (t, k) => refusals.allow(`${t}:${k}`),
   })
   const bind = (topicId: string, b: Partial<{ model: string; effort: 'low' | 'high' | 'max'; sessionId: string; auto: boolean }> = {}) => {
     store.registry[topicId] = { cwd: '/w', model: b.model ?? 'claude-opus-5', effort: b.effort, sessionId: b.sessionId, title: 't' + topicId, lastActive: 0, auto: b.auto }

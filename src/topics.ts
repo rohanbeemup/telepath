@@ -11,7 +11,6 @@ import type { Effort } from './models'
 import { effortFor, type Catalog } from './models'
 import type { Binding, Store } from './state'
 import type { Logger, Metrics } from './log'
-import { Throttle } from './throttle'
 
 export type SessionExtras = {
   canUseTool: CanUseTool
@@ -127,8 +126,8 @@ export type TopicDeps = {
   shared?: boolean
   /** In a shared forum, a turn with no result for this long is stuck and may be paused for a new topic. */
   stuckTurnMs?: number
-  /** The bot's one rule for replies a member can trigger at will (topic and kind, and the sender's allowance); the manager's own per-topic-and-kind throttle when absent. */
-  replyAllowed?: (topicId: string, kind: string, senderId?: string) => boolean
+  /** The bot's one rule for replies a member can trigger at will (topic and kind, and the sender's allowance): a refusal notice goes out only when it says so. */
+  replyAllowed: (topicId: string, kind: string, senderId?: string) => boolean
 }
 
 export const CONTINUE_AFTER_LIMIT =
@@ -153,8 +152,6 @@ export class TopicManager {
   readonly live = new Map<string, Live>()
   private readonly primed = new Set<string>()
   private readonly resumeTimers = new Map<string, ReturnType<typeof setTimeout>>()
-  /** A refusal is said at most once a minute per topic; the rest are counted. */
-  private readonly refusals = new Throttle(60_000, () => this.now())
   /** Bumped by every user action on a topic; a pending rotation watch compares against it. */
   private readonly takeoverGen = new Map<string, number>()
   private readonly now: () => number
@@ -470,10 +467,8 @@ export class TopicManager {
    */
   private async refuse(topicId: string, why: 'closed' | 'budget' | 'busy', senderId?: string): Promise<void> {
     this.d.metrics.inc(`${why}_refusals`)
-    // The bot's one rule for replies a member can trigger (topic and kind, and the sender's
-    // allowance) when it provides it; the manager's own per-topic-and-kind throttle otherwise.
-    const allowed = this.d.replyAllowed ? this.d.replyAllowed(topicId, why, senderId) : this.refusals.allow(`${topicId}:${why}`)
-    if (allowed) await this.d.say(topicId, this.refusalNotice(why))
+    // The bot's one rule for replies a member can trigger: topic and kind, and the sender's allowance.
+    if (this.d.replyAllowed(topicId, why, senderId)) await this.d.say(topicId, this.refusalNotice(why))
     else this.d.metrics.inc('refusals_muted')
   }
 

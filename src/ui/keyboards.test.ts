@@ -123,5 +123,12 @@ describe('team mode', () => {
     }
     expect(callbackData(topicControlsKb(catalog, binding({ effort: 'high' })))).toContain('m:tm:opus')
     expect(topicControlsText(catalog, binding({ effort: 'high' }))).toContain('Model:')
+    // a closed topic's panel in team mode: the closed state with ♻️ Reopen, no feed toggle, no second close
+    const closed = binding({ effort: 'high' })
+    closed.closed = true
+    expect(callbackData(topicControlsKb(catalog, closed, { team: true }))).toEqual(['m:treopen', 'm:tdelete', 'm:twipe'])
+    expect(topicControlsText(catalog, closed, undefined, { team: true })).toContain('Closed by an admin')
+    // outside team mode the flag changes nothing on the panel
+    expect(callbackData(topicControlsKb(catalog, closed))).not.toContain('m:treopen')
   })
 })

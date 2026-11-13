@@ -189,7 +189,6 @@ export function profileOptions(p: Profile, open: OpenOptions): Options {
   }
 }
 
-/** What team mode needs of a profile beyond what any profile needs; the daemon refuses to boot on these. */
 /**
  * A model name is passed to the SDK as given, so a typo would boot clean and fail in every
  * topic (under a profile, without its detail): it must be one of the install's catalog ids.
@@ -200,6 +199,7 @@ export function profileModelProblem(p: Profile, knownIds: string[]): string | un
   return `model: ${p.model} is not one of this install's model ids (${knownIds.join(', ')}); use one of them, or set OPUS_MODEL and friends in .env`
 }
 
+/** What team mode needs of a profile beyond what any profile needs; the daemon refuses to boot on these. */
 export function teamProfileProblems(p: Profile): string[] {
   const problems: string[] = []
   if (p.maxBudgetUsd === undefined) problems.push('maxBudgetUsd is required in team mode: a shared forum needs a per-topic cap, or any member can spend without limit')

@@ -66,6 +66,13 @@ export function settingsText(c: Catalog, prefs: Prefs, defaultCwd: string): stri
 
 export function topicControlsKb(c: Catalog, b: Binding, mode: KbMode = {}): InlineKeyboard {
   const kb = new InlineKeyboard()
+  if (mode.team && b.closed) {
+    // Closed by an admin: the panel stays pinned in this state, so the way to reopen is where the
+    // refusal says it is, and a later refresh of the panel keeps it (seventeenth review).
+    kb.text('♻️ Reopen', 'm:treopen').row()
+    kb.text('🗑 Delete', 'm:tdelete').text('🧹 Delete & remove all', 'm:twipe')
+    return kb
+  }
   if (!mode.team && !mode.profile) {
     // The profile owns the model, the effort and the (absent) approvals.
     for (const k of c.enabled) kb.text(`${MODEL_MENU[k].short}${b.model === c.ids[k] ? ' ✓' : ''}`, `m:tm:${k}`)
@@ -80,6 +87,9 @@ export function topicControlsKb(c: Catalog, b: Binding, mode: KbMode = {}): Inli
 }
 
 export function topicControlsText(c: Catalog, b: Binding, note?: string, mode: KbMode = {}): string {
+  if (mode.team && b.closed) {
+    return `⚙️ "${b.title}"\n🔒 Closed by an admin: no session opens here until an admin reopens it.${note ? `\n${note}` : ''}`
+  }
   if (mode.team) {
     return `⚙️ "${b.title}"\n🔎 feed ${feedOn(b) ? 'on' : 'off'} · closing, deleting and wiping a topic is for admins\n\n💬 Just type your question below.${note ? `\n${note}` : ''}`
   }
