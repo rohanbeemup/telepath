@@ -1235,7 +1235,10 @@ export class TelegramBot {
       return this.repaintControls(topicId, b)
     }
     if (data === 'm:tclose') {
-      if (b && this.d.cfg.teamMode) {
+      // A panel with no binding behind it (one left pinned by a deletion Telegram refused) has no
+      // session to close: said so, rather than "closed and saved, Reopen to resume" (thirty-second review).
+      if (!b) return void ack('No session here')
+      if (this.d.cfg.teamMode) {
         // Closed for everyone until an admin reopens it: the flag first, before anything yields,
         // so a queued note or line cannot open a fresh session in the gap (eighteenth review).
         b.closed = true
@@ -1245,13 +1248,13 @@ export class TelegramBot {
       this.topics.closeLive(topicId, 'closed & kept by user')
       void this.status.drop(topicId)
       await ack('💾 Closed')
-      if (b && this.d.cfg.teamMode) {
+      if (this.d.cfg.teamMode) {
         // The pinned panel shows the closed state with ♻️ Reopen and stays pinned, so "reopen it
         // from the pinned panel" is true, and a later refresh keeps the button (seventeenth review).
         await this.refreshPinnedControls(topicId, b)
       } else {
         // One user's kept topic resumes on its next message; no flag is written.
-        if (b?.controlMsgId) await this.bot.api.unpinChatMessage(this.d.cfg.forumChatId, b.controlMsgId).catch(() => {})
+        if (b.controlMsgId) await this.bot.api.unpinChatMessage(this.d.cfg.forumChatId, b.controlMsgId).catch(() => {})
         await this.paint(topicId, '💾 Session closed and saved — your context is kept. Reopen to resume.', new InlineKeyboard().text('♻️ Reopen & resume', 'm:treopen'))
       }
       await this.bot.api.closeForumTopic(this.d.cfg.forumChatId, Number(topicId)).catch(e => this.d.log.warn('topic.close_failed', { topic: topicId, error: e }))

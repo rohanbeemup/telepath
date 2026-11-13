@@ -155,6 +155,7 @@ directions and a paraphrase reads as a missing test.
 | `a profile session's first message carries no outbox contract` | with `primeContract: false`, the first `send` into a session is the user's text alone | The contract always prepended, telling a session with no file tools to save files into a directory |
 | `the team main menu offers only a new topic and help` | `mainMenuKb({ team: true })` has exactly those two buttons (status is the admins', typed); under a profile alone the menu drops the old sessions and the resume, which the gate would refuse (twenty-fourth review); the default menu is unchanged | The full menu in team mode: settings, the session list and the status screen reachable by every member; the session list offered under a profile, every tap on it refused |
 | `the team topic panel has no model, effort or auto buttons` | `topicControlsKb(catalog, b, { team: true })` and `topicControlsKb(catalog, b, { profile: true })` carry the feed toggle and the close, delete and wipe actions only; the panel text names neither model nor approvals; the default panel is unchanged; a closed binding's panel in team mode is the closed state (♻️ Reopen, delete, wipe; "Closed by an admin"), so the pinned panel is where the refusal says to reopen and a refresh keeps the button, while outside team mode the flag changes nothing on the panel (seventeenth review); the wrap-up confirmation in team mode offers a member "finish this turn first" and cancel only, since "at the next step" interrupts a colleague's turn and is an admin's (eighth security read), and keeps "at the next step" on an admin's, since the gate reserves that tap for admins and a button nobody can reach makes the help text a lie (twenty-seventh review) | The full panel in team mode: a tap switches the shared profile's model. The full panel in a single-user profile install: buttons that change what the panel shows and nothing the session does (Codex finding, 12 Nov 2026). The open panel painted over a closed topic's, so the only Reopen button vanishes on the next ⚙️ (seventeenth review); "at the next step" offered to members, every tap on it refused as "Admins only"; dropped for admins too, so in team mode "at the next step" is reachable by no one while the help promises it to admins (twenty-seventh review) |
+| `mergeEnvFile reports the keys it loaded, not those the shell already had` | `mergeEnvFile()` returns the keys it wrote into the process environment (absent there before, an empty value included) and not the keys the shell had already set, which the merge skips; the daemon hands that list to the bot as what the transcriber must not see (thirty-second review: every key the file named was stripped, so a `PATH=` line in a file that doubles as the unit's `EnvironmentFile` took the transcriber's PATH) | Every key the file names reported, so a shell-set PATH or HOME is stripped from the transcriber and no voice note transcribes (M184); the keys the shell had reported and the loaded ones not, the same loss inverted (M185) |
 
 The seed-request suite (`src/seed.test.ts`, the todo queue's seam into the registry) predates
 this plan and was named by none; the twenty-sixth review added a case to it, so the six it
@@ -506,7 +507,22 @@ caps a wrong implementation would happily allow.
   topic name from Telegram, so such a hand-made topic is bound under the default name, and
   a titled `/new` renames it; the transcript-gone recovery runs where the stream throws,
   which is how the CLI reports a missing transcript, and Ring 2 checks it end to end
-  (above).
+  (above). After the thirty-second (the independent read of `b12cc31`): the keys kept from
+  the transcriber are the ones `.env` loaded, not every key the file names, since a line the
+  shell had already set (a `PATH=` in a file that doubles as the unit's `EnvironmentFile`)
+  is skipped by the merge and must not be stripped from the transcriber; 💾 Close on a panel
+  with no binding behind it (one left pinned by a deletion Telegram refused) answers that
+  there is no session, rather than painting the single-user "closed and saved, Reopen to
+  resume" over it. Refuted: a 429 on the membership lookup holding the loop for the retry
+  window (auto-retry's pause rejects on the abort signal, checked at the twenty-eighth and
+  twenty-ninth reads); a stuck stretch's spend lost and repeatable on demand (the transcript
+  keeps the usage of every assistant message written before the hang, and a resumed stretch's
+  total continues from it, so the next result's increment charges it; only a transcript that
+  saved nothing loses a stretch, once, as recorded; Ring 2 now checks the charge). Accepted,
+  recorded: the child and its stdio servers inherit `.env` (the twenty-eighth's record: the
+  child needs the key); an argument with no path in it is passed as typed, since a bare name
+  may be a package or a flag's value as well as a file, and the profile author writes `./x`
+  for a file beside the profile (the README says so).
 - **The membership lookup runs on the update loop.** grammY handles updates one at a time,
   and `admit()` asks the forum before a message is queued, so a cache miss costs every
   topic that lookup (bounded at five seconds, deduplicated per sender). Moving it into the
@@ -527,6 +543,8 @@ that spent part of its budget, was idle-evicted and resumed, still answers (the 
 is the stretch's own cap) and ends only once the remainder is spent; a topic whose
 transcript was removed from disk opens fresh on the next message and says so, however
 the CLI reports the failed resume (thirty-first review: the recovery runs where the
-stream throws; an error result instead would keep the stale id); a DM to
+stream throws; an error result instead would keep the stale id); a stretch cut as stuck
+mid-turn is charged on the next stretch's first result (thirty-second review: the resumed
+total continues from the transcript's saved usage); a DM to
 the bot gets nothing; and, on a host with no `claude login`, the sessions run on the
 `ANTHROPIC_API_KEY` from `.env`.

@@ -38,13 +38,14 @@ const STARTED = Date.now()
 // ── config ─────────────────────────────────────────────────────────────────
 const stateDir = process.env.TG_CLAUDE_STATE_DIR || import.meta.dir
 const envFile = join(stateDir, '.env')
-// The keys .env holds: none of them reaches the transcriber, whatever they are (thirty-first review).
+// The keys .env loaded: none of them reaches the transcriber, whatever they are (thirty-first
+// review). Loaded, not named: a line the shell had already set is skipped by the merge and stays
+// the shell's, so a PATH= in a file that doubles as the unit's EnvironmentFile is not stripped
+// from the transcriber (thirty-second review).
 let envFileKeys: string[] = []
 try {
   chmodSync(envFile, 0o600) // it holds the bot token (a no-op on NTFS)
-  const fromFile = parseEnvFile(readFileSync(envFile, 'utf8'))
-  mergeEnvFile(process.env, fromFile)
-  envFileKeys = Object.keys(fromFile)
+  envFileKeys = mergeEnvFile(process.env, parseEnvFile(readFileSync(envFile, 'utf8')))
 } catch {}
 
 let cfg: Config
