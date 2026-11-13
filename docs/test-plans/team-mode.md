@@ -579,7 +579,19 @@ caps a wrong implementation would happily allow.
   the project directories for `transcriptExists` and main's `deleteTranscript`, whose own
   walk neither skips stray files nor follows a symlinked project; a mode policy object for
   `bot.ts` in place of its scattered team-mode and profile branches, the shape the
-  thirty-fifth read named as the source of several of these rounds' findings.
+  thirty-fifth read named as the source of several of these rounds' findings. The
+  thirty-sixth (the independent read of `ffd6d14`) found nits and items already recorded,
+  so the loop ends there, on the bundle's own rule. Recorded from it: a rate limit that
+  carries no reset time (no timer, the rotator's own watch only) cannot be told from a hung
+  process by silence, so after the stuck bound the topic is paused with the notice that
+  names what was lost and asks for it again, and the rotator's watch ends with the process;
+  a topic Telegram would not delete stays tombstoned for the process for admins too (the
+  twenty-fifth's record: the notice says to delete it by hand). Follow-ups, not defects: a
+  typed `/menu` in a bound topic whose pinned panel the refresh edited shows nothing where
+  it was typed (the tap path toasts; the typed path can say where the panel is); the boot's
+  refusal says "over a minute" for six tries ten seconds apart, fifty seconds; one
+  `actionRefusal()` for the three gates applied at the typed and the tapped entry; the
+  registry written whole after every result under a budget (the ninth's record).
 - **The membership lookup runs on the update loop.** grammY handles updates one at a time,
   and `admit()` asks the forum before a message is queued, so a cache miss costs every
   topic that lookup (bounded at five seconds, deduplicated per sender). Moving it into the
@@ -602,6 +614,9 @@ transcript was removed from disk opens fresh on the next message and says so, ho
 the CLI reports the failed resume (thirty-first review: the recovery runs where the
 stream throws; an error result instead would keep the stale id); a stretch cut as stuck
 mid-turn is charged on the next stretch's first result (thirty-second review: the resumed
-total continues from the transcript's saved usage); a DM to
+total continues from the transcript's saved usage); a tap on the pinned panel reaches its
+topic (thirty-sixth review: `topicIdOf` reads `is_topic_message` on the callback's message,
+which Telegram sets on a bot-posted panel; a client that did not would leave every panel
+tap on "no topic"); a DM to
 the bot gets nothing; and, on a host with no `claude login`, the sessions run on the
 `ANTHROPIC_API_KEY` from `.env`.
