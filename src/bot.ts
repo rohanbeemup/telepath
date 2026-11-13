@@ -14,7 +14,7 @@ import { admitted, allowedAction, membershipRequired, profileFreshOnly, profileL
 import { Throttle } from './throttle'
 import { KNOWN_COMMANDS, parseTyped, type Typed } from './commands'
 import type { Profile } from './profile'
-import { parseTeamNew, TITLE_MAX, TopicQuota, type Member } from './team'
+import { clipTitle, parseTeamNew, TopicQuota, type Member } from './team'
 import { describeTask } from './feed'
 import { TurnStatus, type StatusTransport } from './status'
 import { parseHandoff, resumePrompt } from './handoff'
@@ -560,6 +560,9 @@ export class TelegramBot {
       // opening costs no transcription. The member's own note then goes the way typed text does,
       // once heard, into a topic already bound.
       if (this.d.cfg.teamMode && !this.d.store.registry[topicId] && !(await this.bindFreshProfileTopic(ctx, topicId))) return
+      // A topic that refuses (closed, spent, full) is told so now, before a slot and a download are
+      // spent on words it would not take (twenty-fifth review).
+      if (await this.topics.refuseNow(topicId, this.senderId(ctx))) return
       // The slot is checked and taken with nothing in between, just before the download, so notes
       // arriving in other topics meanwhile cannot all pass the check and a slot is never held
       // through the bind's Telegram calls (hook, twenty-third review); the download counts too,
@@ -585,9 +588,8 @@ export class TelegramBot {
         await this.say(topicId, `🎙️ ${words}`)
         return await this.handleText(ctx, turn)
       }
-      // A topic that refuses (closed, spent, full) is told so by sendToTopic; "passed on" is said
-      // only when the words can reach the session (twentieth review).
-      if (this.topics.openRefusal(topicId)) return void (await this.topics.sendToTopic(topicId, turn, { senderId: this.senderId(ctx) }))
+      // "Passed on" is said only when the words can reach the session (twentieth review).
+      if (await this.topics.refuseNow(topicId, this.senderId(ctx))) return
       await this.say(topicId, `🎙️ ${shared.audioFile ? 'Audio file' : 'Forwarded voice note'}, passed on as content: ${words}`)
       if (!(await this.topics.sendToTopic(topicId, turn, { senderId: this.senderId(ctx) }))) await this.say(topicId, this.noSessionHint())
     } catch (e) {
@@ -661,7 +663,7 @@ export class TelegramBot {
   /** The new topic's id, or undefined after a failure, whose Telegram error is in the log; the caller says TOPIC_CREATE_FAILED its own way. */
   private async createTopic(name: string): Promise<string | undefined> {
     try {
-      const topic = await this.bot.api.createForumTopic(this.d.cfg.forumChatId, name.slice(0, TITLE_MAX) || 'session')
+      const topic = await this.bot.api.createForumTopic(this.d.cfg.forumChatId, clipTitle(name) || 'session')
       return String(topic.message_thread_id)
     } catch (e) {
       this.d.log.error('topic.create_failed', { error: e })
@@ -704,7 +706,7 @@ export class TelegramBot {
     if (!live || !isBusy(live)) return this.notice(topicId, 'wrap', 'Nothing is running in this topic right now, so there is nothing to wrap up.', senderId)
     // The confirmation too: a member tapping "Wrap up" thirty times is thirty posts otherwise.
     if (this.muted(topicId, 'wrap', senderId)) return
-    await this.send(topicId, wrapConfirmText(live.queued), wrapConfirmKb())
+    await this.send(topicId, wrapConfirmText(live.queued), wrapConfirmKb(this.kbMode()))
   }
 
   private async repaintControls(topicId: string, b: Binding, note?: string): Promise<void> {
@@ -1057,7 +1059,7 @@ export class TelegramBot {
     if (data === 'm:help') {
       await ack()
       if (this.muted(topicId, 'help', this.senderId(ctx))) return
-      return void this.send(topicId, this.d.cfg.teamMode ? teamHelp() : help(this.d.cfg.reposDir), backKb())
+      return void this.send(topicId, this.helpText(), backKb())
     }
     if (data === 'm:cancel') {
       this.wizard.delete(uid)
@@ -1195,6 +1197,9 @@ export class TelegramBot {
       b.feed = !feedOn(b)
       store.saveRegistry()
       await ack(b.feed ? '🔎 Feed ON' : '🔎 Feed OFF')
+      // In a shared forum the pinned panel is what everyone reads: refreshed on a state change,
+      // whichever copy carried the tap; for one user the tapped message, as on main.
+      if (this.d.cfg.teamMode) return void (await this.refreshPinnedControls(topicId, b))
       return this.repaintControls(topicId, b)
     }
     if (data === 'm:ta') {
@@ -1230,8 +1235,10 @@ export class TelegramBot {
     if (data === 'm:treopen') {
       await this.bot.api.reopenForumTopic(this.d.cfg.forumChatId, Number(topicId)).catch(e => this.d.log.warn('topic.reopen_failed', { topic: topicId, error: e }))
       if (!b) return void this.paint(topicId, 'That session no longer exists.', backKb())
-      b.closed = false
-      store.saveRegistry()
+      if (b.closed) {
+        b.closed = false
+        store.saveRegistry()
+      }
       if (this.d.cfg.teamMode) {
         // Reopened, not resumed: like a fresh topic, it costs no process until someone writes in
         // it. The panel stayed pinned through the close, so it is refreshed, never re-pinned.
@@ -1295,7 +1302,7 @@ export class TelegramBot {
       setTimeout(() => this.removed.delete(topicId), 10 * 60_000).unref()
     } catch (e) {
       this.d.log.warn('topic.delete_failed', { topic: topicId, error: e })
-      await this.say(topicId, '🗑 The bot has let this topic go, but Telegram would not delete it (the log has the detail). Delete it by hand, or try again; it takes no new messages.')
+      await this.say(topicId, '🗑 The bot has let this topic go, but Telegram would not delete it (the log has the detail). Delete it by hand in Telegram; it takes no new messages.')
     }
   }
 
@@ -1349,15 +1356,16 @@ export class TelegramBot {
             const given = typed.args.trim() ? parseTeamNew(typed.args, this.memberOf(ctx), new Date()).title : undefined
             // Typed into a fresh topic a member made by hand, /new binds that topic (a second one would
             // cost a second opening and leave this one unbound): a bare /new keeps the topic's own
-            // name, a given title renames it in Telegram too (twenty-third and twenty-fourth reviews).
+            // name, a given title names the binding. Telegram's topic name is left alone: renaming it
+            // would let any member rename a colleague's topic (twenty-third and twenty-fourth
+            // reviews, eighth security read).
             if (this.d.cfg.teamMode && topicId && !this.d.store.registry[topicId]) {
               const name = given ?? this.topicTitleOf(ctx) ?? this.defaultTitle(ctx)
               if (!(await this.bindFreshProfileTopic(ctx, topicId, name))) return
-              if (given) await this.bot.api.editForumTopic(this.d.cfg.forumChatId, Number(topicId), { name: given }).catch(e => this.d.log.warn('topic.rename_failed', { topic: topicId, error: e }))
-              await this.say(topicId, `✅ This topic is "${name}". Type your question below.`)
+              await this.say(topicId, `✅ Bound as "${name}". Type your question below.`)
               return
             }
-            return this.createProfileTopic(ctx, given ?? parseTeamNew('', this.memberOf(ctx), new Date()).title, topicId, 'text')
+            return this.createProfileTopic(ctx, given ?? this.defaultTitle(ctx), topicId, 'text')
           }
           const { name, cwd, auto, notes } = parseNew(typed.args, this.d.store.defaultCwd())
           for (const n of notes) await this.say(topicId, n)
@@ -1390,7 +1398,7 @@ export class TelegramBot {
           return
         case 'help':
           if (this.muted(topicId, 'help', fromId)) return
-          return void this.say(topicId, this.d.cfg.teamMode ? teamHelp() : help(this.d.cfg.reposDir))
+          return void this.say(topicId, this.helpText())
         default:
           return // every known command has a case above; KNOWN_COMMANDS gated the rest before the switch
       }
@@ -1444,9 +1452,17 @@ export class TelegramBot {
     }
 
     if (!b) return void this.send(topicId, 'This topic has no Claude session yet.', new InlineKeyboard().text('🆕 Start a session here', 'm:newhere'))
+    // A topic that refuses (closed, spent, full) is told so before the status moves and the typing
+    // indicator goes out: a flood into such a topic costs no sendChatAction per line.
+    if (await this.topics.refuseNow(topicId, fromId)) return
     this.status.bump(topicId) // the user's own message now sits below the status
     await this.typing(topicId)
     if (!(await this.topics.sendToTopic(topicId, typed.text, { senderId: fromId }))) await this.say(topicId, this.noSessionHint())
+  }
+
+  /** The one help text, for the tap and the typed command alike. */
+  private helpText(): string {
+    return this.d.cfg.teamMode ? teamHelp() : help(this.d.cfg.reposDir)
   }
 
   /** Under a profile every topic starts fresh, so /attach is not on offer. */
@@ -1633,7 +1649,7 @@ export class TelegramBot {
       const data = ctx.callbackQuery.data || ''
       if (!(await this.admit(ctx))) {
         this.d.metrics.inc('rejected_updates')
-        return void ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
+        return void ctx.answerCallbackQuery({ text: 'Not available: not a member here, or could not be verified just now.' }).catch(() => {})
       }
       if (data.startsWith('m:') && !allowedAction(this.access, this.senderId(ctx), data)) {
         this.d.metrics.inc('admin_only_refused')
@@ -1756,7 +1772,7 @@ export function teamHelp(): string {
 • Open a new topic and ask your question there — or tap 🆕 New topic in General, or type /new <title>.
 • Keep asking in the same topic to continue; open another topic for another subject.
 • 🎙️ A voice note is transcribed and answered like typed text (where the install supports it).
-• ⏹ Wrap up on the status message stops a long answer at its next step; ▶️ Resume picks it up again.
+• ⏹ Wrap up on the status message lets a long answer finish this turn, then hand off; ▶️ Resume picks it up again. Stopping it at the next step is for the admins.
 • 🔎 Activity feed on the pinned panel shows which tools an answer used.
 
 Closing, deleting or wiping a topic, and changing the model, are for the admins.`

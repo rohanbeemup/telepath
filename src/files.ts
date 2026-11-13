@@ -84,8 +84,13 @@ export class Files {
   }
 }
 
-/** Delete a session's transcript from ~/.claude/projects (makes it unresumable). */
-export function deleteTranscript(sessionId: string, projectsDir = join(homedir(), '.claude', 'projects')): string[] {
+/** Where the CLI keeps transcripts: under CLAUDE_CONFIG_DIR when the environment sets one (the child honours it), else ~/.claude. */
+export function projectsRoot(env: NodeJS.ProcessEnv = process.env): string {
+  return join(env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude'), 'projects')
+}
+
+/** Delete a session's transcript from the projects directory (makes it unresumable). */
+export function deleteTranscript(sessionId: string, projectsDir = projectsRoot()): string[] {
   const removed: string[] = []
   let projects: string[]
   try {
@@ -110,7 +115,7 @@ export function deleteTranscript(sessionId: string, projectsDir = join(homedir()
  * what makes a resume possible at all. Undefined when the directory cannot be read: unknown
  * is not gone (a permission or a passing filesystem failure must not cost a transcript).
  */
-export function transcriptExists(sessionId: string, projectsDir = join(homedir(), '.claude', 'projects')): boolean | undefined {
+export function transcriptExists(sessionId: string, projectsDir = projectsRoot()): boolean | undefined {
   let entries: Dirent[]
   try {
     entries = readdirSync(projectsDir, { withFileTypes: true })

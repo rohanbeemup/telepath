@@ -1,11 +1,14 @@
 import { test, expect, describe } from 'bun:test'
 import { chmodSync, mkdtempSync, mkdirSync, symlinkSync, writeFileSync, rmSync } from 'fs'
-import { tmpdir } from 'os'
+import { homedir, tmpdir } from 'os'
 import { join } from 'path'
-import { transcriptExists } from './files'
+import { projectsRoot, transcriptExists } from './files'
 
 describe('transcripts on disk', () => {
   test('a transcript is looked for on disk, and not looking is not a no', () => {
+    // the transcripts live where the CLI keeps them: CLAUDE_CONFIG_DIR when set, else ~/.claude
+    expect(projectsRoot({ CLAUDE_CONFIG_DIR: '/srv/claude' })).toBe(join('/srv/claude', 'projects'))
+    expect(projectsRoot({})).toBe(join(homedir(), '.claude', 'projects'))
     const dir = mkdtempSync(join(tmpdir(), 'telepath-projects-'))
     try {
       mkdirSync(join(dir, 'p1'))

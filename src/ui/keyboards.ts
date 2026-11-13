@@ -177,11 +177,11 @@ export const statusLiveKb = (): InlineKeyboard => new InlineKeyboard().text('⏹
  * already with the session (the CLI folds them into the running or the next turn), so
  * nothing can be taken back; the confirmation says so instead of offering it.
  */
-export function wrapConfirmKb(): InlineKeyboard {
-  return new InlineKeyboard()
-    .text('⏹ Hand off at the next step (recommended)', 'm:tw:now').row()
-    .text('⏳ Finish this turn first, then hand off', 'm:tw:turn').row()
-    .text('↩️ Cancel', 'm:ctl')
+export function wrapConfirmKb(mode: KbMode = {}): InlineKeyboard {
+  const kb = new InlineKeyboard()
+  // Stopping at the next step interrupts a colleague's turn: an admin's in a shared forum, so not offered to members.
+  if (!mode.team) kb.text('⏹ Hand off at the next step (recommended)', 'm:tw:now').row()
+  return kb.text('⏳ Finish this turn first, then hand off', 'm:tw:turn').row().text('↩️ Cancel', 'm:ctl')
 }
 
 export function wrapConfirmText(queued: number): string {

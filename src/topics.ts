@@ -429,9 +429,12 @@ export class TopicManager {
         this.d.metrics.inc('sessions_evicted_idle')
         this.closeLive(l.topicId, 'idle')
       } else if (this.stuck(l, now)) {
-        // A hung process in a shared forum is not kept until cap pressure finds it.
-        void this.d.say(l.topicId, STUCK_PAUSED)
+        // A hung process in a shared forum is not kept until cap pressure finds it. As under the
+        // cap: the notice on the rule, and the topic's continuations cancelled, so a rotation
+        // watcher cannot reopen it on its own after the member was told to send again.
+        if (!this.d.replyMuted(l.topicId, 'paused')) void this.d.say(l.topicId, STUCK_PAUSED)
         this.d.metrics.inc('sessions_evicted_stuck')
+        this.userTookOver(l.topicId)
         this.closeLive(l.topicId, 'stuck')
       }
     }
@@ -507,6 +510,14 @@ export class TopicManager {
     const why = this.openRefusal(topicId)
     if (why) return { refused: why }
     return this.ensureLive(topicId, true)
+  }
+
+  /** Whether the topic refuses a message now (closed, spent, full), said on the rule: a caller with work to do first (a download, a transcription) asks before doing it. */
+  async refuseNow(topicId: string, senderId?: string): Promise<boolean> {
+    const why = this.openRefusal(topicId)
+    if (!why) return false
+    await this.refuse(topicId, why, senderId)
+    return true
   }
 
   /** A refused send: said, unless the message is a quiet nudge, which reports undelivered. */
