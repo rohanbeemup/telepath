@@ -2,7 +2,7 @@
  * Files both ways: the per-topic outbox a session drops deliverables into, the inbox
  * Telegram uploads land in, and transcript removal for the full wipe.
  */
-import { existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'fs'
+import { existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync, writeFileSync, type Dirent } from 'fs'
 import { homedir } from 'os'
 import { basename, join } from 'path'
 
@@ -111,20 +111,22 @@ export function deleteTranscript(sessionId: string, projectsDir = join(homedir()
  * is not gone (a permission or a passing filesystem failure must not cost a transcript).
  */
 export function transcriptExists(sessionId: string, projectsDir = join(homedir(), '.claude', 'projects')): boolean | undefined {
-  let projects: string[]
+  let entries: Dirent[]
   try {
-    projects = readdirSync(projectsDir)
+    entries = readdirSync(projectsDir, { withFileTypes: true })
   } catch {
     return undefined
   }
   let unknown = false
-  for (const p of projects) {
+  for (const entry of entries) {
+    if (entry.isFile()) continue // a stray file beside the projects (a .DS_Store) is no place to look
     try {
-      statSync(join(projectsDir, p, `${sessionId}.jsonl`))
+      statSync(join(projectsDir, entry.name, `${sessionId}.jsonl`)) // through a symlink, when the project is one
       return true
     } catch (e) {
-      // Only "no such file" is a no; a permission or a non-directory in the way is a place not looked at.
-      if ((e as { code?: string }).code !== 'ENOENT') unknown = true
+      const code = (e as { code?: string }).code
+      // "No such file" and "not a directory" (a link to a file) are a no; a permission in the way is a project not looked at.
+      if (code !== 'ENOENT' && code !== 'ENOTDIR') unknown = true
     }
   }
   return unknown ? undefined : false

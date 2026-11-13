@@ -31,9 +31,10 @@ describe('who is admitted', () => {
 const MEMBER_OK = [
   'chat', '/new', '/help', '/menu', 'feed', 'wrap',
   'm:menu', 'm:new', 'm:newhere', 'm:help', 'm:ctl', 'm:cancel', 'm:noop',
-  'm:tf', 'm:twrap', 'm:tw:now', 'm:tw:turn', 'm:tres',
+  'm:tf', 'm:twrap', 'm:tw:turn', 'm:tres',
 ]
 const ADMIN_ONLY = [
+  'm:tw:now', // wrapping up "now" interrupts a colleague's step; after this turn is a member's
   'm:tclose', 'm:treopen', 'm:tdelete', 'm:tdelyes', 'm:twipe', 'm:twipeyes',
   'm:tm:opus', 'm:te:high', 'm:ta',
   'm:settings', 'm:sdm:opus', 'm:sde:high', 'm:sdf', 'm:sdfp:1', 'm:sdfi:0',

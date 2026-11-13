@@ -801,7 +801,11 @@ export class TelegramBot {
    * at a time, handlers queued per topic), so the topic is still unbound here.
    */
   private async bindFreshProfileTopic(ctx: Context, topicId: string, title?: string): Promise<boolean> {
-    if (this.removed.has(topicId)) return false // deleted by an admin while this message waited: gone, or going
+    if (this.removed.has(topicId)) {
+      // Deleted by an admin: gone, going, or left behind by a deletion Telegram refused. Said on the rule, not in silence.
+      await this.notice(topicId, 'closed', '🗑 An admin deleted this topic; it takes no new messages. Open a new one for your question.', this.senderId(ctx))
+      return false
+    }
     if (!(await this.reserveOpening(ctx, topicId))) return false
     this.bindProfileTopic(topicId, title ?? this.topicTitleOf(ctx) ?? this.defaultTitle(ctx))
     await this.postPinnedControls(topicId)
@@ -1342,14 +1346,18 @@ export class TelegramBot {
       switch (typed.cmd) {
         case 'new': {
           if (this.d.profile) {
-            const title = parseTeamNew(typed.args, this.memberOf(ctx), new Date()).title
-            // Typed into a fresh topic a member made by hand, /new names and binds that topic: a second
-            // one would cost a second opening and leave this one unbound (twenty-third review).
+            const given = typed.args.trim() ? parseTeamNew(typed.args, this.memberOf(ctx), new Date()).title : undefined
+            // Typed into a fresh topic a member made by hand, /new binds that topic (a second one would
+            // cost a second opening and leave this one unbound): a bare /new keeps the topic's own
+            // name, a given title renames it in Telegram too (twenty-third and twenty-fourth reviews).
             if (this.d.cfg.teamMode && topicId && !this.d.store.registry[topicId]) {
-              if (await this.bindFreshProfileTopic(ctx, topicId, title)) await this.say(topicId, `✅ This topic is "${title}". Type your question below.`)
+              const name = given ?? this.topicTitleOf(ctx) ?? this.defaultTitle(ctx)
+              if (!(await this.bindFreshProfileTopic(ctx, topicId, name))) return
+              if (given) await this.bot.api.editForumTopic(this.d.cfg.forumChatId, Number(topicId), { name: given }).catch(e => this.d.log.warn('topic.rename_failed', { topic: topicId, error: e }))
+              await this.say(topicId, `✅ This topic is "${name}". Type your question below.`)
               return
             }
-            return this.createProfileTopic(ctx, title, topicId, 'text')
+            return this.createProfileTopic(ctx, given ?? parseTeamNew('', this.memberOf(ctx), new Date()).title, topicId, 'text')
           }
           const { name, cwd, auto, notes } = parseNew(typed.args, this.d.store.defaultCwd())
           for (const n of notes) await this.say(topicId, n)

@@ -19,11 +19,10 @@ export type KbMode = { team?: boolean; profile?: boolean }
 export function mainMenuKb(mode: KbMode = {}): InlineKeyboard {
   // Status is the admins' (typed /status): the operator's view of the box, reduced in team mode.
   if (mode.team) return new InlineKeyboard().text('🆕 New topic', 'm:new').row().text('❓ Help', 'm:help')
-  return new InlineKeyboard()
-    .text('🆕 New session', 'm:new').text('⚡ Quick new', 'm:quick').row()
-    .text('📋 My sessions', 'm:list').text('▶️ Resume last', 'm:resume').row()
-    .text('⚙️ Settings', 'm:settings').text('📊 Status', 'm:status').row()
-    .text('❓ Help', 'm:help')
+  const kb = new InlineKeyboard().text('🆕 New session', 'm:new').text('⚡ Quick new', 'm:quick').row()
+  // Under a profile every topic starts fresh, so the list of old sessions and the resume are not offered: a tap would only be refused.
+  if (!mode.profile) kb.text('📋 My sessions', 'm:list').text('▶️ Resume last', 'm:resume').row()
+  return kb.text('⚙️ Settings', 'm:settings').text('📊 Status', 'm:status').row().text('❓ Help', 'm:help')
 }
 
 export const backKb = (): InlineKeyboard => new InlineKeyboard().text('⬅️ Back', 'm:menu')

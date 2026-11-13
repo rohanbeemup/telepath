@@ -90,7 +90,11 @@ export function parseProfile(raw: unknown, src: ProfileSource): Profile {
     problems.push('tools: AskUserQuestion cannot work in a profile session: it never prompts (dontAsk), and an allowed tool is approved before a question could be shown, so the model would get an empty answer')
   }
 
-  const servers = o.mcpServers && typeof o.mcpServers === 'object' && !Array.isArray(o.mcpServers) ? (o.mcpServers as Record<string, unknown>) : {}
+  // A copy of each entry: the paths resolved below are written into the profile, never into the caller's object.
+  const servers: Record<string, unknown> =
+    o.mcpServers && typeof o.mcpServers === 'object' && !Array.isArray(o.mcpServers)
+      ? Object.fromEntries(Object.entries(o.mcpServers as Record<string, unknown>).map(([k, v]) => [k, v && typeof v === 'object' && !Array.isArray(v) ? { ...(v as Record<string, unknown>) } : v]))
+      : {}
   const serverNames = Object.keys(servers)
   if (!serverNames.length) problems.push('mcpServers must declare at least one server: it is all a profile session can reach')
   // Each entry is read here, not handed through: a typo would otherwise boot clean and fail in every topic.
@@ -119,8 +123,9 @@ export function parseProfile(raw: unknown, src: ProfileSource): Profile {
   }
 
   const allowedTools = stringList(o.allowedTools, 'allowedTools', problems)
-  // With none, the hook denies every call in every topic and the bot boots as if fine.
-  if (!allowedTools.length) problems.push('allowedTools must name at least one tool (mcp__<server>__<tool>); with none, every call in every topic is denied')
+  // With none, the hook denies every call in every topic and the bot boots as if fine. (A list of
+  // the wrong shape was already reported by stringList; one mistake, one line.)
+  if (!allowedTools.length && (o.allowedTools === undefined || Array.isArray(o.allowedTools))) problems.push('allowedTools must name at least one tool (mcp__<server>__<tool>); with none, every call in every topic is denied')
   for (const t of allowedTools) {
     if (t.includes('*')) {
       // The hook matches exact names, so a pattern would be accepted here and allow nothing there.

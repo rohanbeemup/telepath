@@ -18,8 +18,10 @@ export type Sender = { fromId: string | undefined; chatId: string | undefined; /
 /**
  * What a member may do in team mode. An allowlist, not a denylist: an action this file
  * has never heard of is an admin's until someone decides otherwise. Everything in it is
- * reversible and local to a topic: chatting, opening a topic, wrapping up a turn, the
- * activity feed, and the screens that change nothing. Not the status screen: the full one
+ * reversible and local to a topic: chatting, opening a topic, wrapping up a turn after it
+ * finishes (wrapping up "now" interrupts a colleague's step, so it is an admin's, as the cap
+ * never pauses a running turn for a member), the activity feed, and the screens that change
+ * nothing. Not the status screen: the full one
  * lists the box's recent errors, the admin ids and every topic's title, and the reduced
  * one team mode shows is still the operator's view, not a member's.
  */
@@ -39,7 +41,6 @@ const MEMBER_ACTIONS: ReadonlySet<string> = new Set([
   'm:noop',
   'm:tf',
   'm:twrap',
-  'm:tw:now',
   'm:tw:turn',
   'm:tres',
 ])

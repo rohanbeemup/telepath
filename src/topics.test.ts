@@ -209,7 +209,8 @@ describe('TopicManager', () => {
     expect(h.tm.isLive('newer')).toBe(true)
     expect(h.tm.isLive('filler')).toBe(true)
     expect(h.tm.isLive('parked')).toBe(false)
-    h.tm.userTookOver('parked') // clears the scheduled resume, so the test leaves no timer behind
+    // and its scheduled resume went with it: the notice said a message resumes it, not a timer
+    expect(h.tm.scheduledResume('parked')).toBe(false)
     // where the forum is one person's, the longest-idle session is paused for the new topic, running or not, as before
     const own = harness({ maxLive: 1 })
     own.bind('p')

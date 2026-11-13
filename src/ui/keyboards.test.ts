@@ -110,6 +110,8 @@ describe('team mode', () => {
     expect(callbackData(mainMenuKb({ team: true }))).toEqual(['m:new', 'm:help'])
     expect(labels(mainMenuKb({ team: true }))[0]).toBe('🆕 New topic')
     expect(callbackData(mainMenuKb())).toEqual(['m:new', 'm:quick', 'm:list', 'm:resume', 'm:settings', 'm:status', 'm:help'])
+    // under a profile alone, the entries the gate would refuse (the old sessions, the resume) are not offered
+    expect(callbackData(mainMenuKb({ profile: true }))).toEqual(['m:new', 'm:quick', 'm:settings', 'm:status', 'm:help'])
   })
 
   test('the team topic panel has no model, effort or auto buttons', () => {

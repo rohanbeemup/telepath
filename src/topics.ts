@@ -236,6 +236,9 @@ export class TopicManager {
       // rule, so a member alternating between their own topics cannot post there at will.
       if (!this.d.replyMuted(oldest.topicId, 'paused')) void this.d.say(oldest.topicId, this.stuck(oldest) ? STUCK_PAUSED : `💤 Paused to free a slot (max ${this.d.maxLiveSessions} live sessions). Send a message here to resume — your context is kept.`)
       this.d.metrics.inc('sessions_evicted_cap')
+      // A parked session's scheduled resume goes with it: the notice said a message resumes it, and
+      // the timer would otherwise reopen it on its own and pause the newcomer (twenty-fourth review).
+      this.userTookOver(oldest.topicId)
       this.closeLive(oldest.topicId, 'evicted (session cap)')
     }
   }
@@ -432,6 +435,11 @@ export class TopicManager {
         this.closeLive(l.topicId, 'stuck')
       }
     }
+  }
+
+  /** Whether a rate-limit resume is scheduled for the topic. */
+  scheduledResume(topicId: string): boolean {
+    return this.resumeTimers.has(topicId)
   }
 
   private scheduleResume(topicId: string, resetsAt?: number): string | undefined {
@@ -670,9 +678,6 @@ export class TopicManager {
     } catch (e) {
       this.d.metrics.inc('sdk_stream_errors')
       this.d.log.error('session.stream_error', { topic: topicId, error: e })
-      // A stretch that failed before any result on a resume cannot resume that transcript (gone,
-      // or refused by the CLI): the next message opens fresh, said once, rather than failing on
-      // every message for good (seventh security read).
       const b = this.d.store.registry[topicId]
       // A failure before any result on a resume whose transcript is gone from disk (the CLI's own
       // cleanup removes old ones) would repeat on every message for good: the session id goes, so
