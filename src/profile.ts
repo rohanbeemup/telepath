@@ -106,6 +106,10 @@ export function parseProfile(raw: unknown, src: ProfileSource): Profile {
       if (typeof s.url !== 'string' || !s.url.trim()) problems.push(`mcpServers.${name}: a ${type} server needs a url`)
     } else if (type === 'stdio') {
       if (typeof s.command !== 'string' || !s.command.trim()) problems.push(`mcpServers.${name}: a stdio server needs a command`)
+      // A command with a path in it resolves against the profile's directory, like cwd and the
+      // prompt file; a bare name is the child's PATH to find.
+      else if (/[\\/]/.test(s.command)) s.command = resolve(src.dir, s.command)
+      s.type = 'stdio'
     } else {
       problems.push(`mcpServers.${name}: type must be http, sse or stdio; got ${JSON.stringify(s.type)}`)
     }

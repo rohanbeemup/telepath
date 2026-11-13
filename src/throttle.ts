@@ -6,12 +6,19 @@
  */
 export class Throttle {
   private readonly windows = new Map<string, { start: number; n: number }>()
+  private lastSweep = -Infinity
 
   constructor(
     private readonly windowMs: number,
     private readonly now: () => number = () => Date.now(),
     private readonly limit = 1,
   ) {}
+
+  /** Whether a firing of this key would be allowed now; nothing is recorded. */
+  peek(key: string): boolean {
+    const w = this.windows.get(key)
+    return !w || this.now() - w.start >= this.windowMs || w.n < this.limit
+  }
 
   /** True while this key has fired fewer than `limit` times in its current window; records the firing. */
   allow(key: string): boolean {
@@ -23,8 +30,12 @@ export class Throttle {
       return true
     }
     this.windows.set(key, { start: t, n: 1 })
-    // Keys come and go (topics, senders): once the map is large, entries past their window go.
-    if (this.windows.size > 1000) for (const [k, x] of this.windows) if (t - x.start >= this.windowMs) this.windows.delete(k)
+    // Keys come and go (topics, senders): once the map is large, entries past their window go,
+    // at most once a window, so a large map is not walked on every call.
+    if (this.windows.size > 1000 && t - this.lastSweep >= this.windowMs) {
+      this.lastSweep = t
+      for (const [k, x] of this.windows) if (t - x.start >= this.windowMs) this.windows.delete(k)
+    }
     return true
   }
 

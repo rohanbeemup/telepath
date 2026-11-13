@@ -230,7 +230,7 @@ export class TopicManager {
       if (!oldest) break
       // Said on the paused topic, which in a shared forum is usually a colleague's: on the reply
       // rule, so a member alternating between their own topics cannot post there at will.
-      if (this.d.replyAllowed(oldest.topicId, 'paused')) void this.d.say(oldest.topicId, isBusy(oldest) ? STUCK_PAUSED : `💤 Paused to free a slot (max ${this.d.maxLiveSessions} live sessions). Send a message here to resume — your context is kept.`)
+      if (this.d.replyAllowed(oldest.topicId, 'paused')) void this.d.say(oldest.topicId, this.stuck(oldest) ? STUCK_PAUSED : `💤 Paused to free a slot (max ${this.d.maxLiveSessions} live sessions). Send a message here to resume — your context is kept.`)
       this.d.metrics.inc('sessions_evicted_cap')
       this.closeLive(oldest.topicId, 'evicted (session cap)')
     }
@@ -250,6 +250,32 @@ export class TopicManager {
     if (left !== undefined && left <= 0) return 'budget'
     if (!this.live.has(topicId) && this.live.size >= this.d.maxLiveSessions && ![...this.live.values()].some(l => this.pausable(l))) return 'busy'
     return undefined
+  }
+
+  /**
+   * A binding made before the profile becomes the profile's: its session id goes (another
+   * binding's transcript, a full session's tool results, files and questions, is not this
+   * topic's to show), and with it the hand-off (a repo path, a branch, the operator's next
+   * command, which ▶️ Resume would feed to the profile), the approval mode, and the old
+   * transcript's total as a baseline. True when something changed. Run over the whole
+   * registry at boot, and here for any binding added since, so no reader sees the old values.
+   */
+  private adopt(topicId: string, b: Binding): boolean {
+    if (!this.d.profileSessions || b.profile) return false
+    if (b.sessionId) this.d.log.info('session.resume_dropped', { topic: topicId, sessionId: b.sessionId, why: 'binding predates the profile' })
+    b.sessionId = undefined
+    b.profile = true
+    delete b.handoff
+    b.auto = false
+    if (this.d.budgetUsd !== undefined) b.reportedUsd = 0
+    return true
+  }
+
+  /** Every binding from before the profile, adopted at once (boot). */
+  adoptAll(): void {
+    let changed = false
+    for (const [topicId, b] of Object.entries(this.d.store.registry)) if (this.adopt(topicId, b)) changed = true
+    if (changed) this.d.store.saveRegistry()
   }
 
   ensureLive(topicId: string): Live | undefined {
@@ -280,20 +306,8 @@ export class TopicManager {
     delete env.CLAUDE_CODE_EFFORT_LEVEL // effort is an option now; an inherited value would override it
     // Under a profile only a binding made under it resumes its session; another binding's
     // transcript (a full session's tool results, files, questions) is not this topic's to show.
-    let resume = b.sessionId
-    if (this.d.profileSessions && !b.profile) {
-      if (b.sessionId) this.d.log.info('session.resume_dropped', { topic: topicId, sessionId: b.sessionId, why: 'binding predates the profile' })
-      b.sessionId = undefined
-      b.profile = true // the profile's from now on: the fresh session it opens is resumed like any other
-      // The old session's hand-off (a repo path, a branch, the operator's next command) and its
-      // approval mode are not this topic's either: ▶️ Resume would feed them to the profile.
-      delete b.handoff
-      b.auto = false
-      // The old transcript's total is no baseline for the fresh one, which starts at zero.
-      if (this.d.budgetUsd !== undefined) b.reportedUsd = 0
-      this.d.store.saveRegistry()
-      resume = undefined
-    }
+    if (this.adopt(topicId, b)) this.d.store.saveRegistry()
+    const resume = b.sessionId
     const session = this.d.backend.open({
       topicId,
       cwd: b.cwd,

@@ -115,7 +115,7 @@ if (cfg.profileFile) {
     process.exit(2)
   }
   // A model name goes to the SDK as given: a typo would boot clean and end every turn in an error.
-  const modelProblem = profileModelProblem(profile, Object.values(cfg.catalog.ids))
+  const modelProblem = profileModelProblem(profile, cfg.catalog.enabled.map(k => cfg.catalog.ids[k])) // enabled ones: a disabled model is the operator's choice too
   if (modelProblem) {
     process.stderr.write(`session profile ${cfg.profileFile}:\n  - ${modelProblem}\n`)
     process.exit(2)
@@ -183,6 +183,9 @@ const topics = new TopicManager({
   profileSessions: !!profile, shared: cfg.teamMode, stuckTurnMs: cfg.stuckTurnMinutes * 60_000, replyAllowed: (t, k, s) => bot.replyAllowed(t, k, s),
 })
 bot.attachTopics(topics)
+// Bindings from before the profile become its own in one pass, so no reader sees their old session,
+// hand-off or approval mode; the manager adopts any binding added since on its first open.
+if (profile) topics.adoptAll()
 
 // ── periodic work ───────────────────────────────────────────────────────────
 setInterval(() => topics.evictIdle(), 60_000).unref()

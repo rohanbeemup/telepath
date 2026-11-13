@@ -144,6 +144,12 @@ describe('a profile is refused when', () => {
     expect(() => parseProfile(raw({ mcpServers: { local: { type: 'stdio', command: 'kb-server', args: ['--port', '0'] } }, allowedTools: ['mcp__local__search'] }), source())).not.toThrow()
     // a command with no type is a stdio server: the SDK's own default and the shape every .mcp.json uses
     expect(() => parseProfile(raw({ mcpServers: { local: { command: 'kb-server' } }, allowedTools: ['mcp__local__search'] }), source())).not.toThrow()
+    // a command with a path in it resolves against the profile's directory, like cwd; a bare name is the child's PATH to find
+    const local = parseProfile(raw({ mcpServers: { local: { command: './kb-server.js' } }, allowedTools: ['mcp__local__search'] }), source()).mcpServers.local as { type?: string; command?: string }
+    expect(local.command).toBe(join(DIR, 'kb-server.js'))
+    expect(local.type).toBe('stdio')
+    const bare = parseProfile(raw({ mcpServers: { local: { command: 'kb-server' } }, allowedTools: ['mcp__local__search'] }), source()).mcpServers.local as { command?: string }
+    expect(bare.command).toBe('kb-server')
   })
 
   test('an allowed tool must name a declared MCP server or a kept built-in tool', () => {

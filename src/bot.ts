@@ -252,11 +252,16 @@ export class TelegramBot {
         await this.menuCtx!.editMessageText(text, { reply_markup: kb })
         return
       } catch {}
-    } else if (q && keyboard && this.d.cfg.teamMode) {
-      // Callback data against a message whose keyboard does not hold it (forged, or a stale
-      // client): a fresh message per such tap would be a flood a member can cause.
-      this.d.metrics.inc('forged_taps')
-      return
+    } else if (q && this.d.cfg.teamMode) {
+      if (keyboard) {
+        // Callback data against a message whose keyboard does not hold it (forged, or a stale
+        // client): a fresh message per such tap would be a flood a member can cause.
+        this.d.metrics.inc('forged_taps')
+        return
+      }
+      // No keyboard to check (an inaccessible message): the fresh post goes out on the reply
+      // rule, so an unverifiable tap is bounded like any other reply (hook).
+      if (this.muted(topicId, 'paint', String(q.from.id))) return
     }
     await this.send(topicId, text, kb)
   }
@@ -576,6 +581,9 @@ export class TelegramBot {
         await this.say(topicId, `🎙️ ${words}`)
         return await this.handleText(ctx, turn)
       }
+      // A topic that refuses (closed, spent, full) is told so by sendToTopic; "passed on" is said
+      // only when the words can reach the session (twentieth review).
+      if (this.topics.openRefusal(topicId)) return void (await this.topics.sendToTopic(topicId, turn, { senderId: this.senderId(ctx) }))
       await this.say(topicId, `🎙️ ${shared.audioFile ? 'Audio file' : 'Forwarded voice note'}, passed on as content: ${words}`)
       if (!(await this.topics.sendToTopic(topicId, turn, { senderId: this.senderId(ctx) }))) await this.say(topicId, this.noSessionHint())
     } catch (e) {
@@ -670,9 +678,10 @@ export class TelegramBot {
       await this.bot.api.deleteMessage(this.d.cfg.forumChatId, b.controlMsgId).catch(() => {})
     }
     try {
-      const sent = await this.bot.api.sendMessage(this.d.cfg.forumChatId, topicControlsText(this.d.cfg.catalog, b, undefined, this.kbMode()), {
+      const panel = this.panel(b)
+      const sent = await this.bot.api.sendMessage(this.d.cfg.forumChatId, panel.text, {
         message_thread_id: Number(topicId),
-        reply_markup: topicControlsKb(this.d.cfg.catalog, b, this.kbMode()),
+        reply_markup: panel.kb,
       })
       b.controlMsgId = sent.message_id
       this.d.store.saveRegistry()
@@ -693,7 +702,19 @@ export class TelegramBot {
   }
 
   private async repaintControls(topicId: string, b: Binding, note?: string): Promise<void> {
-    await this.paint(topicId, topicControlsText(this.d.cfg.catalog, b, note, this.kbMode()), topicControlsKb(this.d.cfg.catalog, b, this.kbMode()))
+    const panel = this.panel(b, note)
+    await this.paint(topicId, panel.text, panel.kb)
+  }
+
+  /** The topic's control panel, text and keyboard, from one place. */
+  private panel(b: Binding, note?: string): { text: string; kb: InlineKeyboard } {
+    return { text: topicControlsText(this.d.cfg.catalog, b, note, this.kbMode()), kb: topicControlsKb(this.d.cfg.catalog, b, this.kbMode()) }
+  }
+
+  /** An unpinned copy of the panel, where the pinned one could not be edited or shows nothing new. */
+  private sendPanel(topicId: string, b: Binding): Promise<void> {
+    const panel = this.panel(b)
+    return this.send(topicId, panel.text, panel.kb)
   }
 
   /**
@@ -704,9 +725,8 @@ export class TelegramBot {
   private async refreshPinnedControls(topicId: string, b: Binding): Promise<'edited' | 'unchanged' | 'posted'> {
     if (b.controlMsgId) {
       try {
-        await this.bot.api.editMessageText(this.d.cfg.forumChatId, b.controlMsgId, topicControlsText(this.d.cfg.catalog, b, undefined, this.kbMode()), {
-          reply_markup: topicControlsKb(this.d.cfg.catalog, b, this.kbMode()),
-        })
+        const panel = this.panel(b)
+        await this.bot.api.editMessageText(this.d.cfg.forumChatId, b.controlMsgId, panel.text, { reply_markup: panel.kb })
         return 'edited'
       } catch (e) {
         const outcome = this.editOutcome(e)
@@ -715,7 +735,7 @@ export class TelegramBot {
           // A 429 or a network error: the pinned panel keeps its old state, so the current one
           // (a closed topic's Reopen, say) goes out as an unpinned copy; no re-pin, no notification.
           this.d.log.warn('controls.refresh_failed', { topic: topicId, error: this.describeError(e).text })
-          await this.send(topicId, topicControlsText(this.d.cfg.catalog, b, undefined, this.kbMode()), topicControlsKb(this.d.cfg.catalog, b, this.kbMode()))
+          await this.sendPanel(topicId, b)
           return 'posted'
         }
         // Deleted by hand: posting again is the only way to have a panel at all.
@@ -803,7 +823,7 @@ export class TelegramBot {
     }
     const shown = await this.refreshPinnedControls(topicId, b)
     // A typed /menu whose panel was already current would otherwise show nothing: an unpinned copy.
-    if (shown === 'unchanged' && fresh) await this.send(topicId, topicControlsText(this.d.cfg.catalog, b, undefined, this.kbMode()), topicControlsKb(this.d.cfg.catalog, b, this.kbMode()))
+    if (shown === 'unchanged' && fresh) await this.sendPanel(topicId, b)
     return shown
   }
 
@@ -1145,10 +1165,8 @@ export class TelegramBot {
     }
     if (data === 'm:tres') {
       const hb = this.d.store.registry[topicId]
-      // A binding from before the profile has no hand-off for it: the operator's repo path, branch
-      // and next command are not this forum's, and ensureLive drops them only after this read.
-      const text = hb?.handoff && !(this.d.profile && !hb.profile) ? hb.handoff.text : undefined
-      const h = text ? parseHandoff(text) : undefined
+      // A binding from before the profile was adopted at boot, so no hand-off here is the operator's.
+      const h = hb?.handoff ? parseHandoff(hb.handoff.text) : undefined
       if (!h) return void ack('No hand-off saved for this topic')
       await ack('▶️ Resuming')
       this.status.bump(topicId)
@@ -1422,10 +1440,16 @@ export class TelegramBot {
    */
   replyAllowed(topicId: string | undefined, kind: string, senderId?: string): boolean {
     if (!this.d.cfg.teamMode) return true // the throttles are a shared forum's: one user's notices are all answered
-    // The sender's allowance first: a member past theirs must not use up the topic's one slot
-    // for that kind and silence the notice for a colleague who has not been answered.
-    if (senderId !== undefined && !this.senderReplies.allow(senderId)) return false
-    return this.refusals.allow(`${topicId ?? 'general'}:${kind}`)
+    // Both asked before either is charged: a member past their allowance must not use up the
+    // topic's one slot for that kind and silence a colleague's notice (sixteenth review), and a
+    // reply the topic's slot mutes must not cost the member an allowance they will need for the
+    // one notice that explains their refusal (twentieth review).
+    const key = `${topicId ?? 'general'}:${kind}`
+    if (senderId !== undefined && !this.senderReplies.peek(senderId)) return false
+    if (!this.refusals.peek(key)) return false
+    if (senderId !== undefined) this.senderReplies.allow(senderId)
+    this.refusals.allow(key)
+    return true
   }
 
   /** A refusal notice: "Admins only", the quota, the text-only and voice notices. */

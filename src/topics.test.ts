@@ -762,6 +762,15 @@ describe('bindings from before the profile', () => {
     // its hand-off and approval mode go with it: neither is the profile topic's to resume
     expect(h.store.registry['old'].handoff).toBeUndefined()
     expect(h.store.registry['old'].auto).toBe(false)
+    // and the same adoption runs over the whole registry at boot, so no reader sees the old values first
+    const boot = harness({ profileSessions: true, budgetUsd: 2 })
+    boot.bind('kept', { sessionId: 'full-session-3', auto: true })
+    boot.store.registry['kept'].handoff = { at: 1, text: 'Resume: the operator\'s next command' }
+    boot.store.registry['kept'].spentUsd = 0.3
+    boot.tm.adoptAll()
+    expect(boot.store.registry['kept']).toMatchObject({ profile: true, auto: false, reportedUsd: 0 })
+    expect(boot.store.registry['kept'].sessionId).toBeUndefined()
+    expect(boot.store.registry['kept'].handoff).toBeUndefined()
     // and it is the profile's from now on: the fresh session it opened is resumed by the next stretch
     expect(h.store.registry['old'].profile).toBe(true)
     h.backend.last().emit(result('fresh-1'))
