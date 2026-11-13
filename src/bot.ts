@@ -246,7 +246,10 @@ export class TelegramBot {
     // An inaccessible message (too old for Telegram to hand over) has no keyboard to check: not
     // forged, just unknowable, so the result goes out fresh.
     const keyboard = m && 'reply_markup' in m ? m.reply_markup?.inline_keyboard : undefined
-    const tapped = !!keyboard?.some(row => row.some(btn => 'callback_data' in btn && btn.callback_data === q?.data))
+    // In a shared forum only the tapped message's own button is edited (a forged or stale tap is
+    // not); for one user any tapped message is, as on main, so a quick second tap edits in place
+    // rather than posting a second screen (twenty-third review).
+    const tapped = this.d.cfg.teamMode ? !!keyboard?.some(row => row.some(btn => 'callback_data' in btn && btn.callback_data === q?.data)) : !!m
     if (tapped) {
       try {
         await this.menuCtx!.editMessageText(text, { reply_markup: kb })
@@ -553,17 +556,18 @@ export class TelegramBot {
       if (!this.d.cfg.transcribeCmd) {
         return await this.notice(topicId, 'voice', this.d.profile ? '🎙️ Voice notes are not transcribed on this install: type your question.' : `🎙️ Voice note not transcribed: ${NO_TRANSCRIBER}`, this.senderId(ctx))
       }
+      // In team mode a fresh topic binds (and pays its opening) before any download: a refused
+      // opening costs no transcription. The member's own note then goes the way typed text does,
+      // once heard, into a topic already bound.
+      if (this.d.cfg.teamMode && !this.d.store.registry[topicId] && !(await this.bindFreshProfileTopic(ctx, topicId))) return
+      // The slot is checked and taken with nothing in between, just before the download, so notes
+      // arriving in other topics meanwhile cannot all pass the check and a slot is never held
+      // through the bind's Telegram calls (hook, twenty-third review); the download counts too,
+      // which bounds the disk as well as the processes.
       if (this.transcribing >= MAX_TRANSCRIBING) return await this.notice(topicId, 'voice', `🎙️ ${MAX_TRANSCRIBING} voice notes are being transcribed already. Send it again in a moment.`, this.senderId(ctx))
-      // Reserved before any await, so notes arriving in other topics meanwhile cannot all pass
-      // the check; the download counts too, which bounds the disk as well as the processes.
       this.transcribing++
       let words: string
       try {
-        // In team mode a fresh topic binds (and pays its opening) before any download and after the
-        // refusals that cost nothing: a refused opening costs no transcription, and a refused note
-        // costs no opening. The member's own note then goes the way typed text does, once heard,
-        // into a topic already bound.
-        if (this.d.cfg.teamMode && !this.d.store.registry[topicId] && !(await this.bindFreshProfileTopic(ctx, topicId))) return
         if (topicId) await this.typing(topicId)
         const path = this.d.files.saveInbox(media.file_name || `${media.file_unique_id}.ogg`, await this.download(media.file_id))
         try {
@@ -796,10 +800,10 @@ export class TelegramBot {
    * Every caller reads the registry just before, under the topic's own ordering (one update
    * at a time, handlers queued per topic), so the topic is still unbound here.
    */
-  private async bindFreshProfileTopic(ctx: Context, topicId: string): Promise<boolean> {
+  private async bindFreshProfileTopic(ctx: Context, topicId: string, title?: string): Promise<boolean> {
     if (this.removed.has(topicId)) return false // deleted by an admin while this message waited: gone, or going
     if (!(await this.reserveOpening(ctx, topicId))) return false
-    this.bindProfileTopic(topicId, this.topicTitleOf(ctx) ?? this.defaultTitle(ctx))
+    this.bindProfileTopic(topicId, title ?? this.topicTitleOf(ctx) ?? this.defaultTitle(ctx))
     await this.postPinnedControls(topicId)
     return true
   }
@@ -1251,10 +1255,7 @@ export class TelegramBot {
     if (data === 'm:tdelyes') {
       this.removeTopic(topicId, false)
       await ack('🗑 Deleted')
-      await this.bot.api.deleteForumTopic(this.d.cfg.forumChatId, Number(topicId)).catch(e => {
-        this.removed.delete(topicId) // still there: not a tombstone after all (twenty-second review)
-        this.d.log.warn('topic.delete_failed', { topic: topicId, error: e })
-      })
+      await this.deleteForumTopic(topicId)
       return
     }
     if (data === 'm:twipe') {
@@ -1268,10 +1269,7 @@ export class TelegramBot {
     if (data === 'm:twipeyes') {
       this.removeTopic(topicId, true)
       await ack('🧹 Wiped')
-      await this.bot.api.deleteForumTopic(this.d.cfg.forumChatId, Number(topicId)).catch(e => {
-        this.removed.delete(topicId)
-        this.d.log.warn('topic.wipe_failed', { topic: topicId, error: e })
-      })
+      await this.deleteForumTopic(topicId)
       return
     }
     await ack()
@@ -1280,8 +1278,26 @@ export class TelegramBot {
   /** Topics deleted this process: a note still being heard there must not bind it again while Telegram removes it. */
   private readonly removed = new Set<string>()
 
+  /**
+   * The Telegram side of a deletion, after the bot's own. A refusal keeps the tombstone: the
+   * binding, the session and (for a wipe) the transcript are already gone, so the topic is the
+   * admin's to delete by hand or retry, not a fresh topic for the next member line; the admin
+   * is told. A success lets the tombstone go once any note still queued there has had time to
+   * finish, so the set does not grow for the process's life (twenty-third review).
+   */
+  private async deleteForumTopic(topicId: string): Promise<void> {
+    try {
+      await this.bot.api.deleteForumTopic(this.d.cfg.forumChatId, Number(topicId))
+      setTimeout(() => this.removed.delete(topicId), 10 * 60_000).unref()
+    } catch (e) {
+      this.d.log.warn('topic.delete_failed', { topic: topicId, error: e })
+      await this.say(topicId, '🗑 The bot has let this topic go, but Telegram would not delete it (the log has the detail). Delete it by hand, or try again; it takes no new messages.')
+    }
+  }
+
   private removeTopic(topicId: string, wipe: boolean): void {
     this.removed.add(topicId)
+    this.anonymousNoticed.delete(topicId)
     const sid = this.d.store.registry[topicId]?.sessionId
     this.topics.userTookOver(topicId)
     this.topics.closeLive(topicId, wipe ? 'wiped by user' : 'deleted by user')
@@ -1325,7 +1341,16 @@ export class TelegramBot {
       if (this.d.profile && profileFreshOnly(`/${typed.cmd}`)) return void this.say(topicId, PROFILE_FRESH)
       switch (typed.cmd) {
         case 'new': {
-          if (this.d.profile) return this.createProfileTopic(ctx, parseTeamNew(typed.args, this.memberOf(ctx), new Date()).title, topicId, 'text')
+          if (this.d.profile) {
+            const title = parseTeamNew(typed.args, this.memberOf(ctx), new Date()).title
+            // Typed into a fresh topic a member made by hand, /new names and binds that topic: a second
+            // one would cost a second opening and leave this one unbound (twenty-third review).
+            if (this.d.cfg.teamMode && topicId && !this.d.store.registry[topicId]) {
+              if (await this.bindFreshProfileTopic(ctx, topicId, title)) await this.say(topicId, `✅ This topic is "${title}". Type your question below.`)
+              return
+            }
+            return this.createProfileTopic(ctx, title, topicId, 'text')
+          }
           const { name, cwd, auto, notes } = parseNew(typed.args, this.d.store.defaultCwd())
           for (const n of notes) await this.say(topicId, n)
           await this.newSession(name, cwd, this.d.store.prefs.defaultModel, this.d.store.prefs.defaultEffort, auto, topicId)
@@ -1437,8 +1462,8 @@ export class TelegramBot {
   /** A member's topic creations, ten a minute: a creation Telegram refuses is refunded, so the day's allowance alone does not bound the attempts. */
   private readonly creations = new Throttle(60_000, () => Date.now(), 10)
 
-  /** Whether a reply a member can trigger at will is muted now; counted when it is. */
-  private muted(topicId: string | undefined, kind: string, senderId?: string): boolean {
+  /** Whether a reply a member can trigger at will is muted now; counted when it is. The manager's refusals ask this too. */
+  muted(topicId: string | undefined, kind: string, senderId?: string): boolean {
     if (this.replyAllowed(topicId, kind, senderId)) return false
     this.d.metrics.inc('refusals_muted')
     return true

@@ -128,8 +128,10 @@ export type TopicDeps = {
   shared?: boolean
   /** In a shared forum, a turn with no result for this long is stuck and may be paused for a new topic. */
   stuckTurnMs?: number
-  /** The bot's one rule for replies a member can trigger at will (topic and kind, and the sender's allowance): a refusal notice goes out only when it says so. */
-  replyAllowed: (topicId: string, kind: string, senderId?: string) => boolean
+  /** The bot's one rule for replies a member can trigger at will (topic and kind, and the sender's allowance): true when a notice is muted now, counted there. */
+  replyMuted: (topicId: string, kind: string, senderId?: string) => boolean
+  /** Whether a session's transcript is still on disk (undefined: could not look); without a definite no, a failed resume is never read as a lost transcript. */
+  transcriptExists?: (sessionId: string) => boolean | undefined
 }
 
 export const CONTINUE_AFTER_LIMIT =
@@ -216,7 +218,9 @@ export class TopicManager {
    * not hold its slot forever (twelfth review).
    */
   private pausable(l: Live): boolean {
-    return !this.d.shared || !isBusy(l) || this.stuck(l)
+    // A turn parked on a rate limit holds no API call: pausing it loses nothing (its resume
+    // opens a fresh stretch), so it must not hold a slot for hours (twenty-third review).
+    return !this.d.shared || !isBusy(l) || this.stuck(l) || this.resumeTimers.has(l.topicId)
   }
 
   /**
@@ -230,7 +234,7 @@ export class TopicManager {
       if (!oldest) break
       // Said on the paused topic, which in a shared forum is usually a colleague's: on the reply
       // rule, so a member alternating between their own topics cannot post there at will.
-      if (this.d.replyAllowed(oldest.topicId, 'paused')) void this.d.say(oldest.topicId, this.stuck(oldest) ? STUCK_PAUSED : `💤 Paused to free a slot (max ${this.d.maxLiveSessions} live sessions). Send a message here to resume — your context is kept.`)
+      if (!this.d.replyMuted(oldest.topicId, 'paused')) void this.d.say(oldest.topicId, this.stuck(oldest) ? STUCK_PAUSED : `💤 Paused to free a slot (max ${this.d.maxLiveSessions} live sessions). Send a message here to resume — your context is kept.`)
       this.d.metrics.inc('sessions_evicted_cap')
       this.closeLive(oldest.topicId, 'evicted (session cap)')
     }
@@ -291,12 +295,13 @@ export class TopicManager {
     if (changed) this.d.store.saveRegistry()
   }
 
-  ensureLive(topicId: string): Live | undefined {
+  /** The topic's live session, opened if need be; `refusalChecked` when the caller asked openRefusal() just now, so the live map is walked once. */
+  ensureLive(topicId: string, refusalChecked = false): Live | undefined {
     const existing = this.live.get(topicId)
     if (existing) return existing
     const b = this.d.store.registry[topicId]
     if (!b) return undefined
-    if (this.openRefusal(topicId)) return undefined
+    if (!refusalChecked && this.openRefusal(topicId)) return undefined
     // A stretch gets what is left of the topic's budget, so it cannot overshoot the cap by
     // a whole fresh budget. This is consistent with the pump's accounting, not at odds with
     // it: the SDK's `maxBudgetUsd` counts only the spend since this query() started (the CLI
@@ -489,9 +494,11 @@ export class TopicManager {
    * new, still idle session before it was used (Codex hook).
    */
   private openFor(topicId: string): Live | { refused: 'closed' | 'budget' | 'busy' } | undefined {
+    // The refusal first, before the live session is found: a topic still live but over its budget
+    // (or closed, or full) is refused, not written into. Asked once; ensureLive is told.
     const why = this.openRefusal(topicId)
     if (why) return { refused: why }
-    return this.ensureLive(topicId)
+    return this.ensureLive(topicId, true)
   }
 
   /** A refused send: said, unless the message is a quiet nudge, which reports undelivered. */
@@ -504,8 +511,7 @@ export class TopicManager {
   private async refuse(topicId: string, why: 'closed' | 'budget' | 'busy', senderId?: string): Promise<void> {
     this.d.metrics.inc(`${why}_refusals`)
     // The bot's one rule for replies a member can trigger: topic and kind, and the sender's allowance.
-    if (this.d.replyAllowed(topicId, why, senderId)) await this.d.say(topicId, this.refusalNotice(why))
-    else this.d.metrics.inc('refusals_muted')
+    if (!this.d.replyMuted(topicId, why, senderId)) await this.d.say(topicId, this.refusalNotice(why))
   }
 
   private refusalNotice(why: 'closed' | 'budget' | 'busy'): string {
@@ -522,6 +528,8 @@ export class TopicManager {
   private async pump(l: Live): Promise<void> {
     const topicId = l.topicId
     const st = newPumpState(this.d.store.registry[topicId]?.sessionId)
+    const resumedId = this.d.store.registry[topicId]?.sessionId
+    let answered = false
     try {
       for await (const msg of l.session.stream()) {
         // A turn still producing is never stuck. lastActive stays what it is on main (a message or
@@ -587,6 +595,7 @@ export class TopicManager {
             }
             case 'turnEnd':
             case 'turnError': {
+              answered = true
               // The topic's spend, from every result, success or failure, by each total's increment
               // over the last total the transcript reported: a total at or above it continues it
               // (within a stretch, and across a resume whose transcript saved its total, per the
@@ -661,8 +670,29 @@ export class TopicManager {
     } catch (e) {
       this.d.metrics.inc('sdk_stream_errors')
       this.d.log.error('session.stream_error', { topic: topicId, error: e })
-      // Under a profile the detail stays in the log: a spawn or transcript error names host paths.
-      await this.d.say(topicId, this.d.profileSessions ? '⚠️ session error; the operator has the detail. Send your message again in a moment.' : `⚠️ session error: ${e instanceof Error ? e.message : String(e)}`)
+      // A stretch that failed before any result on a resume cannot resume that transcript (gone,
+      // or refused by the CLI): the next message opens fresh, said once, rather than failing on
+      // every message for good (seventh security read).
+      const b = this.d.store.registry[topicId]
+      // A failure before any result on a resume whose transcript is gone from disk (the CLI's own
+      // cleanup removes old ones) would repeat on every message for good: the session id goes, so
+      // the next message opens fresh, said on its own kind. Confirmed on disk, never inferred from
+      // the failure: a transient one (auth, network, a process that would not start) keeps a
+      // transcript that is still there, and a directory that could not be read is unknown, not
+      // gone (seventh security read; Codex hook, three times).
+      const unresumable = !!resumedId && !answered && !!b && b.sessionId === resumedId && this.d.transcriptExists?.(resumedId) === false
+      if (b && unresumable) {
+        b.sessionId = undefined
+        if (this.d.budgetUsd !== undefined) b.reportedUsd = 0
+        this.d.store.saveRegistry()
+      }
+      // On the reply rule: a member's message is what opens the stretch. Under a profile the
+      // detail stays in the log: a spawn or transcript error names host paths.
+      if (unresumable) {
+        if (!this.d.replyMuted(topicId, 'resume')) await this.d.say(topicId, '⚠️ The earlier conversation here is gone and could not be resumed; the next message starts fresh.')
+      } else if (!this.d.replyMuted(topicId, 'error')) {
+        await this.d.say(topicId, this.d.profileSessions ? '⚠️ session error; the operator has the detail. Send your message again in a moment.' : `⚠️ session error: ${e instanceof Error ? e.message : String(e)}`)
+      }
     } finally {
       // The stream ended (closed, crashed or completed): always terminate the process,
       // otherwise every resume spawns a fresh one while the old lingers.

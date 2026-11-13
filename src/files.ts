@@ -105,6 +105,31 @@ export function deleteTranscript(sessionId: string, projectsDir = join(homedir()
   return removed
 }
 
+/**
+ * Whether a session's transcript is still on disk, in any project under ~/.claude/projects:
+ * what makes a resume possible at all. Undefined when the directory cannot be read: unknown
+ * is not gone (a permission or a passing filesystem failure must not cost a transcript).
+ */
+export function transcriptExists(sessionId: string, projectsDir = join(homedir(), '.claude', 'projects')): boolean | undefined {
+  let projects: string[]
+  try {
+    projects = readdirSync(projectsDir)
+  } catch {
+    return undefined
+  }
+  let unknown = false
+  for (const p of projects) {
+    try {
+      statSync(join(projectsDir, p, `${sessionId}.jsonl`))
+      return true
+    } catch (e) {
+      // Only "no such file" is a no; a permission or a non-directory in the way is a place not looked at.
+      if ((e as { code?: string }).code !== 'ENOENT') unknown = true
+    }
+  }
+  return unknown ? undefined : false
+}
+
 /** Candidate working dirs: the default first, then every project under reposDir (git repos first, newest first), then home. */
 export function listRepoFolders(reposDir: string, defaultCwd: string): string[] {
   const entries: { path: string; mtime: number; git: boolean }[] = []

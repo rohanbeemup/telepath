@@ -21,7 +21,7 @@ import { API_CONSTANTS } from 'grammy'
 import { TelegramBot } from './src/bot'
 import { COMMANDS } from './src/commands'
 import { ConfigError, mergeEnvFile, parseConfig, parseEnvFile, type Config } from './src/config'
-import { Files } from './src/files'
+import { Files, transcriptExists } from './src/files'
 import { ErrorRing, Logger, Metrics } from './src/log'
 import { bundledClaudePath, checkClaudeVersion, MIN_CLAUDE_VERSION, readClaudeVersion } from './src/preflight'
 import { parseProfile, ProfileError, profileModelProblem, teamProfileProblems, type Profile } from './src/profile'
@@ -180,7 +180,7 @@ const topics = new TopicManager({
   metrics,
   primeContract: !profile,
   budgetUsd: profile?.maxBudgetUsd,
-  profileSessions: !!profile, shared: cfg.teamMode, stuckTurnMs: cfg.stuckTurnMinutes * 60_000, replyAllowed: (t, k, s) => bot.replyAllowed(t, k, s),
+  profileSessions: !!profile, shared: cfg.teamMode, stuckTurnMs: cfg.stuckTurnMinutes * 60_000, replyMuted: (t, k, s) => bot.muted(t, k, s), transcriptExists,
 })
 bot.attachTopics(topics)
 // Bindings from the other side of the profile line become this side's in one pass, so no reader

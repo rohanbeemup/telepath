@@ -62,7 +62,7 @@ function fakeRotator(over: Partial<Rotator> = {}): Rotator & { handedOff: unknow
 
 type FakeRotator = ReturnType<typeof fakeRotator>
 
-function harness(over: { maxLive?: number; idleMinutes?: number; rotator?: FakeRotator; now?: () => number; resumeBufferMs?: number; primeContract?: boolean; budgetUsd?: number; profileSessions?: boolean; shared?: boolean; stuckTurnMs?: number } = {}) {
+function harness(over: { maxLive?: number; idleMinutes?: number; rotator?: FakeRotator; now?: () => number; resumeBufferMs?: number; primeContract?: boolean; budgetUsd?: number; profileSessions?: boolean; shared?: boolean; stuckTurnMs?: number; transcriptExists?: (id: string) => boolean | undefined } = {}) {
   const store = new Store('/nowhere', {}, { defaultModel: 'claude-opus-5', defaultCwd: '/w' }, { defaultModel: 'claude-opus-5', defaultCwd: '/w' })
   // never touch disk in these tests
   store.saveRegistry = () => {}
@@ -95,7 +95,8 @@ function harness(over: { maxLive?: number; idleMinutes?: number; rotator?: FakeR
     shared: over.shared,
     stuckTurnMs: over.stuckTurnMs,
     // the bot's rule, stood in for by its own kind of throttle: one notice a minute per topic and kind
-    replyAllowed: (t, k) => refusals.allow(`${t}:${k}`),
+    replyMuted: (t, k) => !refusals.allow(`${t}:${k}`),
+    transcriptExists: over.transcriptExists,
   })
   const bind = (topicId: string, b: Partial<{ model: string; effort: 'low' | 'high' | 'max'; sessionId: string; auto: boolean }> = {}) => {
     store.registry[topicId] = { cwd: '/w', model: b.model ?? 'claude-opus-5', effort: b.effort, sessionId: b.sessionId, title: 't' + topicId, lastActive: 0, auto: b.auto }
@@ -200,6 +201,14 @@ describe('TopicManager', () => {
     t += 10 * 60_000
     h.tm.evictIdle()
     expect(h.tm.isLive('parked')).toBe(true)
+    // but it is pausable for a newcomer: it holds no API call, and its resume opens a fresh stretch
+    h.bind('filler')
+    await h.tm.sendToTopic('filler', 'x') // the other slot: a turn running now
+    h.bind('newer')
+    expect(await h.tm.sendToTopic('newer', 'x')).toBe(true)
+    expect(h.tm.isLive('newer')).toBe(true)
+    expect(h.tm.isLive('filler')).toBe(true)
+    expect(h.tm.isLive('parked')).toBe(false)
     h.tm.userTookOver('parked') // clears the scheduled resume, so the test leaves no timer behind
     // where the forum is one person's, the longest-idle session is paused for the new topic, running or not, as before
     const own = harness({ maxLive: 1 })
@@ -821,14 +830,49 @@ describe('bindings from before the profile', () => {
         },
       }),
     }
-    const broken = harness({ profileSessions: true })
-    broken.backend.open = () => failing as unknown as LiveSession
-    broken.bind('err')
+    const broken = harness({ profileSessions: true, budgetUsd: 2, transcriptExists: id => (id === 'unknown-1' ? undefined : id !== 'gone-1') })
+    broken.backend.open = opts => {
+      broken.backend.opens.push(opts)
+      return failing as unknown as LiveSession
+    }
+    broken.bind('err', { sessionId: 'gone-1' })
+    broken.store.registry['err'].profile = true
     await broken.tm.sendToTopic('err', 'hello')
     await broken.tick()
-    const said = broken.said.find(([topic, text]) => topic === 'err' && /session error/i.test(text))
-    expect(said).toBeTruthy()
-    expect(said![1]).not.toMatch(/ENOENT|\/home\//)
+    // a failure before any result on a resume whose transcript is gone from disk drops the session id, said
+    // on its own kind and without a path: the next message opens fresh rather than failing on every message
+    const gone = broken.said.find(([topic, text]) => topic === 'err' && /could not be resumed/i.test(text))
+    expect(gone).toBeTruthy()
+    expect(gone![1]).not.toMatch(/ENOENT|\/home\//)
+    expect(broken.store.registry['err'].sessionId).toBeUndefined()
+    await broken.tm.sendToTopic('err', 'again')
+    await broken.tick()
+    expect(broken.backend.opens.map(o => o.resume)).toEqual(['gone-1', undefined])
+    // while a failure on a transcript still on disk is a blip, confirmed, never inferred: the ordinary
+    // error, without its detail, and the transcript kept
+    broken.bind('kept', { sessionId: 'alive-1' })
+    broken.store.registry['kept'].profile = true
+    await broken.tm.sendToTopic('kept', 'hello')
+    await broken.tick()
+    const blip = broken.said.find(([topic, text]) => topic === 'kept' && /session error/i.test(text))
+    expect(blip).toBeTruthy()
+    expect(blip![1]).not.toMatch(/ENOENT|\/home\//)
+    expect(broken.store.registry['kept'].sessionId).toBe('alive-1')
+    // and a directory that could not be read is unknown, not gone: the transcript is kept too
+    broken.bind('unread', { sessionId: 'unknown-1' })
+    broken.store.registry['unread'].profile = true
+    await broken.tm.sendToTopic('unread', 'hello')
+    await broken.tick()
+    expect(broken.store.registry['unread'].sessionId).toBe('unknown-1')
+    // a failure with no transcript to drop is an ordinary error, said without its detail under a profile
+    const fresh = harness({ profileSessions: true })
+    fresh.backend.open = () => failing as unknown as LiveSession
+    fresh.bind('e2')
+    await fresh.tm.sendToTopic('e2', 'hello')
+    await fresh.tick()
+    const generic = fresh.said.find(([topic, text]) => topic === 'e2' && /session error/i.test(text))
+    expect(generic).toBeTruthy()
+    expect(generic![1]).not.toMatch(/ENOENT|\/home\//)
     // and with its detail where the forum is one person's, as before
     const own = harness()
     own.backend.open = () => failing as unknown as LiveSession
