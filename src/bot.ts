@@ -65,6 +65,8 @@ export type BotDeps = {
   statusText: () => string
   /** The locked session profile, when one is configured (team mode requires it). */
   profile?: Profile
+  /** The keys the daemon loaded from .env: none of them reaches the transcriber. */
+  envFileKeys?: string[]
 }
 
 type Pending = { resolve: (r: PermissionResult) => void; topicId: string; messageId?: number }
@@ -574,7 +576,7 @@ export class TelegramBot {
         if (topicId) await this.typing(topicId)
         const path = this.d.files.saveInbox(media.file_name || `${media.file_unique_id}.ogg`, await this.download(media.file_id))
         try {
-          words = await transcribe(path, this.d.cfg.transcribeCmd)
+          words = await transcribe(path, this.d.cfg.transcribeCmd, undefined, this.d.envFileKeys)
         } finally {
           this.d.files.removeInbox(path)
         }
@@ -1194,10 +1196,13 @@ export class TelegramBot {
       // not hear "Resuming" and then a refusal, or nothing (thirtieth review).
       if (await this.topics.refuseNow(topicId, this.senderId(ctx))) return void ack('Not now: see the notice in this topic')
       await ack('▶️ Resuming')
-      this.status.bump(topicId)
-      await this.typing(topicId)
-      await this.topics.sendToTopic(topicId, resumePrompt(h), { senderId: this.senderId(ctx) })
-      return
+      // Queued behind a voice note still being heard in this topic, as typed text is, so the resume
+      // does not jump ahead of words already on their way (thirty-first review).
+      return this.inOrder(ctx, async () => {
+        this.status.bump(topicId)
+        await this.typing(topicId)
+        await this.topics.sendToTopic(topicId, resumePrompt(h), { senderId: this.senderId(ctx) })
+      })
     }
     if (data === 'm:tf') {
       if (!b) return void ack('No session here')

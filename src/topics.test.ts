@@ -781,11 +781,16 @@ describe('bindings from before the profile', () => {
   test('under a profile, a binding made before the profile opens a fresh session, not its old transcript', async () => {
     const h = harness({ profileSessions: true })
     // a binding the single-user install made, with a full session's transcript behind it
-    h.bind('old', { sessionId: 'full-session-1', auto: true })
+    h.bind('old', { sessionId: 'full-session-1', auto: true, model: 'claude-x-disabled-since', effort: 'max' })
     h.store.registry['old'].handoff = { at: 1, text: 'Resume: push branch fix/x from /home/op/repo, then run the deploy' }
     await h.tm.sendToTopic('old', 'hello')
     expect(h.backend.opens[0].resume).toBeUndefined()
     expect(h.store.registry['old'].sessionId).toBeUndefined()
+    // its model and effort were never checked against the profile or the enabled catalog: the install's
+    // defaults take their place, as for a fresh binding (thirty-first review)
+    expect(h.store.registry['old'].model).toBe('claude-opus-5')
+    expect(h.store.registry['old'].effort).toBeUndefined()
+    expect(h.backend.opens[0].model).toBe('claude-opus-5')
     // its hand-off and approval mode go with it: neither is the profile topic's to resume
     expect(h.store.registry['old'].handoff).toBeUndefined()
     expect(h.store.registry['old'].auto).toBe(false)

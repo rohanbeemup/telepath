@@ -73,7 +73,7 @@
   the user's instructions; a voice note in General is refused like a photo. Transcription runs in
   the background with a 3-minute limit and a per-topic queue, so later messages in that topic wait
   for it while no other topic is held up; every failure, an unset `TRANSCRIBE_CMD` included, is
-  answered in the topic. The pre-0.2.0 fork had this; the rewrite dropped it and voice notes were
+  answered in the topic. The transcriber runs without anything `.env` holds. The pre-0.2.0 fork had this; the rewrite dropped it and voice notes were
   ignored without a trace.
 
 ## 0.2.0 — 2026-09-22

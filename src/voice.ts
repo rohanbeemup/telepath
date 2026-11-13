@@ -22,18 +22,25 @@ export function parseTranscript(out: string): string {
 
 export const NO_TRANSCRIBER = "voice notes need TRANSCRIBE_CMD in telepath's .env (a command that prints the words of the audio file it is given)"
 
-/** Transcribe one audio file. Async, so a slow transcription holds up nothing else. */
-export async function transcribe(path: string, cmd: string | undefined, timeoutMs = 180_000): Promise<string> {
+/**
+ * Transcribe one audio file. Async, so a slow transcription holds up nothing else. `scrub` is
+ * every key the daemon loaded from .env: none of them reaches the transcriber.
+ */
+export async function transcribe(path: string, cmd: string | undefined, timeoutMs = 180_000, scrub: Iterable<string> = []): Promise<string> {
   if (!cmd) throw new VoiceError(NO_TRANSCRIBER)
   const out = await new Promise<string>((resolve, reject) => {
     // Its own process group, so a timeout ends everything it started: a wrapper script's own
     // children (python, ffmpeg) would otherwise outlive every kill of the script and pile up.
     const group = process.platform !== 'win32'
     const [exe, ...args] = splitCommand(cmd)
-    // The transcriber hears audio anyone in the forum sent; it gets none of the bot's secrets.
+    // The transcriber hears audio anyone in the forum sent; it gets nothing .env holds (every key
+    // handed in as `scrub`, so the rule is the file and not a list that rots; thirty-first review),
+    // nor the two secrets named here whatever loaded them. The shell's own variables stay: a
+    // transcriber needs the operator's PATH and model caches.
     const env = { ...process.env }
     delete env.TELEGRAM_BOT_TOKEN
     delete env.ANTHROPIC_API_KEY
+    for (const k of scrub) delete env[k]
     const child = spawn(exe, [...args, path], { stdio: ['ignore', 'pipe', 'pipe'], detached: group, windowsHide: true, env })
     const stop = () => {
       try {

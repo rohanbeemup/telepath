@@ -46,6 +46,9 @@ gate: bun test src/voice.test.ts
 |---|---|---|
 | `a transcript that starts with a slash is still text` | a transcript is never cut or rewritten beyond the tag (it goes on to the same parser as typed text) | trimming words or punctuation from the transcript |
 | `the user's own voice note is their turn, as if typed` | the user's own note is framed, or its caption dropped (dictated commands such as `stop` must keep working) | framing every note as content; dropping the caption |
+| `a forwarded transcript cannot break out of its fence with a closing tag (injection)` | a `</transcript>` inside forwarded words is defanged, so only the wrapper's own closing tag survives and the injected text stays inside the block framed as content | the words passed as they are, so a forwarded note closes the fence and its next line reads as the user's instructions |
+| `a forwarded sender name is quoted and labelled untrusted; the user's own caption is kept whole` | a sender name is one quoted line labelled untrusted (its newlines collapsed), while the user's own caption is kept in full | the name passed with its newlines, so a crafted name adds framing lines of its own; the caption truncated, so a dictated instruction loses its end |
+| `a forwarded sender name cannot break out of its quoting or spoof the fence` | a double quote in a sender name is neutralised and a fence delimiter in it defanged, so the name can neither close its quoting nor add a closing tag | the quote kept, so the name ends the quoted field and the rest reads as framing; the delimiter kept, so the name closes the transcript block |
 
 Widened 2026-10-14 after the Codex pre-commit review: running the transcription in the
 background let a message typed right after a voice note overtake it, so the last two rows
@@ -56,6 +59,11 @@ test runtime (the shell scripts failed on Windows); a forwarded note or an audio
 content, not the user's turn (in an auto-mode topic its words would otherwise run tools); a
 caption is kept; `TRANSCRIBE_CMD` may carry arguments; the transcriber's output is decoded as one
 stream (also found by the Codex branch review).
+
+Widened 2026-11-13: the three injection-hardening rows at the end of the negative table name
+cases the suite already ran that no plan had named; they surfaced when the team-mode plan
+listed this suite for its one case here (the transcriber's environment), and they are this
+feature's, so their rows are here.
 
 ## Out of scope
 

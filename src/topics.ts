@@ -281,6 +281,11 @@ export class TopicManager {
     b.profile = underProfile
     delete b.handoff
     b.auto = false
+    // Its model and effort were never checked against the profile or the enabled catalog (a model
+    // disabled since would error every turn, unexplained to the forum), so the install's defaults
+    // take their place, as for a fresh binding (thirty-first review).
+    b.model = this.d.store.prefs.defaultModel
+    b.effort = this.d.store.prefs.defaultEffort
     if (this.d.budgetUsd !== undefined) b.reportedUsd = 0
     return true
   }

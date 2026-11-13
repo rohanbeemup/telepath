@@ -38,9 +38,13 @@ const STARTED = Date.now()
 // ── config ─────────────────────────────────────────────────────────────────
 const stateDir = process.env.TG_CLAUDE_STATE_DIR || import.meta.dir
 const envFile = join(stateDir, '.env')
+// The keys .env holds: none of them reaches the transcriber, whatever they are (thirty-first review).
+let envFileKeys: string[] = []
 try {
   chmodSync(envFile, 0o600) // it holds the bot token (a no-op on NTFS)
-  mergeEnvFile(process.env, parseEnvFile(readFileSync(envFile, 'utf8')))
+  const fromFile = parseEnvFile(readFileSync(envFile, 'utf8'))
+  mergeEnvFile(process.env, fromFile)
+  envFileKeys = Object.keys(fromFile)
 } catch {}
 
 let cfg: Config
@@ -162,7 +166,7 @@ function statusText(): string {
   )
 }
 
-const bot = new TelegramBot({ cfg, store, files, log, metrics, statusText, profile })
+const bot = new TelegramBot({ cfg, store, files, log, metrics, statusText, profile, envFileKeys })
 
 const topics = new TopicManager({
   store,
@@ -256,7 +260,9 @@ try {
     // chat_member updates reach admins only; without them a removed member keeps access until the TTL,
     // and topics are created with Manage Topics. Refused, not warned (twenty-eighth review): the forum
     // would run with fewer limits than asked, as with a profile problem, and the fix is one Telegram
-    // setting. A lookup that fails is unknown, not a no: the boot goes on, said.
+    // setting. A lookup that fails is a precondition not read, refused too (thirty-first review): a
+    // boot that went on would run with exactly the two gaps the check exists to refuse, and the
+    // service restarts it.
     try {
       const self = await bot.bot.api.getChatMember(cfg.forumChatId, me.id)
       if (self.status !== 'administrator' && self.status !== 'creator') {
@@ -271,7 +277,8 @@ try {
         process.exit(2)
       }
     } catch (e) {
-      log.warn('preflight.bot_membership_unknown', { error: e })
+      process.stderr.write(`team mode: could not read the bot's membership of ${cfg.forumChatId} (${e instanceof Error ? e.message : String(e)}); the admin check is not skipped. Start again once Telegram answers.\n`)
+      process.exit(2)
     }
   }
   // The published menu reads the one command table (src/commands.ts), like the gate and the

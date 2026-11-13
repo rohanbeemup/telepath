@@ -119,6 +119,23 @@ describe('voice notes', () => {
     expect(await transcribe('/tmp/note.ogg', split)).toBe('café 🎤')
   })
 
+  test('the transcriber runs without anything .env holds', async () => {
+    const cmd = script('env', `process.stdout.write(['TELEGRAM_BOT_TOKEN', 'MY_SECRET', 'KEEP'].map(k => process.env[k] ?? 'absent').join(' '))`)
+    process.env.TELEGRAM_BOT_TOKEN = 't'
+    process.env.MY_SECRET = 'bearer'
+    process.env.KEEP = 'shell'
+    try {
+      // the two named secrets always go; every key .env loaded goes too (thirty-first review: a bearer or an
+      // OAuth token kept in .env reached a process that chews member-sent audio); the shell's own stays
+      expect(await transcribe('/nowhere/a.ogg', cmd, 10_000, ['MY_SECRET'])).toBe('absent absent shell')
+      expect(await transcribe('/nowhere/a.ogg', cmd, 10_000)).toBe('absent bearer shell')
+    } finally {
+      delete process.env.TELEGRAM_BOT_TOKEN
+      delete process.env.MY_SECRET
+      delete process.env.KEEP
+    }
+  })
+
   test('a message sent after a voice note waits for its transcript', async () => {
     const order = new TopicOrder()
     const seen: string[] = []
