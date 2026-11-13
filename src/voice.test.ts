@@ -120,15 +120,18 @@ describe('voice notes', () => {
   })
 
   test('the transcriber runs without anything .env holds', async () => {
-    const cmd = script('env', `process.stdout.write(['TELEGRAM_BOT_TOKEN', 'MY_SECRET', 'KEEP'].map(k => process.env[k] ?? 'absent').join(' '))`)
+    const cmd = script('env', `process.stdout.write(['TELEGRAM_BOT_TOKEN', 'MY_SECRET', 'KEEP', 'PATH', 'HOME'].map(k => process.env[k] === undefined ? 'absent' : k === 'PATH' || k === 'HOME' ? k.toLowerCase() : process.env[k]).join(' '))`)
     process.env.TELEGRAM_BOT_TOKEN = 't'
     process.env.MY_SECRET = 'bearer'
     process.env.KEEP = 'shell'
     try {
-      // the two named secrets always go; every key .env loaded goes too (thirty-first review: a bearer or an
-      // OAuth token kept in .env reached a process that chews member-sent audio); the shell's own stays
-      expect(await transcribe('/nowhere/a.ogg', cmd, 10_000, ['MY_SECRET'])).toBe('absent absent shell')
-      expect(await transcribe('/nowhere/a.ogg', cmd, 10_000)).toBe('absent bearer shell')
+      // the two named secrets always go; every key .env names goes too, whether or not the shell had set it as
+      // well (thirty-first review: a bearer or an OAuth token kept in .env reached a process that chews member-sent
+      // audio; thirty-third, from the security read: a unit whose EnvironmentFile is the same .env presets every
+      // key, so "the shell had it" must not exempt a secret); the harmless names a transcriber needs (PATH, HOME,
+      // the locale, temp and cache directories) stay even when .env names them, and the shell's own stays
+      expect(await transcribe('/nowhere/a.ogg', cmd, 10_000, ['MY_SECRET', 'PATH', 'HOME'])).toBe('absent absent shell path home')
+      expect(await transcribe('/nowhere/a.ogg', cmd, 10_000)).toBe('absent bearer shell path home')
     } finally {
       delete process.env.TELEGRAM_BOT_TOKEN
       delete process.env.MY_SECRET

@@ -55,19 +55,9 @@ export function parseEnvFile(text: string): Record<string, string> {
   return out
 }
 
-/**
- * The shell wins over the file: a per-run override must stay possible. Returns the keys the file
- * loaded (absent from the environment before), which is what the transcriber must not see; a key
- * the shell had set is not the file's, so it is not reported (thirty-second review).
- */
-export function mergeEnvFile(env: Record<string, string | undefined>, file: Record<string, string>): string[] {
-  const loaded: string[] = []
-  for (const [k, v] of Object.entries(file)) {
-    if (env[k] !== undefined) continue
-    env[k] = v
-    loaded.push(k)
-  }
-  return loaded
+/** The shell wins over the file: a per-run override must stay possible. */
+export function mergeEnvFile(env: Record<string, string | undefined>, file: Record<string, string>): void {
+  for (const [k, v] of Object.entries(file)) if (env[k] === undefined) env[k] = v
 }
 
 const LOG_LEVELS: LogLevel[] = ['debug', 'info', 'warn', 'error']

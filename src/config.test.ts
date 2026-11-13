@@ -15,15 +15,6 @@ describe('env file', () => {
     mergeEnvFile(env, { A: 'file', B: 'file' })
     expect(env).toEqual({ A: 'shell', B: 'file' })
   })
-
-  test('mergeEnvFile reports the keys it loaded, not those the shell already had', () => {
-    // the transcriber is stripped of what .env loaded: a PATH= line the shell had already set is
-    // skipped by the merge and must stay with the transcriber (thirty-second review)
-    const env: Record<string, string | undefined> = { PATH: '/usr/bin', A: 'shell' }
-    expect(mergeEnvFile(env, { PATH: '/opt/venv/bin', A: 'file', SECRET: 'x', EMPTY: '' })).toEqual(['SECRET', 'EMPTY'])
-    expect(env).toEqual({ PATH: '/usr/bin', A: 'shell', SECRET: 'x', EMPTY: '' })
-    expect(mergeEnvFile(env, {})).toEqual([])
-  })
 })
 
 describe('config', () => {

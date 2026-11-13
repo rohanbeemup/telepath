@@ -78,6 +78,16 @@ const HANDOFF_MAX = 4000
 /** Said when a running turn is ended as stuck: the turn and what was sent during it are gone, the transcript before it stays. */
 const STUCK_PAUSED = '💤 Paused: no output for a while. The unfinished turn, and anything sent during it, is lost; send it again to continue — the earlier context is kept.'
 
+/**
+ * The one wording for a spent topic, wherever it is said (the refusal of a message, a continuation
+ * not resumed, the turn that spent the last of it): three hand-written copies had drifted apart
+ * (thirty-third review).
+ */
+export function budgetNotice(budgetUsd?: number): string {
+  const cap = budgetUsd !== undefined ? ` ($${budgetUsd.toFixed(2)})` : ''
+  return `This topic has used its budget${cap}. Open a new topic for the next question; an admin can delete this one.`
+}
+
 export type Rotator = {
   enabled(): boolean
   active(): string | undefined
@@ -128,6 +138,9 @@ export type TopicDeps = {
   shared?: boolean
   /** In a shared forum, a turn with no result for this long is stuck and may be paused for a new topic. */
   stuckTurnMs?: number
+  /** The profile's pinned model and effort, when it pins them: what an adopted binding records, as a fresh profile topic does. */
+  profileModel?: string
+  profileEffort?: Effort
   /** The bot's one rule for replies a member can trigger at will (topic and kind, and the sender's allowance): true when a notice is muted now, counted there. */
   replyMuted: (topicId: string, kind: string, senderId?: string) => boolean
   /** Whether a session's transcript is still on disk (undefined: could not look); without a definite no, a failed resume is never read as a lost transcript. */
@@ -234,7 +247,7 @@ export class TopicManager {
       if (!oldest) break
       // Said on the paused topic, which in a shared forum is usually a colleague's: on the reply
       // rule, so a member alternating between their own topics cannot post there at will.
-      if (!this.d.replyMuted(oldest.topicId, 'paused')) void this.d.say(oldest.topicId, this.stuck(oldest) ? STUCK_PAUSED : `💤 Paused to free a slot (max ${this.d.maxLiveSessions} live sessions). Send a message here to resume — your context is kept.`)
+      if (!this.d.replyMuted(oldest.topicId, 'paused')) void this.d.say(oldest.topicId, this.pausedNotice(oldest))
       this.d.metrics.inc('sessions_evicted_cap')
       // In a shared forum a parked session's scheduled resume goes with it: the notice said a message
       // resumes it, and the timer would otherwise reopen it on its own and pause the newcomer
@@ -244,6 +257,20 @@ export class TopicManager {
       if (this.d.shared) this.userTookOver(oldest.topicId)
       this.closeLive(oldest.topicId, 'evicted (session cap)')
     }
+  }
+
+  /**
+   * What the paused topic is told. A topic waiting on a rate limit holds the messages sent
+   * meanwhile undelivered, and they die with the process: named, rather than "your context is
+   * kept" alone, which is true of the transcript and not of them (thirty-third review).
+   */
+  private pausedNotice(l: Live): string {
+    if (this.stuck(l)) return STUCK_PAUSED
+    if (this.resumeTimers.has(l.topicId) && l.queued > 0) {
+      const n = l.queued === 1 ? 'The message' : `The ${l.queued} messages`
+      return `💤 Paused to free a slot (max ${this.d.maxLiveSessions} live sessions) while this topic waited on a rate limit. ${n} sent meanwhile did not reach the session: send ${l.queued === 1 ? 'it' : 'them'} again — the earlier context is kept.`
+    }
+    return `💤 Paused to free a slot (max ${this.d.maxLiveSessions} live sessions). Send a message here to resume — your context is kept.`
   }
 
   /**
@@ -282,10 +309,11 @@ export class TopicManager {
     delete b.handoff
     b.auto = false
     // Its model and effort were never checked against the profile or the enabled catalog (a model
-    // disabled since would error every turn, unexplained to the forum), so the install's defaults
-    // take their place, as for a fresh binding (thirty-first review).
-    b.model = this.d.store.prefs.defaultModel
-    b.effort = this.d.store.prefs.defaultEffort
+    // disabled since would error every turn, unexplained to the forum), so what a fresh binding
+    // records takes their place: the profile's where it pins them, else the install's defaults
+    // (thirty-first review; thirty-third: the defaults alone disagreed with bindProfileTopic).
+    b.model = (underProfile ? this.d.profileModel : undefined) ?? this.d.store.prefs.defaultModel
+    b.effort = (underProfile ? this.d.profileEffort : undefined) ?? this.d.store.prefs.defaultEffort
     if (this.d.budgetUsd !== undefined) b.reportedUsd = 0
     return true
   }
@@ -499,7 +527,7 @@ export class TopicManager {
       return
     }
     const why = this.openRefusal(topicId)
-    if (why === 'budget') await this.d.say(topicId, '💸 Not resumed: this topic has used its budget. Open a new topic for the next question.')
+    if (why === 'budget') await this.d.say(topicId, `💸 Not resumed. ${budgetNotice(this.d.budgetUsd)}`)
     else if (why === 'busy') await this.d.say(topicId, '⏳ Not resumed: every session slot is busy. Send a message here when one is free.')
   }
 
@@ -547,7 +575,7 @@ export class TopicManager {
       case 'closed':
         return '🔒 An admin closed this topic. An admin can reopen it from the pinned panel.'
       case 'budget':
-        return `💸 This topic has used its budget ($${(this.d.budgetUsd ?? 0).toFixed(2)}). Open a new topic for the next question; an admin can delete this one.`
+        return `💸 ${budgetNotice(this.d.budgetUsd)}`
       case 'busy':
         return `⏳ Every session slot is busy (max ${this.d.maxLiveSessions} live sessions, all running a turn). Send your message again in a moment.`
     }

@@ -23,8 +23,15 @@ export function parseTranscript(out: string): string {
 export const NO_TRANSCRIBER = "voice notes need TRANSCRIBE_CMD in telepath's .env (a command that prints the words of the audio file it is given)"
 
 /**
+ * Names .env may hold that a transcriber needs and that carry no secret: kept even when `scrub`
+ * names them (a unit whose EnvironmentFile is the same .env names every one of them). Anything
+ * else .env holds goes; a transcriber that needs a key of its own takes it on its command line.
+ */
+const TRANSCRIBER_KEEPS = new Set(['PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'LANG', 'LANGUAGE', 'LC_ALL', 'LC_CTYPE', 'TZ', 'TMPDIR', 'TEMP', 'TMP', 'XDG_CACHE_HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_RUNTIME_DIR', 'HF_HOME', 'TRANSFORMERS_CACHE', 'TORCH_HOME'])
+
+/**
  * Transcribe one audio file. Async, so a slow transcription holds up nothing else. `scrub` is
- * every key the daemon loaded from .env: none of them reaches the transcriber.
+ * every key .env names: none of them reaches the transcriber, the harmless names above excepted.
  */
 export async function transcribe(path: string, cmd: string | undefined, timeoutMs = 180_000, scrub: Iterable<string> = []): Promise<string> {
   if (!cmd) throw new VoiceError(NO_TRANSCRIBER)
@@ -35,12 +42,13 @@ export async function transcribe(path: string, cmd: string | undefined, timeoutM
     const [exe, ...args] = splitCommand(cmd)
     // The transcriber hears audio anyone in the forum sent; it gets nothing .env holds (every key
     // handed in as `scrub`, so the rule is the file and not a list that rots; thirty-first review),
-    // nor the two secrets named here whatever loaded them. The shell's own variables stay: a
-    // transcriber needs the operator's PATH and model caches.
+    // whether or not the shell had set it too (the security read on the thirty-second: "the shell
+    // had it" must not exempt a secret), nor the two secrets named here whatever loaded them. The
+    // shell's own variables stay, and so do the harmless names a transcriber needs.
     const env = { ...process.env }
     delete env.TELEGRAM_BOT_TOKEN
     delete env.ANTHROPIC_API_KEY
-    for (const k of scrub) delete env[k]
+    for (const k of scrub) if (!TRANSCRIBER_KEEPS.has(k)) delete env[k]
     const child = spawn(exe, [...args, path], { stdio: ['ignore', 'pipe', 'pipe'], detached: group, windowsHide: true, env })
     const stop = () => {
       try {

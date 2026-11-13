@@ -62,7 +62,7 @@ function fakeRotator(over: Partial<Rotator> = {}): Rotator & { handedOff: unknow
 
 type FakeRotator = ReturnType<typeof fakeRotator>
 
-function harness(over: { maxLive?: number; idleMinutes?: number; rotator?: FakeRotator; now?: () => number; resumeBufferMs?: number; primeContract?: boolean; budgetUsd?: number; profileSessions?: boolean; shared?: boolean; stuckTurnMs?: number; transcriptExists?: (id: string) => boolean | undefined } = {}) {
+function harness(over: { maxLive?: number; idleMinutes?: number; rotator?: FakeRotator; now?: () => number; resumeBufferMs?: number; primeContract?: boolean; budgetUsd?: number; profileSessions?: boolean; shared?: boolean; stuckTurnMs?: number; transcriptExists?: (id: string) => boolean | undefined; profileModel?: string; profileEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' } = {}) {
   const store = new Store('/nowhere', {}, { defaultModel: 'claude-opus-5', defaultCwd: '/w' }, { defaultModel: 'claude-opus-5', defaultCwd: '/w' })
   // never touch disk in these tests
   store.saveRegistry = () => {}
@@ -97,6 +97,8 @@ function harness(over: { maxLive?: number; idleMinutes?: number; rotator?: FakeR
     // the bot's rule, stood in for by its own kind of throttle: one notice a minute per topic and kind
     replyMuted: (t, k) => !refusals.allow(`${t}:${k}`),
     transcriptExists: over.transcriptExists,
+    profileModel: over.profileModel,
+    profileEffort: over.profileEffort,
   })
   const bind = (topicId: string, b: Partial<{ model: string; effort: 'low' | 'high' | 'max'; sessionId: string; auto: boolean }> = {}) => {
     store.registry[topicId] = { cwd: '/w', model: b.model ?? 'claude-opus-5', effort: b.effort, sessionId: b.sessionId, title: 't' + topicId, lastActive: 0, auto: b.auto }
@@ -196,6 +198,8 @@ describe('TopicManager', () => {
     // a turn parked on a rate limit with a resume scheduled is waiting, not hung: not evicted meanwhile
     h.bind('parked')
     await h.tm.sendToTopic('parked', 'x')
+    await h.tm.sendToTopic('parked', 'follow-up one') // sent into the running turn: with the session, folded in when it can
+    await h.tm.sendToTopic('parked', 'follow-up two')
     h.backend.last().emit({ type: 'rate_limit_event', rate_limit_info: { status: 'rejected', resetsAt: Math.floor((t + 3_600_000) / 1000) } })
     await h.tick()
     t += 10 * 60_000
@@ -211,6 +215,10 @@ describe('TopicManager', () => {
     expect(h.tm.isLive('parked')).toBe(false)
     // and its scheduled resume went with it: the notice said a message resumes it, not a timer
     expect(h.tm.scheduledResume('parked')).toBe(false)
+    // the messages sent while it waited died with the process: the notice names them, rather than
+    // "your context is kept" alone (thirty-third review)
+    expect(h.said.find(([topic, text]) => topic === 'parked' && /2 messages[^.]*did not reach/.test(text))).toBeTruthy()
+    expect(h.said.find(([topic, text]) => topic === 'parked' && /Send a message here to resume/.test(text))).toBeFalsy()
     // for one user the timer stays: the rate-limit notice promised a continuation at the reset, so the cap's
     // pause leaves it to reopen the topic then, as main did (twenty-ninth review: the cancellation was unconditional)
     const solo = harness({ maxLive: 2, now: () => t })
@@ -791,6 +799,13 @@ describe('bindings from before the profile', () => {
     expect(h.store.registry['old'].model).toBe('claude-opus-5')
     expect(h.store.registry['old'].effort).toBeUndefined()
     expect(h.backend.opens[0].model).toBe('claude-opus-5')
+    // where the profile pins a model and an effort, the adopted binding takes those, as a fresh profile
+    // topic does (thirty-third review: the defaults alone disagreed with what a fresh topic records)
+    const pinned = harness({ profileSessions: true, profileModel: 'claude-fable-5-1', profileEffort: 'high' })
+    pinned.bind('o2', { sessionId: 'full-session-2', model: 'claude-x-disabled-since' })
+    await pinned.tm.sendToTopic('o2', 'hello')
+    expect(pinned.store.registry['o2'].model).toBe('claude-fable-5-1')
+    expect(pinned.store.registry['o2'].effort).toBe('high')
     // its hand-off and approval mode go with it: neither is the profile topic's to resume
     expect(h.store.registry['old'].handoff).toBeUndefined()
     expect(h.store.registry['old'].auto).toBe(false)

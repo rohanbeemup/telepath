@@ -26,6 +26,7 @@ import { htmlEsc, htmlToPlain, renderWithDeadline, chunkHtml, chunkPlain } from 
 import { isEnabledModelKey, modelLabel, parseEffort, supportsEffort, MODEL_MENU, type Effort } from './models'
 import { listSessions } from './session'
 import { transcribe, TopicOrder, voiceTurn, NO_TRANSCRIBER, type Heard } from './voice'
+import { budgetNotice } from './topics'
 import { feedOn, type Binding, type Store } from './state'
 import { isBusy, type SessionExtras, type TopicManager } from './topics'
 import {
@@ -320,7 +321,7 @@ export class TelegramBot {
           // Nothing to switch under a profile; a spent budget is said now, not at the next message.
           // The CLI's error strings can name host paths: logged for the operator, not posted.
           if (ev.errors.length) this.d.log.warn('turn.error_detail', { topic: topicId, subtype: ev.subtype, errors: ev.errors })
-          const budget = ev.subtype === 'error_max_budget_usd' ? '\n💸 This topic has used its budget. Open a new topic for the next question.' : ''
+          const budget = ev.subtype === 'error_max_budget_usd' ? `\n💸 ${budgetNotice(this.d.profile.maxBudgetUsd)}` : ''
           // A broken model (a revoked key) would otherwise answer every member message with a notice.
           if (!budget && !this.replyAllowed(topicId, 'error')) return
           await this.send(topicId, `⚠️ turn ended: ${ev.subtype}.${budget}`)
@@ -1261,6 +1262,9 @@ export class TelegramBot {
       return
     }
     if (data === 'm:treopen') {
+      // No binding behind the panel (a deletion Telegram refused left it pinned): nothing to reopen, and
+      // the pinned panel is not painted over (thirty-third review); for one user, as on main.
+      if (!b && this.d.cfg.teamMode) return void ack('No session here')
       await this.bot.api.reopenForumTopic(this.d.cfg.forumChatId, Number(topicId)).catch(e => this.d.log.warn('topic.reopen_failed', { topic: topicId, error: e }))
       if (!b) return void this.paint(topicId, 'That session no longer exists.', backKb())
       if (b.closed) {
@@ -1409,7 +1413,9 @@ export class TelegramBot {
             if (this.d.cfg.teamMode && topicId && !this.d.store.registry[topicId]) {
               const name = given ?? this.topicTitleOf(ctx) ?? this.defaultTitle(ctx)
               if (!(await this.bindFreshProfileTopic(ctx, topicId, name))) return
-              await this.say(topicId, `✅ Bound as "${name}". Type your question below.`)
+              // Plain text: the name is the member's, and say() renders Markdown (thirty-third review: a title
+              // with a link in it posted that link under the bot's name).
+              await this.send(topicId, `✅ Bound as "${name}". Type your question below.`)
               return
             }
             return this.createProfileTopic(ctx, given ?? this.defaultTitle(ctx), topicId, 'text')
