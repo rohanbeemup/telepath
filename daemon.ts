@@ -19,6 +19,7 @@ import { chmodSync, readFileSync, statSync, writeFileSync } from 'fs'
 import { dirname, join } from 'path'
 import { API_CONSTANTS } from 'grammy'
 import { TelegramBot } from './src/bot'
+import { COMMANDS } from './src/commands'
 import { ConfigError, mergeEnvFile, parseConfig, parseEnvFile, type Config } from './src/config'
 import { Files } from './src/files'
 import { ErrorRing, Logger, Metrics } from './src/log'
@@ -239,11 +240,8 @@ try {
       log.warn('preflight.bot_membership_unknown', { error: e })
     }
   }
-  await bot.bot.api.setMyCommands([
-    ...(cfg.teamMode ? [{ command: 'new', description: 'Start a new topic: /new <title>' }] : []),
-    { command: 'menu', description: 'Open the menu — everything is buttons' },
-    { command: 'status', description: 'Live sessions, counters, versions' },
-  ])
+  // The published menu reads the one command table (src/commands.ts), like the gate and the handler.
+  await bot.bot.api.setMyCommands([...(cfg.teamMode ? ['new'] : []), 'menu', 'status'].map(command => ({ command, description: COMMANDS[command] })))
   log.info('telepath.up', {
     version: VERSION,
     sdk: SDK_VERSION,

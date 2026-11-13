@@ -13,7 +13,7 @@ export type AccessConfig = {
 }
 
 /** The sender of an update: Telegram's numeric ids as strings; undefined when absent. */
-export type Sender = { fromId: string | undefined; chatId: string | undefined }
+export type Sender = { fromId: string | undefined; chatId: string | undefined; /** The post carries a sender_chat: an anonymous admin or a linked channel. */ anonymous?: boolean }
 
 /**
  * What a member may do in team mode. An allowlist, not a denylist: an action this file
@@ -53,6 +53,9 @@ const PROFILE_LOCKED: ReadonlySet<string> = new Set(['m:ta', '/auto'])
 /** The chat gate: the forum, and outside team mode the one allowed user. Membership is Membership's. */
 export function admitted(cfg: AccessConfig, s: Sender): boolean {
   if (!s.chatId || s.chatId !== cfg.forumChatId) return false
+  // An anonymous admin posts as the group and a linked channel as 777000: proxy ids that no
+  // member list holds, so there is nothing to verify and nothing to answer.
+  if (s.anonymous) return false
   return cfg.teamMode || (!!s.fromId && s.fromId === cfg.allowedUserId)
 }
 
@@ -93,7 +96,7 @@ export function isMemberStatus(m: ChatMemberLike): boolean {
  * so a member removed just now is refused on their next message, not at the TTL.
  */
 export class Membership {
-  private readonly cache = new Map<string, { until: number; verdict: Verdict }>()
+  private readonly cache = new Map<string, { until: number; verdict: Verdict; noticed: boolean }>()
   /** One lookup per sender at a time: a burst of messages shares it. */
   private readonly inflight = new Map<string, Promise<Verdict>>()
   private readonly ttlMs: number
@@ -126,12 +129,12 @@ export class Membership {
     let verdict: Verdict
     try {
       verdict = isMemberStatus(await this.lookup(userId)) ? 'member' : 'no'
-    } catch {
-      verdict = 'unknown'
+    } catch (e) {
+      verdict = lookupFailureVerdict(e)
     }
     // Strangers come and go; once the cache is full, the expired ones leave.
     if (this.cache.size >= this.maxEntries) this.sweep()
-    this.cache.set(userId, { until: this.now() + (verdict === 'member' ? this.ttlMs : this.graceMs), verdict })
+    this.cache.set(userId, { until: this.now() + (verdict === 'member' ? this.ttlMs : this.graceMs), verdict, noticed: false })
     return verdict
   }
 
@@ -140,13 +143,17 @@ export class Membership {
     for (const [id, entry] of this.cache) if (now >= entry.until) this.cache.delete(id)
   }
 
-  async isMember(userId: string): Promise<boolean> {
-    return (await this.check(userId)) === 'member'
-  }
-
   /** Entries held, expired ones included until the next sweep. */
   get size(): number {
     return this.cache.size
+  }
+
+  /** True once per fresh unknown verdict: the bot says 'could not verify' on the same grace, with no second timer. */
+  noticeDue(userId: string): boolean {
+    const hit = this.cache.get(userId)
+    if (!hit || hit.verdict !== 'unknown' || hit.noticed || this.now() >= hit.until) return false
+    hit.noticed = true
+    return true
   }
 
   /** The forum reported a change for this id: the next check asks again. */
@@ -172,4 +179,25 @@ export function profileLocked(action: string): boolean {
  */
 export function membershipRequired(cfg: AccessConfig, fromId: string | undefined): boolean {
   return cfg.teamMode && !isAdmin(cfg, fromId)
+}
+
+/** A tap on a clarifying-question option (`qa:`) or an Allow/Deny button (`p:`). */
+export type PromptTap = { fromId: string | undefined; kind: 'question' | 'approval'; sameTopic: boolean }
+
+/**
+ * A prompt belongs to the topic that asked: in team mode a question is anyone's there to
+ * answer (the topic is shared), an approval is an admin's there, and neither counts from
+ * another topic, so a token replayed elsewhere does nothing. Outside team mode, as before.
+ * Defense in depth: no profile session prompts today (see the plan's premise).
+ */
+export function promptTapAllowed(cfg: AccessConfig, tap: PromptTap): boolean {
+  if (!cfg.teamMode) return true
+  if (!tap.sameTopic) return false
+  return tap.kind === 'question' || isAdmin(cfg, tap.fromId)
+}
+
+/** What a failed getChatMember means: a 400 is an id the chat never saw (a no); anything else is unknown. */
+export function lookupFailureVerdict(e: unknown): Verdict {
+  const code = e && typeof e === 'object' ? (e as { error_code?: unknown }).error_code : undefined
+  return code === 400 ? 'no' : 'unknown'
 }

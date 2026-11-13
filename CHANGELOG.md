@@ -44,7 +44,10 @@
   full. Under a profile, a turn that ended for its budget says so at once and the "switch
   model" hint is left off. A profile's server entries are read at boot (type, url or
   command) and `ADMIN_USER_IDS` must be numeric ids, each refused with its name otherwise;
-  typed `/menu` refreshes the pinned panel like ⚙️ does. An `ANTHROPIC_API_KEY` in `.env` reaches the Claude
+  typed `/menu` refreshes the pinned panel like ⚙️ does. A post made as the group (anonymous
+  admin) or by a linked channel is dropped, a 400 from `getChatMember` counts as "not a
+  member" rather than a blip, `/status` in team mode answers in General only, old sessions are
+  not attached or resumed under a profile, and the command table lives in `src/commands.ts`. An `ANTHROPIC_API_KEY` in `.env` reaches the Claude
   Code child, for installs that bill a Console organization rather than a login.
 - **Video, GIFs and video notes, both ways.** Inbound: videos, GIFs/animations and round video
   notes are now downloaded (under Telegram's 20 MB bot-download cap) and handed to the session

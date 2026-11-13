@@ -14,6 +14,22 @@ export type Typed =
   | { kind: 'wrap' }
   | { kind: 'chat'; text: string }
 
+/**
+ * The slash commands this bot answers, with the line the published menu shows. One
+ * table: the gate, the handler's switch and setMyCommands all read it, so a command
+ * added to one cannot be missing from another.
+ */
+export const COMMANDS: Readonly<Record<string, string>> = {
+  new: 'Start a new topic: /new <title>',
+  list: 'Your sessions as buttons',
+  attach: 'Bind an existing session: /attach <short-id> [name]',
+  auto: 'Toggle auto mode in this topic',
+  status: 'Live sessions, counters, versions',
+  menu: 'Open the menu — everything is buttons',
+  help: 'Show help',
+}
+export const KNOWN_COMMANDS: ReadonlySet<string> = new Set(Object.keys(COMMANDS))
+
 export function parseTyped(raw: string, catalog: Catalog, botUsername?: string): Typed {
   const text = raw.trim()
   if (text.startsWith('/')) {
