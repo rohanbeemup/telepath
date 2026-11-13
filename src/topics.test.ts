@@ -567,6 +567,31 @@ describe('a profile budget', () => {
     h.backend.last().emit({ ...result('sg'), total_cost_usd: 0.7 })
     await h.tick()
     expect(h.store.registry['g'].spentUsd).toBeCloseTo(0.7)
+    // after a lost-transcript stretch, the transcript's totals run from that stretch's own count: a later
+    // carried stretch is charged its increment over the last reported total, not its history again
+    h.bind('k')
+    await h.tm.sendToTopic('k', 'q1')
+    h.backend.last().emit({ ...result('sk'), total_cost_usd: 0.4 })
+    await h.tick()
+    h.tm.closeLive('k', 'killed mid-turn in test') // its transcript saved no total
+    await h.tm.sendToTopic('k', 'q2')
+    h.backend.last().emit({ ...result('sk'), total_cost_usd: 0.3 }) // restarted at zero
+    await h.tick()
+    expect(h.store.registry['k'].spentUsd).toBeCloseTo(0.7)
+    h.tm.closeLive('k', 'evicted in test')
+    await h.tm.sendToTopic('k', 'q3')
+    h.backend.last().emit({ ...result('sk'), total_cost_usd: 0.35 }) // carried from 0.3: one cheap turn
+    await h.tick()
+    expect(h.store.registry['k'].spentUsd).toBeCloseTo(0.75)
+    // a binding recorded before the transcript's total was kept (spentUsd, no reportedUsd) takes its
+    // record as the baseline for its first result, so a carried total does not add its history again
+    h.bind('m')
+    h.store.registry['m'].spentUsd = 0.4
+    await h.tm.sendToTopic('m', 'q1')
+    h.backend.last().emit({ ...result('sm'), total_cost_usd: 0.45 }) // carried: one cheap turn on top of the recorded history
+    await h.tick()
+    expect(h.store.registry['m'].spentUsd).toBeCloseTo(0.45)
+    expect(h.store.registry['m'].reportedUsd).toBeCloseTo(0.45)
     // a nudge into an exhausted topic posts nothing and reports undelivered
     const notices = h.said.filter(([topic, text]) => topic === 'b' && /budget/i.test(text)).length
     expect(await h.tm.sendToTopic('b', 'continue', { takeover: false, quiet: true })).toBe(false)

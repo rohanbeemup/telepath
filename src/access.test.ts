@@ -1,5 +1,5 @@
 import { test, expect, describe } from 'bun:test'
-import { admitted, isAdmin, allowedAction, profileLocked, profileFreshOnly, promptTapAllowed, membershipRequired, lookupFailureVerdict, Membership, type AccessConfig } from './access'
+import { admitted, isAdmin, allowedAction, profileLocked, profileFreshOnly, promptTapAllowed, membershipRequired, lookupFailureVerdict, Membership, type AccessConfig, type ChatMemberLike } from './access'
 
 const single: AccessConfig = { teamMode: false, allowedUserId: '1', forumChatId: '-100', adminUserIds: ['1'] }
 const team: AccessConfig = { teamMode: true, allowedUserId: '1', forumChatId: '-100', adminUserIds: ['1', '9'] }
@@ -80,7 +80,7 @@ describe('what a member may do', () => {
 
 describe('membership', () => {
   test('in team mode a sender is admitted only when the forum reports them as a member', async () => {
-    const statuses: Record<string, { status: string; is_member?: boolean }> = {
+    const statuses: Record<string, ChatMemberLike> = {
       '1': { status: 'creator' },
       '2': { status: 'administrator' },
       '3': { status: 'member' },
@@ -89,10 +89,12 @@ describe('membership', () => {
       '6': { status: 'kicked' },
       '7': { status: 'restricted', is_member: false },
       '8': { status: 'something_new' },
+      '10': { status: 'restricted', is_member: true, can_send_messages: true },
+      '11': { status: 'restricted', is_member: true, can_send_messages: false }, // muted: Telegram drops their messages, their taps still arrive
     }
     const m = new Membership(async id => statuses[id] ?? { status: 'left' })
-    for (const id of ['1', '2', '3', '4']) expect([id, await m.check(id)]).toEqual([id, 'member'])
-    for (const id of ['5', '6', '7', '8', '9']) expect([id, await m.check(id)]).toEqual([id, 'no'])
+    for (const id of ['1', '2', '3', '4', '10']) expect([id, await m.check(id)]).toEqual([id, 'member'])
+    for (const id of ['5', '6', '7', '8', '9', '11']) expect([id, await m.check(id)]).toEqual([id, 'no'])
     // Telegram answers 400 "user not found" for an id the chat has never seen: a no, not a blip.
     // A 400 about the chat itself is a misconfiguration, not a stranger: unknown, like any other failure.
     expect(lookupFailureVerdict({ error_code: 400, description: 'Bad Request: user not found' })).toBe('no')
@@ -209,6 +211,55 @@ describe('membership', () => {
     expect(await pendingCheck).toBe('member')
     expect(await slow.check('leaving')).toBe('no')
     expect(askedSlow).toBe(2)
+    // two removals around two lookups: neither the orphaned first lookup nor the overtaken second may cache a yes
+    const releases: ((v: { status: string }) => void)[] = []
+    let dblCalls = 0
+    const dbl = new Membership(
+      () => {
+        dblCalls++
+        if (dblCalls <= 2) return new Promise<{ status: string }>(resolve => releases.push(resolve))
+        return Promise.resolve({ status: 'kicked' })
+      },
+      { ttlMs: 600_000, graceMs: 30_000, now: () => t },
+    )
+    const first = dbl.check('u')
+    dbl.forget('u')
+    const second = dbl.check('u')
+    releases[0]({ status: 'member' }) // the orphaned first answer
+    expect(await first).toBe('member')
+    dbl.forget('u') // removed again while the second lookup is pending
+    releases[1]({ status: 'member' }) // the overtaken second answer
+    expect(await second).toBe('member')
+    expect(await dbl.check('u')).toBe('no') // nothing was cached: the truth is asked for again
+    expect(dblCalls).toBe(3)
+    // an orphaned lookup's late answer never overrides the lookup that replaced it, whatever order they settle in
+    const answers: ((v: { status: string }) => void)[] = []
+    let lateCalls = 0
+    const late = new Membership(
+      () => {
+        lateCalls++
+        return new Promise<{ status: string }>(resolve => answers.push(resolve))
+      },
+      { ttlMs: 600_000, graceMs: 30_000, now: () => t },
+    )
+    const stale = late.check('v')
+    late.forget('v') // removed while the first lookup is pending
+    const fresh = late.check('v')
+    answers[0]({ status: 'member' }) // the orphan answers first, from before the removal
+    expect(await stale).toBe('member')
+    answers[1]({ status: 'kicked' }) // the replacement answers the truth
+    expect(await fresh).toBe('no')
+    expect(await late.check('v')).toBe('no') // and the truth is what was kept
+    expect(lateCalls).toBe(2)
+    // a lookup that throws before returning a promise is a failed lookup like any other
+    const thrower = new Membership(
+      () => {
+        throw new Error('api client gone')
+      },
+      { ttlMs: 600_000, graceMs: 30_000, now: () => t },
+    )
+    expect(await thrower.check('x')).toBe('unknown')
+    expect(thrower.size).toBe(1)
     // expired entries are swept once the cache passes its size, so strangers do not pile up
     const small = new Membership(async () => ({ status: 'left' }), { ttlMs: 600_000, graceMs: 30_000, now: () => t, maxEntries: 3 })
     for (const id of ['s1', 's2', 's3']) await small.check(id)

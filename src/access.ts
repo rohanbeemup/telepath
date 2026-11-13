@@ -76,15 +76,18 @@ export function allowedAction(cfg: AccessConfig, fromId: string | undefined, act
 }
 
 /** What Telegram's getChatMember answers, reduced to what the gate reads. */
-export type ChatMemberLike = { status: string; is_member?: boolean }
+export type ChatMemberLike = { status: string; is_member?: boolean; can_send_messages?: boolean }
 
 /** What the forum said, or that it could not be asked. */
 export type Verdict = 'member' | 'no' | 'unknown'
 
-/** Only what the forum calls a member; a status this code has never seen is not one. */
+/**
+ * Only what the forum calls a member; a status this code has never seen is not one, and
+ * neither is a muted member: Telegram drops their messages, but their taps still arrive.
+ */
 export function isMemberStatus(m: ChatMemberLike): boolean {
   if (m.status === 'creator' || m.status === 'administrator' || m.status === 'member') return true
-  if (m.status === 'restricted') return m.is_member === true
+  if (m.status === 'restricted') return m.is_member === true && m.can_send_messages !== false
   return false
 }
 
@@ -98,10 +101,12 @@ export function isMemberStatus(m: ChatMemberLike): boolean {
  */
 export class Membership {
   private readonly cache = new Map<string, { until: number; verdict: Verdict; noticed: boolean }>()
-  /** One lookup per sender at a time: a burst of messages shares it. */
+  /**
+   * One lookup per sender at a time: a burst of messages shares it. The promise is also the
+   * lookup's token: only the lookup the map still holds may write its answer, and forget()
+   * drops the one it overtakes, so no count can be reset by a lookup that was itself overtaken.
+   */
   private readonly inflight = new Map<string, Promise<Verdict>>()
-  /** Bumped by forget(): a lookup that started before the bump must not write its answer. */
-  private readonly generation = new Map<string, number>()
   private readonly ttlMs: number
   private readonly graceMs: number
   private readonly maxEntries: number
@@ -123,23 +128,27 @@ export class Membership {
     if (hit && this.now() < hit.until) return hit.verdict
     const pending = this.inflight.get(userId)
     if (pending) return pending
-    const p = this.ask(userId).finally(() => this.inflight.delete(userId))
+    const p: Promise<Verdict> = this.ask(userId, () => this.inflight.get(userId) === p)
     this.inflight.set(userId, p)
     return p
   }
 
-  private async ask(userId: string): Promise<Verdict> {
-    const started = this.generation.get(userId) ?? 0
+  private async ask(userId: string, stillPending: () => boolean): Promise<Verdict> {
     let verdict: Verdict
     try {
       verdict = isMemberStatus(await this.lookup(userId)) ? 'member' : 'no'
     } catch (e) {
       verdict = lookupFailureVerdict(e)
     }
-    // The forum reported a change while this was pending: the answer is reported, never kept.
-    const invalidated = (this.generation.get(userId) ?? 0) !== started
-    this.generation.delete(userId) // served its purpose either way
-    if (invalidated) return verdict
+    // check() registers this lookup right after starting it. A lookup that threw before
+    // returning a promise gets here without having yielded, so yield once: the comparison
+    // below then always sees the registered promise.
+    await Promise.resolve()
+    // forget() dropped this lookup while it was pending (the forum reported a change): the
+    // answer is reported to its callers and never kept, and the map is left to the lookup
+    // that replaced it, if any.
+    if (!stillPending()) return verdict
+    this.inflight.delete(userId)
     // Strangers come and go; once the cache is full the expired ones leave, and when nothing
     // has expired the oldest does, so a forum larger than the cache cannot grow it.
     if (this.cache.size >= this.maxEntries && !this.cache.has(userId)) {
@@ -175,7 +184,6 @@ export class Membership {
   forget(userId: string): void {
     this.cache.delete(userId)
     this.inflight.delete(userId)
-    this.generation.set(userId, (this.generation.get(userId) ?? 0) + 1)
   }
 }
 

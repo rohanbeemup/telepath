@@ -63,8 +63,6 @@ export type Live = {
   /** Messages sent since the running turn began; the CLI folds them into it. Shown as "queued". */
   queued: number
   wrap?: Wrap
-  /** The last total this stretch reported; later results add their increment over it. */
-  lastTotal?: number
 }
 
 export function isBusy(l: Live): boolean {
@@ -425,30 +423,33 @@ export class TopicManager {
             }
             case 'turnEnd':
             case 'turnError': {
-              // The topic's spend, from every result, success or failure. A stretch's first total
-              // at or above the record is the topic's running total (a resumed stretch carries the
-              // earlier stretches when its transcript saved a total, per the SDK); below it, the
-              // stretch restarted at zero (no saved total: a crash or a kill mid-turn) and counts on
-              // top. Later results of the stretch add their increment over its last total. Never a
-              // sum of stretch totals, never a max that misses a restarted stretch. One bound: a
-              // restarted stretch whose first turn costs more than the record reads as carried, and
-              // the record falls short by the record, at most one cap once per lost transcript (the
-              // SDK's usage query would settle it and is experimental). A stretch the SDK ended for
-              // its budget counts as the budget spent whatever it reported. Tracked only where a
-              // budget exists.
+              // The topic's spend, from every result, success or failure, by each total's increment
+              // over the last total the transcript reported: a total at or above it continues it
+              // (within a stretch, and across a resume whose transcript saved its total, per the
+              // SDK); a total below it means the transcript restarted at zero (no saved total: a
+              // crash or a kill mid-turn) and counts whole. Never a sum of stretch totals, never a
+              // max that misses a restarted stretch, and never read against the record, which
+              // charged every stretch after a lost one its history again. One bound: a restarted
+              // stretch whose first turn costs at least the last reported total reads as carried,
+              // and the record falls short by that total, at most once per lost transcript (the
+              // SDK's usage query would settle it and is experimental). A binding recorded before
+              // the reported total was kept has only its record, which serves as the baseline for
+              // its first result. A stretch the SDK ended for its budget counts as the budget spent
+              // whatever it reported. Tracked only where a budget exists.
               const budget = this.d.budgetUsd
               if (b && budget !== undefined) {
                 let spent = b.spentUsd
+                let reported = b.reportedUsd
                 // A zero is no information (a crash or startup-error result may carry zeroed values).
                 if (ev.costUsd !== undefined && ev.costUsd > 0) {
-                  const recorded = spent ?? 0
-                  if (l.lastTotal === undefined) spent = ev.costUsd >= recorded ? ev.costUsd : recorded + ev.costUsd
-                  else spent = recorded + Math.max(0, ev.costUsd - l.lastTotal)
-                  l.lastTotal = ev.costUsd
+                  const last = reported ?? spent
+                  spent = (spent ?? 0) + (last !== undefined && ev.costUsd >= last ? ev.costUsd - last : ev.costUsd)
+                  reported = ev.costUsd
                 }
                 if (ev.kind === 'turnError' && ev.subtype === 'error_max_budget_usd') spent = Math.max(spent ?? 0, budget)
-                if (spent !== b.spentUsd) {
+                if (spent !== b.spentUsd || reported !== b.reportedUsd) {
                   b.spentUsd = spent
+                  b.reportedUsd = reported
                   this.d.store.saveRegistry()
                 }
               }

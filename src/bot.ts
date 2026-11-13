@@ -116,6 +116,12 @@ export class TelegramBot {
     this.topics = topics
   }
 
+  /** Telegram's answer to an edit that changes nothing: a success, not a failure. */
+  private isNotModified(e: unknown): boolean {
+    const any = e as { description?: string; message?: string }
+    return /not modified/i.test(String(any?.description ?? any?.message ?? e))
+  }
+
   /**
    * The status message's transport over the Bot API, with Telegram's answers mapped to
    * what TurnStatus needs: a 429 carries `retry_after` (honoured exactly), "message is
@@ -150,8 +156,8 @@ export class TelegramBot {
           this.d.metrics.inc('status_edits')
           return { ok: true }
         } catch (e) {
+          if (this.isNotModified(e)) return { ok: true }
           const d = describe(e)
-          if (/not modified/i.test(d.text)) return { ok: true }
           if (d.code === 429) {
             this.d.metrics.inc('status_edit_429')
             this.d.log.warn('status.edit_rate_limited', { topic: topicId, retryAfter: d.retryAfter })
@@ -615,7 +621,7 @@ export class TelegramBot {
         })
         return
       } catch (e) {
-        if (/not modified/i.test(String((e as { description?: string })?.description ?? e))) return
+        if (this.isNotModified(e)) return
       }
     }
     await this.postPinnedControls(topicId)

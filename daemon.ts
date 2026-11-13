@@ -80,6 +80,20 @@ try {
   }
   throw e
 }
+// 💾 Close & keep writes `closed` in team mode only (a single user's kept topic resumes on its
+// next message) and every mode honours it, so a team-mode run must not leave it behind.
+if (!cfg.teamMode) {
+  let cleared = 0
+  for (const b of Object.values(store.registry)) {
+    if (!b.closed) continue
+    delete b.closed
+    cleared++
+  }
+  if (cleared) {
+    store.saveRegistry()
+    log.info('state.closed_cleared', { topics: cleared, reason: 'closed is team mode\'s; outside it a topic resumes on its next message' })
+  }
+}
 const files = new Files(stateDir)
 
 // ── preflight ───────────────────────────────────────────────────────────────
@@ -260,6 +274,9 @@ try {
     await bot.bot.api.setMyCommands(publish(['new', 'menu', 'status']), { scope: { type: 'chat_administrators', chat_id: Number(cfg.forumChatId) } }).catch(e => log.warn('commands.admin_scope_failed', { error: e }))
   } else {
     await bot.bot.api.setMyCommands(publish(['menu', 'status']))
+    // A team-mode run published a set to the forum's administrators, which shadows the default
+    // one for them for as long as it exists: clear it, so leaving team mode leaves no menu behind.
+    await bot.bot.api.deleteMyCommands({ scope: { type: 'chat_administrators', chat_id: Number(cfg.forumChatId) } }).catch(e => log.warn('commands.admin_scope_clear_failed', { error: e }))
   }
   log.info('telepath.up', {
     version: VERSION,

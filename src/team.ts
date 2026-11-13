@@ -22,7 +22,11 @@ export function parseTeamNew(args: string, member: Member, now: Date): { title: 
   return { title: `${who} · ${hh}:${mm}` }
 }
 
-/** How many topics one member may open per calendar day (UTC); in memory, so a restart starts the day over. */
+/**
+ * How many topics one member may open per calendar day, on the box's local clock (the clock the
+ * default title shows, so "come back tomorrow" means the same midnight); in memory, so a restart
+ * starts the day over.
+ */
 export class TopicQuota {
   private readonly counts = new Map<string, { day: string; n: number }>()
 
@@ -32,7 +36,8 @@ export class TopicQuota {
   ) {}
 
   private today(): string {
-    return new Date(this.now()).toISOString().slice(0, 10)
+    const d = new Date(this.now())
+    return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`
   }
 
   private opened(userId: string, day: string): number {

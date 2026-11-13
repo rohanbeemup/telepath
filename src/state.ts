@@ -22,6 +22,8 @@ export type Binding = {
   handoff?: { at: number; text: string }
   /** USD this topic's sessions have reported, across idle stretches; read against a profile's budget. */
   spentUsd?: number
+  /** The last total the topic's transcript reported; the next result is charged its increment over it (a lower total means the transcript restarted). */
+  reportedUsd?: number
   /** 💾 Close & keep: no session opens here until ♻️ Reopen clears it (admins only in team mode). */
   closed?: boolean
   /** Made under a session profile; only such a binding may resume its session under one. */

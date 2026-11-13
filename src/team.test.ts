@@ -16,26 +16,35 @@ test('/new in team mode takes the rest of the line as the title and ignores cwd=
 })
 
 test('a member may open only so many topics a day', () => {
-  let t = Date.UTC(2026, 10, 13, 9, 0)
-  const q = new TopicQuota(2, () => t)
-  expect(q.take('a')).toBe(true)
-  expect(q.take('a')).toBe(true)
-  expect(q.take('a')).toBe(false) // the third of the day
-  expect(q.take('b')).toBe(true) // another member's own count
-  expect(q.take('b')).toBe(true)
-  expect(q.take('b')).toBe(false)
-  t = Date.UTC(2026, 10, 14, 0, 1) // the next day
-  expect(q.take('a')).toBe(true)
-  expect(q.take('a')).toBe(true)
-  expect(q.take('a')).toBe(false)
-  // an opening is reserved first and given back when Telegram refuses it, so a failed creation is not charged
-  q.refund('a')
-  expect(q.take('a')).toBe(true)
-  expect(q.take('a')).toBe(false)
-  // a refund never goes below zero
-  q.refund('fresh')
-  q.refund('fresh')
-  expect(q.take('fresh')).toBe(true)
-  expect(q.take('fresh')).toBe(true)
-  expect(q.take('fresh')).toBe(false)
+  // A day ends at local midnight, on the clock the default title shows. Pinned to one zone off
+  // UTC, because bun test runs on UTC, where a UTC day and a local day cannot be told apart.
+  const zone = process.env.TZ
+  process.env.TZ = 'Europe/Amsterdam'
+  try {
+    let t = new Date(2026, 10, 13, 23, 30).getTime()
+    const q = new TopicQuota(2, () => t)
+    expect(q.take('a')).toBe(true)
+    expect(q.take('a')).toBe(true)
+    expect(q.take('a')).toBe(false) // the third of the day
+    expect(q.take('b')).toBe(true) // another member's own count
+    expect(q.take('b')).toBe(true)
+    expect(q.take('b')).toBe(false)
+    t = new Date(2026, 10, 14, 0, 1).getTime() // the next local day, half an hour later (still 13 Nov in UTC)
+    expect(q.take('a')).toBe(true)
+    expect(q.take('a')).toBe(true)
+    expect(q.take('a')).toBe(false)
+    // an opening is reserved first and given back when Telegram refuses it, so a failed creation is not charged
+    q.refund('a')
+    expect(q.take('a')).toBe(true)
+    expect(q.take('a')).toBe(false)
+    // a refund never goes below zero
+    q.refund('fresh')
+    q.refund('fresh')
+    expect(q.take('fresh')).toBe(true)
+    expect(q.take('fresh')).toBe(true)
+    expect(q.take('fresh')).toBe(false)
+  } finally {
+    if (zone === undefined) delete process.env.TZ
+    else process.env.TZ = zone
+  }
 })
