@@ -274,6 +274,7 @@ export class TopicManager {
     if (!!b.profile === underProfile) return false
     if (b.sessionId) this.d.log.info('session.resume_dropped', { topic: topicId, sessionId: b.sessionId, why: underProfile ? 'binding predates the profile' : 'binding was made under a profile' })
     b.sessionId = undefined
+    this.primed.delete(topicId) // the session that heard the contract is gone with its id
     b.profile = underProfile
     delete b.handoff
     b.auto = false
@@ -699,6 +700,7 @@ export class TopicManager {
       const unresumable = !!resumedId && !answered && !!b && b.sessionId === resumedId && this.d.transcriptExists?.(resumedId) === false
       if (b && unresumable) {
         b.sessionId = undefined
+        this.primed.delete(topicId) // a new transcript is told where deliverables go again
         if (this.d.budgetUsd !== undefined) b.reportedUsd = 0
         this.d.store.saveRegistry()
       }

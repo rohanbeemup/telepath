@@ -14,7 +14,7 @@
   `/new <title>`, capped at Telegram's 120 characters; `TEAM_TOPICS_PER_DAY` per member per
   local day, default 20, admins exempt, a refused creation not counted; a topic costs no
   process until someone writes in it). Closing, deleting and wiping a topic, model, effort,
-  approvals, settings, the session list, `/attach` and `/status` stay with `ALLOWED_USER_ID`
+  approvals, settings, the session list, `/attach`, `/status` and wrapping up at the next step stay with `ALLOWED_USER_ID`
   plus `ADMIN_USER_IDS` (numeric ids; an allowlist of member actions in `src/access.ts`, so
   an action it has not heard of is an admin's); a closed topic opens no session for anyone
   until an admin reopens it. General is the members' own: commands are answered there,
@@ -30,7 +30,9 @@
   refused, since no profile session can prompt), no settings files, a prompt of its own, a
   fixed working directory, `maxTurns` and `maxBudgetUsd` (required in team mode). Every
   server entry is read at boot and a profile with any problem stops the boot with all of
-  them listed. A profile also works without team mode, for a read-only single-user
+  them listed (a stdio `command` is a bare name, an absolute path, or `./` or `../` against
+  the profile's directory, as are such `args`; `~/…` or `bin/x` is refused, since nothing
+  expands a `~` and the child's cwd is not the profile's). A profile also works without team mode, for a read-only single-user
   assistant. Under a profile there is no wizard, the pinned panel loses its model, effort
   and approvals buttons (`/auto` and those taps say so; typed `use` and `effort` go to the
   session as text), old sessions are not attached or resumed (a binding made before the

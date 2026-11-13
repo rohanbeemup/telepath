@@ -13,7 +13,7 @@
  * an exclusive list. The profile's hook answers `{}` for a listed tool and `deny` for any
  * other name, whatever the CLI auto-approves now or later.
  */
-import { resolve } from 'path'
+import { isAbsolute, resolve } from 'path'
 import type { Options } from '@anthropic-ai/claude-agent-sdk'
 import { EFFORT_LEVELS, parseEffort, type Effort } from './models'
 import type { OpenOptions } from './topics'
@@ -110,9 +110,13 @@ export function parseProfile(raw: unknown, src: ProfileSource): Profile {
       if (typeof s.url !== 'string' || !s.url.trim()) problems.push(`mcpServers.${name}: a ${type} server needs a url`)
     } else if (type === 'stdio') {
       if (typeof s.command !== 'string' || !s.command.trim()) problems.push(`mcpServers.${name}: a stdio server needs a command`)
-      // A command with a path in it resolves against the profile's directory, like cwd and the
-      // prompt file; a bare name is the child's PATH to find.
-      else if (/[\\/]/.test(s.command)) s.command = resolve(src.dir, s.command)
+      // An explicitly relative command (`./kb-server.js`, `../bin/x`) resolves against the profile's
+      // directory, like cwd and the prompt file; an absolute one is used as given; a bare name is the
+      // child's PATH to find. Anything else with a path in it (`~/x`, `bin/x`) is refused here: nothing
+      // expands a `~`, and the child's cwd is not the profile's, so it would boot clean and fail every
+      // topic's first turn with an error the forum is not shown (twenty-seventh review).
+      else if (/^\.\.?[\\/]/.test(s.command)) s.command = resolve(src.dir, s.command)
+      else if (/[\\/]/.test(s.command) && !isAbsolute(s.command)) problems.push(`mcpServers.${name}: command ${JSON.stringify(s.command)} is neither a bare name (the child's PATH), an absolute path, nor ./ or ../ relative to the profile's directory; a ~ is not expanded`)
       // The same for an argument that is explicitly relative (`./server.py`, `../bin/x`): a URL, a
       // scoped package name or a `--flag=./x` has a slash too and is handed through as typed.
       if (Array.isArray(s.args)) s.args = s.args.map(a => (typeof a === 'string' && /^\.\.?[\\/]/.test(a) ? resolve(src.dir, a) : a))

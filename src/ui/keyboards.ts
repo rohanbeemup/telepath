@@ -14,7 +14,7 @@ export const PAGE_SIZE = 10
  * admins'. A profile (always on in team mode, optional otherwise) owns the model, the
  * effort and the absent approvals, so their buttons go.
  */
-export type KbMode = { team?: boolean; profile?: boolean }
+export type KbMode = { team?: boolean; profile?: boolean; /** The keyboard is an admin's reply: the admin-only buttons stay. */ admin?: boolean }
 
 export function mainMenuKb(mode: KbMode = {}): InlineKeyboard {
   // Status is the admins' (typed /status): the operator's view of the box, reduced in team mode.
@@ -179,8 +179,9 @@ export const statusLiveKb = (): InlineKeyboard => new InlineKeyboard().text('⏹
  */
 export function wrapConfirmKb(mode: KbMode = {}): InlineKeyboard {
   const kb = new InlineKeyboard()
-  // Stopping at the next step interrupts a colleague's turn: an admin's in a shared forum, so not offered to members.
-  if (!mode.team) kb.text('⏹ Hand off at the next step (recommended)', 'm:tw:now').row()
+  // Stopping at the next step interrupts a colleague's turn: an admin's in a shared forum, so not offered to
+  // members, and kept on an admin's confirmation, where the gate admits the tap (twenty-seventh review).
+  if (!mode.team || mode.admin) kb.text('⏹ Hand off at the next step (recommended)', 'm:tw:now').row()
   return kb.text('⏳ Finish this turn first, then hand off', 'm:tw:turn').row().text('↩️ Cancel', 'm:ctl')
 }
 

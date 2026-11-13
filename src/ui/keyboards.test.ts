@@ -132,8 +132,10 @@ describe('team mode', () => {
     expect(topicControlsText(catalog, closed, undefined, { team: true })).toContain('Closed by an admin')
     // outside team mode the flag changes nothing on the panel
     expect(callbackData(topicControlsKb(catalog, closed))).not.toContain('m:treopen')
-    // the wrap-up confirmation in team mode offers no "at the next step": that interrupts a colleague's turn and is an admin's
+    // the wrap-up confirmation in team mode offers a member no "at the next step": that interrupts a colleague's turn and is an admin's
     expect(callbackData(wrapConfirmKb({ team: true }))).toEqual(['m:tw:turn', 'm:ctl'])
+    // an admin's confirmation keeps it: the gate reserves the tap for admins, so the button must reach them (twenty-seventh review)
+    expect(callbackData(wrapConfirmKb({ team: true, admin: true }))).toEqual(['m:tw:now', 'm:tw:turn', 'm:ctl'])
     expect(callbackData(wrapConfirmKb())).toContain('m:tw:now')
   })
 })

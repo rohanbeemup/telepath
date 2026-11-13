@@ -834,7 +834,10 @@ describe('bindings from before the profile', () => {
     const broken = harness({ profileSessions: true, budgetUsd: 2, transcriptExists: id => (id === 'unknown-1' ? undefined : id !== 'gone-1') })
     broken.backend.open = opts => {
       broken.backend.opens.push(opts)
-      return failing as unknown as LiveSession
+      if (opts.resume) return failing as unknown as LiveSession
+      const s = new FakeSession() // a fresh open records what it is sent
+      broken.backend.sessions.push(s)
+      return s
     }
     broken.bind('err', { sessionId: 'gone-1' })
     broken.store.registry['err'].profile = true
@@ -849,6 +852,9 @@ describe('bindings from before the profile', () => {
     await broken.tm.sendToTopic('err', 'again')
     await broken.tick()
     expect(broken.backend.opens.map(o => o.resume)).toEqual(['gone-1', undefined])
+    // the fresh session is a new transcript: it is told where deliverables go again, as the lost one
+    // was (twenty-seventh review: the priming survived the drop, so the replacement never heard)
+    expect(broken.backend.last().sent).toEqual([expect.stringMatching(/^<telepath>[\s\S]*again$/)])
     // while a failure on a transcript still on disk is a blip, confirmed, never inferred: the ordinary
     // error, without its detail, and the transcript kept
     broken.bind('kept', { sessionId: 'alive-1' })

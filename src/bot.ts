@@ -706,7 +706,10 @@ export class TelegramBot {
     if (!live || !isBusy(live)) return this.notice(topicId, 'wrap', 'Nothing is running in this topic right now, so there is nothing to wrap up.', senderId)
     // The confirmation too: a member tapping "Wrap up" thirty times is thirty posts otherwise.
     if (this.muted(topicId, 'wrap', senderId)) return
-    await this.send(topicId, wrapConfirmText(live.queued), wrapConfirmKb(this.kbMode()))
+    // An admin's confirmation keeps "at the next step": the gate admits that tap for admins only, and a member's
+    // tap on an admin's button is refused there like any other admin action.
+    const admin = senderId !== undefined && !membershipRequired(this.access, senderId)
+    await this.send(topicId, wrapConfirmText(live.queued), wrapConfirmKb({ ...this.kbMode(), admin }))
   }
 
   private async repaintControls(topicId: string, b: Binding, note?: string): Promise<void> {

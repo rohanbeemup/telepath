@@ -150,6 +150,13 @@ describe('a profile is refused when', () => {
     expect(local.type).toBe('stdio')
     const bare = parseProfile(raw({ mcpServers: { local: { command: 'kb-server' } }, allowedTools: ['mcp__local__search'] }), source()).mcpServers.local as { command?: string }
     expect(bare.command).toBe('kb-server')
+    // an absolute command is used as given; a path that is neither absolute nor ./ or ../ is refused at boot:
+    // nothing expands a ~, and a path meant for the child's cwd would land under the profile (twenty-seventh review)
+    const abs = join('/opt', 'venv', 'bin', 'python')
+    expect((parseProfile(raw({ mcpServers: { local: { command: abs } }, allowedTools: ['mcp__local__search'] }), source()).mcpServers.local as { command?: string }).command).toBe(abs)
+    for (const command of ['~/.venv/bin/python', 'bin/kb-server']) {
+      expect(() => parseProfile(raw({ mcpServers: { local: { command } }, allowedTools: ['mcp__local__search'] }), source())).toThrow(/mcpServers\.local: command .*neither/)
+    }
     // and an argument that is explicitly relative, while a flag, a URL, a scoped package name or `--flag=./x` stays as typed
     const withArgs = parseProfile(
       raw({ mcpServers: { local: { command: 'npx', args: ['-y', '@scope/server', './server.py', '../bin/x', 'https://kb.example.com/mcp', '--config=./c.json'] } }, allowedTools: ['mcp__local__search'] }),
