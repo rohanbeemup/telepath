@@ -524,6 +524,12 @@ export class TelegramBot {
 
   /** Transcriptions running now; at most MAX_TRANSCRIBING, so one sender's run of audio is not that many transcriber processes. */
   private transcribing = 0
+  /**
+   * Topics with a voice note queued or being heard, marked when the note is queued: in team
+   * mode a second note waits for the first (not for anything else queued there), and a burst
+   * cannot pile up behind a busy queue (eighteenth review, Codex hook).
+   */
+  private readonly pendingVoice = new Set<string>()
 
   /**
    * A voice note becomes the words in it, then goes the way typed text does. Any failure is
@@ -637,9 +643,15 @@ export class TelegramBot {
     return ctx.from ? String(ctx.from.id) : undefined
   }
 
-  private async createTopic(name: string): Promise<string> {
-    const topic = await this.bot.api.createForumTopic(this.d.cfg.forumChatId, name.slice(0, TITLE_MAX) || 'session')
-    return String(topic.message_thread_id)
+  /** The new topic's id, or undefined after a failure, whose Telegram error is in the log; the caller says TOPIC_CREATE_FAILED its own way. */
+  private async createTopic(name: string): Promise<string | undefined> {
+    try {
+      const topic = await this.bot.api.createForumTopic(this.d.cfg.forumChatId, name.slice(0, TITLE_MAX) || 'session')
+      return String(topic.message_thread_id)
+    } catch (e) {
+      this.d.log.error('topic.create_failed', { error: e })
+      return undefined
+    }
   }
 
   private bind(topicId: string, b: Omit<Binding, 'lastActive'>): void {
@@ -697,7 +709,10 @@ export class TelegramBot {
         const outcome = this.editOutcome(e)
         if (outcome === 'not_modified') return
         if (outcome !== 'gone') {
+          // A 429 or a network error: the pinned panel keeps its old state, so the current one
+          // (a closed topic's Reopen, say) goes out as an unpinned copy; no re-pin, no notification.
           this.d.log.warn('controls.refresh_failed', { topic: topicId, error: this.describeError(e).text })
+          await this.send(topicId, topicControlsText(this.d.cfg.catalog, b, undefined, this.kbMode()), topicControlsKb(this.d.cfg.catalog, b, this.kbMode()))
           return
         }
         // Deleted by hand: posting again is the only way to have a panel at all.
@@ -750,6 +765,7 @@ export class TelegramBot {
    * at a time, handlers queued per topic), so the topic is still unbound here.
    */
   private async bindFreshProfileTopic(ctx: Context, topicId: string): Promise<boolean> {
+    if (this.removed.has(topicId)) return false // deleted by an admin while this message waited: gone, or going
     if (!(await this.reserveTopic(ctx, topicId))) return false
     this.bindProfileTopic(topicId, this.topicTitleOf(ctx) ?? this.defaultTitle(ctx))
     await this.postPinnedControls(topicId)
@@ -790,12 +806,9 @@ export class TelegramBot {
     const sender = this.senderId(ctx)
     if (this.d.cfg.teamMode && sender && !this.senderReplies.allow(sender)) return void this.d.metrics.inc('refusals_muted')
     if (!(await this.reserveTopic(ctx, intoTopic))) return
-    let topicId: string
-    try {
-      topicId = await this.createTopic(title)
-    } catch (e) {
+    const topicId = await this.createTopic(title)
+    if (!topicId) {
       this.refundTopic(ctx) // only an opening that happened counts
-      this.d.log.error('topic.create_failed', { error: e }) // the forum gets the hint, not Telegram's raw text
       return tell(TOPIC_CREATE_FAILED, backKb())
     }
     this.bindProfileTopic(topicId, title)
@@ -804,11 +817,8 @@ export class TelegramBot {
   }
 
   private async newSession(name: string, cwd: string, model: string, effort: Effort | undefined, auto: boolean, intoTopic?: string): Promise<string | undefined> {
-    let topicId: string
-    try {
-      topicId = await this.createTopic(name)
-    } catch (e) {
-      this.d.log.error('topic.create_failed', { error: e })
+    const topicId = await this.createTopic(name)
+    if (!topicId) {
       await this.paint(intoTopic, TOPIC_CREATE_FAILED, backKb())
       return undefined
     }
@@ -840,11 +850,8 @@ export class TelegramBot {
     }
     const match = matches[0]
     const title = name || (match.summary || shortId).slice(0, 40)
-    let topicId: string
-    try {
-      topicId = await this.createTopic(title)
-    } catch (e) {
-      this.d.log.error('topic.create_failed', { error: e })
+    const topicId = await this.createTopic(title)
+    if (!topicId) {
       await this.say(fromTopic, TOPIC_CREATE_FAILED)
       return
     }
@@ -919,10 +926,8 @@ export class TelegramBot {
     const effort = done.effort ?? this.d.store.prefs.defaultEffort
     let topicId = done.bindTopic
     if (!topicId) {
-      try {
-        topicId = await this.createTopic(name)
-      } catch (e) {
-        this.d.log.error('topic.create_failed', { error: e })
+      topicId = await this.createTopic(name)
+      if (!topicId) {
         await this.send(undefined, TOPIC_CREATE_FAILED)
         return
       }
@@ -997,7 +1002,7 @@ export class TelegramBot {
     if (data === 'm:status') return void (await ack(), this.paint(topicId, this.d.statusText(), backKb()))
     if (data === 'm:help') {
       await ack()
-      if (this.d.cfg.teamMode && !this.replyAllowed(topicId, 'help', this.senderId(ctx))) return void this.d.metrics.inc('refusals_muted')
+      if (!this.replyAllowed(topicId, 'help', this.senderId(ctx))) return void this.d.metrics.inc('refusals_muted')
       return void this.send(topicId, this.d.cfg.teamMode ? teamHelp() : help(this.d.cfg.reposDir), backKb())
     }
     if (data === 'm:cancel') {
@@ -1142,16 +1147,19 @@ export class TelegramBot {
       return this.repaintControls(topicId, b)
     }
     if (data === 'm:tclose') {
+      if (b && this.d.cfg.teamMode) {
+        // Closed for everyone until an admin reopens it: the flag first, before anything yields,
+        // so a queued note or line cannot open a fresh session in the gap (eighteenth review).
+        b.closed = true
+        store.saveRegistry()
+      }
       this.topics.userTookOver(topicId)
       this.topics.closeLive(topicId, 'closed & kept by user')
       void this.status.drop(topicId)
       await ack('💾 Closed')
       if (b && this.d.cfg.teamMode) {
-        // Closed for everyone until an admin reopens it. The pinned panel shows the closed state
-        // with ♻️ Reopen and stays pinned, so "reopen it from the pinned panel" is true, and a
-        // later refresh of the panel keeps the button (seventeenth review).
-        b.closed = true
-        store.saveRegistry()
+        // The pinned panel shows the closed state with ♻️ Reopen and stays pinned, so "reopen it
+        // from the pinned panel" is true, and a later refresh keeps the button (seventeenth review).
         await this.refreshPinnedControls(topicId, b)
       } else {
         // One user's kept topic resumes on its next message; no flag is written.
@@ -1213,7 +1221,11 @@ export class TelegramBot {
     await ack()
   }
 
+  /** Topics deleted this process: a note still being heard there must not bind it again while Telegram removes it. */
+  private readonly removed = new Set<string>()
+
   private removeTopic(topicId: string, wipe: boolean): void {
+    this.removed.add(topicId)
     const sid = this.d.store.registry[topicId]?.sessionId
     this.topics.userTookOver(topicId)
     this.topics.closeLive(topicId, wipe ? 'wiped by user' : 'deleted by user')
@@ -1249,7 +1261,7 @@ export class TelegramBot {
       if (!KNOWN_COMMANDS.has(typed.cmd)) {
         if (!topicId && this.d.cfg.teamMode) return
         // In a shared forum a menu per unknown command is a flood a member can cause: once a minute per topic.
-        if (this.d.cfg.teamMode && !this.replyAllowed(topicId, 'menu', fromId)) return void this.d.metrics.inc('refusals_muted')
+        if (!this.replyAllowed(topicId, 'menu', fromId)) return void this.d.metrics.inc('refusals_muted')
         return this.showMainMenu(topicId, true)
       }
       if (!allowedAction(this.access, fromId, `/${typed.cmd}`)) return refuse()
@@ -1284,10 +1296,10 @@ export class TelegramBot {
           return void this.send(topicId, this.d.statusText())
         case 'menu':
           // A typed menu or help text is a reply a member can trigger at will: in a shared forum, so many a minute.
-          if (this.d.cfg.teamMode && !this.replyAllowed(topicId, 'menu', fromId)) return void this.d.metrics.inc('refusals_muted')
+          if (!this.replyAllowed(topicId, 'menu', fromId)) return void this.d.metrics.inc('refusals_muted')
           return this.controlsOrMenu(topicId, true)
         case 'help':
-          if (this.d.cfg.teamMode && !this.replyAllowed(topicId, 'help', fromId)) return void this.d.metrics.inc('refusals_muted')
+          if (!this.replyAllowed(topicId, 'help', fromId)) return void this.d.metrics.inc('refusals_muted')
           return void this.say(topicId, this.d.cfg.teamMode ? teamHelp() : help(this.d.cfg.reposDir))
         default:
           return this.showMainMenu(topicId, true)
@@ -1416,7 +1428,7 @@ export class TelegramBot {
     const verdict = await this.membership.check(uid)
     if (verdict === 'member') return true
     this.d.metrics.inc(verdict === 'unknown' ? 'membership_unknown' : 'non_member_rejected')
-    if (verdict === 'unknown' && this.membership.noticeDue(uid)) await this.say(this.topicIdOf(ctx), '⚠️ Could not verify your membership just now. Try again in a moment.')
+    if (verdict === 'unknown' && this.membership.noticeDue(uid)) await this.notice(this.topicIdOf(ctx), 'verify', '⚠️ Could not verify your membership just now. Try again in a moment.', uid)
     return false
   }
 
@@ -1503,8 +1515,9 @@ export class TelegramBot {
       }
       // queued per topic, so whatever is sent after the note is handled after it; in a shared
       // forum one at a time per topic, or a run of notes holds the topic and both slots for hours
-      if (this.d.cfg.teamMode && this.order.busy(topicId)) return await this.notice(topicId, 'voice', '🎙️ A voice note is still being transcribed here. Send the next one when it is done.', this.senderId(ctx))
-      this.order.queue(topicId, () => this.handleVoice(ctx, topicId, media, shared),
+      if (this.d.cfg.teamMode && this.pendingVoice.has(topicId)) return await this.notice(topicId, 'voice', '🎙️ A voice note is still being transcribed here. Send the next one when it is done.', this.senderId(ctx))
+      this.pendingVoice.add(topicId)
+      this.order.queue(topicId, () => this.handleVoice(ctx, topicId, media, shared).finally(() => this.pendingVoice.delete(topicId)),
         e => this.d.log.error('voice.failed', { topic: topicId, error: e }))
     })
 

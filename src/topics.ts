@@ -253,9 +253,9 @@ export class TopicManager {
     if (!b) return undefined
     if (this.openRefusal(topicId)) return undefined
     if (b.closed) {
-      // Written by Close & keep in every mode and honoured only in a shared forum: cleared on
-      // the resume it does not block, so a later switch to team mode cannot lock a topic that
-      // has been in use all along (twelfth review).
+      // Written by Close & keep in team mode and honoured only there: a flag an earlier team-mode
+      // run left behind is cleared on the resume it does not block, so switching team mode back
+      // on cannot lock a topic that has been in use all along (twelfth review).
       delete b.closed
       this.d.store.saveRegistry()
     }

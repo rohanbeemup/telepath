@@ -299,6 +299,17 @@ caps a wrong implementation would happily allow.
   user ⚙️ and `/menu` bring the panel to the bottom as on main; the misplaced docblock
   sits on `teamProfileProblems` again. Accepted, recorded: idle eviction applies the
   stuck bound as cap pressure does, which the operator sets above the longest tool.
+  After the eighteenth: the "could not verify" notice is on the reply rule; Close & keep
+  writes the flag before anything yields, so a note still being heard cannot open a
+  session in the gap; a topic deleted this process is remembered, so such a note cannot
+  bind it again while Telegram removes it; a second voice note waits for a transcription
+  in that topic, not for anything else queued there; when the panel's edit fails for a
+  429 or the network, the current state goes out as an unpinned copy, so a closed topic
+  is never without its Reopen button; `createTopic` logs its own failure and its four
+  callers only reply; the redundant team-mode prefixes before `replyAllowed` went; the
+  stale comment on the closed flag is corrected. Refuted with the plugin's source:
+  `@grammyjs/auto-retry`'s `pause` rejects on the abort signal, so the five-second cap
+  bounds a 429's wait on the membership lookup too.
 - **The membership lookup runs on the update loop.** grammY handles updates one at a time,
   and `admit()` asks the forum before a message is queued, so a cache miss costs every
   topic that lookup (bounded at five seconds, deduplicated per sender). Moving it into the
