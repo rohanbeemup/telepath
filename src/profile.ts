@@ -100,9 +100,11 @@ export function parseProfile(raw: unknown, src: ProfileSource): Profile {
       problems.push(`mcpServers.${name}: must be an object with a type (http, sse or stdio)`)
       continue
     }
-    if (s.type === 'http' || s.type === 'sse') {
-      if (typeof s.url !== 'string' || !s.url.trim()) problems.push(`mcpServers.${name}: a ${s.type} server needs a url`)
-    } else if (s.type === 'stdio') {
+    // No type with a command is a stdio server: the SDK's own default, and the shape every .mcp.json uses.
+    const type = s.type === undefined && typeof s.command === 'string' ? 'stdio' : s.type
+    if (type === 'http' || type === 'sse') {
+      if (typeof s.url !== 'string' || !s.url.trim()) problems.push(`mcpServers.${name}: a ${type} server needs a url`)
+    } else if (type === 'stdio') {
       if (typeof s.command !== 'string' || !s.command.trim()) problems.push(`mcpServers.${name}: a stdio server needs a command`)
     } else {
       problems.push(`mcpServers.${name}: type must be http, sse or stdio; got ${JSON.stringify(s.type)}`)

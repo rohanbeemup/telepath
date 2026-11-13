@@ -192,6 +192,15 @@ describe('TopicManager', () => {
     await h.tm.sendToTopic('late', 'one more')
     h.tm.evictIdle()
     expect(h.tm.isLive('late')).toBe(true)
+    // a turn parked on a rate limit with a resume scheduled is waiting, not hung: not evicted meanwhile
+    h.bind('parked')
+    await h.tm.sendToTopic('parked', 'x')
+    h.backend.last().emit({ type: 'rate_limit_event', rate_limit_info: { status: 'rejected', resetsAt: Math.floor((t + 3_600_000) / 1000) } })
+    await h.tick()
+    t += 10 * 60_000
+    h.tm.evictIdle()
+    expect(h.tm.isLive('parked')).toBe(true)
+    h.tm.userTookOver('parked') // clears the scheduled resume, so the test leaves no timer behind
     // where the forum is one person's, the longest-idle session is paused for the new topic, running or not, as before
     const own = harness({ maxLive: 1 })
     own.bind('p')

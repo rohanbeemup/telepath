@@ -243,13 +243,16 @@ export class TelegramBot {
   private async paint(topicId: string | undefined, text: string, kb?: InlineKeyboard): Promise<void> {
     const q = this.menuCtx?.callbackQuery
     const m = q?.message
-    const tapped = m && 'reply_markup' in m && !!m.reply_markup?.inline_keyboard.some(row => row.some(btn => 'callback_data' in btn && btn.callback_data === q.data))
+    // An inaccessible message (too old for Telegram to hand over) has no keyboard to check: not
+    // forged, just unknowable, so the result goes out fresh.
+    const keyboard = m && 'reply_markup' in m ? m.reply_markup?.inline_keyboard : undefined
+    const tapped = !!keyboard?.some(row => row.some(btn => 'callback_data' in btn && btn.callback_data === q?.data))
     if (tapped) {
       try {
         await this.menuCtx!.editMessageText(text, { reply_markup: kb })
         return
       } catch {}
-    } else if (q && this.d.cfg.teamMode) {
+    } else if (q && keyboard && this.d.cfg.teamMode) {
       // Callback data against a message whose keyboard does not hold it (forged, or a stale
       // client): a fresh message per such tap would be a flood a member can cause.
       this.d.metrics.inc('forged_taps')
@@ -311,7 +314,7 @@ export class TelegramBot {
           if (ev.errors.length) this.d.log.warn('turn.error_detail', { topic: topicId, subtype: ev.subtype, errors: ev.errors })
           const budget = ev.subtype === 'error_max_budget_usd' ? '\n💸 This topic has used its budget. Open a new topic for the next question.' : ''
           // A broken model (a revoked key) would otherwise answer every member message with a notice.
-          if (!budget && !this.replyAllowed(topicId, 'error')) return void this.d.metrics.inc('refusals_muted')
+          if (!budget && !this.replyAllowed(topicId, 'error')) return
           await this.send(topicId, `⚠️ turn ended: ${ev.subtype}.${budget}`)
           return
         }
@@ -337,7 +340,7 @@ export class TelegramBot {
       case 'assistantError':
         this.d.metrics.inc('assistant_errors')
         if (this.d.profile) {
-          if (!this.replyAllowed(topicId, 'error')) return void this.d.metrics.inc('refusals_muted')
+          if (this.muted(topicId, 'error')) return
           await this.send(topicId, `⚠️ model error: ${ev.error}.`)
         } else await this.send(topicId, `⚠️ model error: ${ev.error}. Tap ⚙️ to switch model or adjust this session.`, controlsKb())
         return
@@ -540,7 +543,7 @@ export class TelegramBot {
   private async handleVoice(ctx: Context, topicId: string, media: { file_id: string; file_unique_id: string; file_size?: number; file_name?: string }, shared: Omit<Heard, 'words'>): Promise<void> {
     try {
       if (media.file_size && media.file_size > MAX_DOWNLOAD_BYTES) {
-        return await this.say(topicId, `🎙️ Voice note too large (${(media.file_size / 1048576).toFixed(1)} MB): Telegram caps bot downloads at 20 MB.`)
+        return await this.notice(topicId, 'voice', `🎙️ Voice note too large (${(media.file_size / 1048576).toFixed(1)} MB): Telegram caps bot downloads at 20 MB.`, this.senderId(ctx))
       }
       if (!this.d.cfg.transcribeCmd) {
         return await this.notice(topicId, 'voice', this.d.profile ? '🎙️ Voice notes are not transcribed on this install: type your question.' : `🎙️ Voice note not transcribed: ${NO_TRANSCRIBER}`, this.senderId(ctx))
@@ -577,9 +580,9 @@ export class TelegramBot {
       if (!(await this.topics.sendToTopic(topicId, turn, { senderId: this.senderId(ctx) }))) await this.say(topicId, this.noSessionHint())
     } catch (e) {
       const reason = e instanceof Error ? e.message : String(e)
-      if (!this.d.profile) return await this.say(topicId, `🎙️ Voice note not transcribed: ${reason}`)
+      if (!this.d.profile) return await this.notice(topicId, 'voice', `🎙️ Voice note not transcribed: ${reason}`, this.senderId(ctx))
       this.d.log.warn('voice.failed', { topic: topicId, error: reason })
-      await this.say(topicId, '🎙️ Voice note not transcribed; the operator has the detail. Type your question instead.')
+      await this.notice(topicId, 'voice', '🎙️ Voice note not transcribed; the operator has the detail. Type your question instead.', this.senderId(ctx))
     }
   }
 
@@ -685,7 +688,7 @@ export class TelegramBot {
     const live = this.topics.live.get(topicId)
     if (!live || !isBusy(live)) return this.notice(topicId, 'wrap', 'Nothing is running in this topic right now, so there is nothing to wrap up.', senderId)
     // The confirmation too: a member tapping "Wrap up" thirty times is thirty posts otherwise.
-    if (!this.replyAllowed(topicId, 'wrap', senderId)) return void this.d.metrics.inc('refusals_muted')
+    if (this.muted(topicId, 'wrap', senderId)) return
     await this.send(topicId, wrapConfirmText(live.queued), wrapConfirmKb())
   }
 
@@ -698,27 +701,28 @@ export class TelegramBot {
    * on, and re-post only a panel that is gone (a re-post re-pins, and a pin notifies the
    * whole forum, so a 429 or a network error on the edit is logged and left).
    */
-  private async refreshPinnedControls(topicId: string, b: Binding): Promise<void> {
+  private async refreshPinnedControls(topicId: string, b: Binding): Promise<'edited' | 'unchanged' | 'posted'> {
     if (b.controlMsgId) {
       try {
         await this.bot.api.editMessageText(this.d.cfg.forumChatId, b.controlMsgId, topicControlsText(this.d.cfg.catalog, b, undefined, this.kbMode()), {
           reply_markup: topicControlsKb(this.d.cfg.catalog, b, this.kbMode()),
         })
-        return
+        return 'edited'
       } catch (e) {
         const outcome = this.editOutcome(e)
-        if (outcome === 'not_modified') return
+        if (outcome === 'not_modified') return 'unchanged'
         if (outcome !== 'gone') {
           // A 429 or a network error: the pinned panel keeps its old state, so the current one
           // (a closed topic's Reopen, say) goes out as an unpinned copy; no re-pin, no notification.
           this.d.log.warn('controls.refresh_failed', { topic: topicId, error: this.describeError(e).text })
           await this.send(topicId, topicControlsText(this.d.cfg.catalog, b, undefined, this.kbMode()), topicControlsKb(this.d.cfg.catalog, b, this.kbMode()))
-          return
+          return 'posted'
         }
         // Deleted by hand: posting again is the only way to have a panel at all.
       }
     }
     await this.postPinnedControls(topicId)
+    return 'posted'
   }
 
   private kbMode(): KbMode {
@@ -785,12 +789,22 @@ export class TelegramBot {
   }
 
   /** ⚙️ and /menu: the pinned panel of a bound topic, refreshed in place, or the main menu. */
-  private controlsOrMenu(topicId: string | undefined, fresh = false): Promise<void> {
+  private async controlsOrMenu(topicId: string | undefined, fresh = false): Promise<'menu' | 'edited' | 'unchanged' | 'posted'> {
     const b = topicId ? this.d.store.registry[topicId] : undefined
-    if (!topicId || !b) return this.showMainMenu(topicId, fresh)
+    if (!topicId || !b) {
+      await this.showMainMenu(topicId, fresh)
+      return 'menu'
+    }
     // In a shared forum the panel is refreshed where it is (a re-post re-pins, and a pin notifies
     // the whole forum); for one user it is brought to the bottom, as before.
-    return this.d.cfg.teamMode ? this.refreshPinnedControls(topicId, b) : this.postPinnedControls(topicId)
+    if (!this.d.cfg.teamMode) {
+      await this.postPinnedControls(topicId)
+      return 'posted'
+    }
+    const shown = await this.refreshPinnedControls(topicId, b)
+    // A typed /menu whose panel was already current would otherwise show nothing: an unpinned copy.
+    if (shown === 'unchanged' && fresh) await this.send(topicId, topicControlsText(this.d.cfg.catalog, b, undefined, this.kbMode()), topicControlsKb(this.d.cfg.catalog, b, this.kbMode()))
+    return shown
   }
 
   /**
@@ -801,10 +815,13 @@ export class TelegramBot {
   private async createProfileTopic(ctx: Context, title: string, intoTopic: string | undefined, via: 'tap' | 'text'): Promise<void> {
     const tell = (text: string, kb?: InlineKeyboard): Promise<void> => (via === 'tap' ? this.paint(intoTopic, text, kb) : this.send(intoTopic, text, kb))
     // A creation Telegram refuses is refunded, so the daily allowance does not bound the attempts
-    // while creation fails: the sender's own allowance does (fourth security read). Past it, the
-    // attempt is counted and answered with nothing, like every other muted reply.
+    // while creation fails: a member's own creation allowance does (fourth security read), apart
+    // from the reply allowance so that ten replies do not cost a topic; admins are exempt, as from
+    // the daily allowance.
     const sender = this.senderId(ctx)
-    if (this.d.cfg.teamMode && sender && !this.senderReplies.allow(sender)) return void this.d.metrics.inc('refusals_muted')
+    if (this.d.cfg.teamMode && sender && membershipRequired(this.access, sender) && !this.creations.allow(sender)) {
+      return this.notice(intoTopic, 'create', '⏳ Too many new topics in a minute. Try again shortly.', sender)
+    }
     if (!(await this.reserveTopic(ctx, intoTopic))) return
     const topicId = await this.createTopic(title)
     if (!topicId) {
@@ -953,7 +970,11 @@ export class TelegramBot {
     const { catalog } = this.d.cfg
     const store = this.d.store
 
-    if (data === 'm:menu') return void (await ack(), this.showMainMenu(topicId))
+    if (data === 'm:menu') {
+      await ack()
+      if (this.muted(topicId, 'menu', this.senderId(ctx))) return
+      return this.showMainMenu(topicId)
+    }
     if (data === 'm:noop') return void ack()
     if (data === 'm:new' || data === 'm:newhere') {
       if (this.d.profile) {
@@ -1002,7 +1023,7 @@ export class TelegramBot {
     if (data === 'm:status') return void (await ack(), this.paint(topicId, this.d.statusText(), backKb()))
     if (data === 'm:help') {
       await ack()
-      if (!this.replyAllowed(topicId, 'help', this.senderId(ctx))) return void this.d.metrics.inc('refusals_muted')
+      if (this.muted(topicId, 'help', this.senderId(ctx))) return
       return void this.send(topicId, this.d.cfg.teamMode ? teamHelp() : help(this.d.cfg.reposDir), backKb())
     }
     if (data === 'm:cancel') {
@@ -1010,7 +1031,12 @@ export class TelegramBot {
       await ack('Cancelled')
       return this.showMainMenu(topicId)
     }
-    if (data === 'm:ctl') return void (await ack(), this.controlsOrMenu(topicId))
+    if (data === 'm:ctl') {
+      if (this.muted(topicId, 'menu', this.senderId(ctx))) return void ack()
+      const shown = await this.controlsOrMenu(topicId)
+      // A panel already current edits to nothing: say where it is, or the tap looks dead.
+      return void ack(shown === 'unchanged' ? '⚙️ The controls are pinned at the top of this topic' : undefined)
+    }
 
     // Settings
     const sdm = /^m:sdm:(\w+)$/.exec(data)
@@ -1133,7 +1159,7 @@ export class TelegramBot {
     if (data === 'm:tf') {
       if (!b) return void ack('No session here')
       // Every flip writes the registry and edits the panel: in a shared forum, so many a minute.
-      if (!this.replyAllowed(topicId, 'feed', this.senderId(ctx))) return void ack('Try again in a moment')
+      if (this.muted(topicId, 'feed', this.senderId(ctx))) return void ack('Try again in a moment')
       b.feed = !feedOn(b)
       store.saveRegistry()
       await ack(b.feed ? '🔎 Feed ON' : '🔎 Feed OFF')
@@ -1261,7 +1287,7 @@ export class TelegramBot {
       if (!KNOWN_COMMANDS.has(typed.cmd)) {
         if (!topicId && this.d.cfg.teamMode) return
         // In a shared forum a menu per unknown command is a flood a member can cause: once a minute per topic.
-        if (!this.replyAllowed(topicId, 'menu', fromId)) return void this.d.metrics.inc('refusals_muted')
+        if (this.muted(topicId, 'menu', fromId)) return
         return this.showMainMenu(topicId, true)
       }
       if (!allowedAction(this.access, fromId, `/${typed.cmd}`)) return refuse()
@@ -1296,10 +1322,11 @@ export class TelegramBot {
           return void this.send(topicId, this.d.statusText())
         case 'menu':
           // A typed menu or help text is a reply a member can trigger at will: in a shared forum, so many a minute.
-          if (!this.replyAllowed(topicId, 'menu', fromId)) return void this.d.metrics.inc('refusals_muted')
-          return this.controlsOrMenu(topicId, true)
+          if (this.muted(topicId, 'menu', fromId)) return
+          await this.controlsOrMenu(topicId, true)
+          return
         case 'help':
-          if (!this.replyAllowed(topicId, 'help', fromId)) return void this.d.metrics.inc('refusals_muted')
+          if (this.muted(topicId, 'help', fromId)) return
           return void this.say(topicId, this.d.cfg.teamMode ? teamHelp() : help(this.d.cfg.reposDir))
         default:
           return this.showMainMenu(topicId, true)
@@ -1347,7 +1374,7 @@ export class TelegramBot {
         this.topics.closeLive(topicId, 'effort switch')
         return void this.say(topicId, `Effort set to ${typed.effort ?? 'default'}. (applies on next message)`)
       }
-      if (!this.replyAllowed(topicId, 'feed', fromId)) return void this.d.metrics.inc('refusals_muted')
+      if (this.muted(topicId, 'feed', fromId)) return
       b.feed = typed.on
       this.d.store.saveRegistry()
       return void this.say(topicId, typed.on ? '🔎 Activity feed ON — one line per tool call.' : '🔎 Activity feed OFF.')
@@ -1377,6 +1404,15 @@ export class TelegramBot {
   private readonly refusals = new Throttle(60_000)
   /** And at most ten replies a minute to one member, whatever the topics: the key space of topics is theirs to grow. */
   private readonly senderReplies = new Throttle(60_000, () => Date.now(), 10)
+  /** A member's topic creations, ten a minute: a creation Telegram refuses is refunded, so the day's allowance alone does not bound the attempts. */
+  private readonly creations = new Throttle(60_000, () => Date.now(), 10)
+
+  /** Whether a reply a member can trigger at will is muted now; counted when it is. */
+  private muted(topicId: string | undefined, kind: string, senderId?: string): boolean {
+    if (this.replyAllowed(topicId, kind, senderId)) return false
+    this.d.metrics.inc('refusals_muted')
+    return true
+  }
 
   /**
    * Whether a reply a member can trigger at will (a refusal, the help text, a menu) goes
@@ -1394,7 +1430,7 @@ export class TelegramBot {
 
   /** A refusal notice: "Admins only", the quota, the text-only and voice notices. */
   private async notice(topicId: string | undefined, kind: string, text: string, senderId?: string): Promise<void> {
-    if (!this.replyAllowed(topicId, kind, senderId)) return void this.d.metrics.inc('refusals_muted')
+    if (this.muted(topicId, kind, senderId)) return
     await this.say(topicId, text)
   }
 

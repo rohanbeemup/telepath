@@ -73,6 +73,8 @@ export function isBusy(l: Live): boolean {
 
 /** A turn with no result for this long, in a shared forum, is stuck: it may be paused for a new topic. */
 export const DEFAULT_STUCK_TURN_MS = 10 * 60_000
+/** A stored hand-off is at most one Telegram message long. */
+const HANDOFF_MAX = 4000
 /** Said when a running turn is ended as stuck: the turn and what was sent during it are gone, the transcript before it stays. */
 const STUCK_PAUSED = '💤 Paused: no output for a while. The unfinished turn, and anything sent during it, is lost; send it again to continue — the earlier context is kept.'
 
@@ -201,6 +203,8 @@ export class TopicManager {
    * a hung topic does not keep its slot (fourteenth review).
    */
   private stuck(l: Live, now = this.now()): boolean {
+    // A turn parked on a rate limit with a resume scheduled is waiting, not hung (nineteenth review).
+    if (this.resumeTimers.has(l.topicId)) return false
     return !!this.d.shared && isBusy(l) && now - l.lastOutput >= (this.d.stuckTurnMs ?? DEFAULT_STUCK_TURN_MS)
   }
 
@@ -224,7 +228,9 @@ export class TopicManager {
       let oldest: Live | undefined
       for (const l of this.live.values()) if (this.pausable(l) && (!oldest || l.lastActive < oldest.lastActive)) oldest = l
       if (!oldest) break
-      void this.d.say(oldest.topicId, isBusy(oldest) ? STUCK_PAUSED : `💤 Paused to free a slot (max ${this.d.maxLiveSessions} live sessions). Send a message here to resume — your context is kept.`)
+      // Said on the paused topic, which in a shared forum is usually a colleague's: on the reply
+      // rule, so a member alternating between their own topics cannot post there at will.
+      if (this.d.replyAllowed(oldest.topicId, 'paused')) void this.d.say(oldest.topicId, isBusy(oldest) ? STUCK_PAUSED : `💤 Paused to free a slot (max ${this.d.maxLiveSessions} live sessions). Send a message here to resume — your context is kept.`)
       this.d.metrics.inc('sessions_evicted_cap')
       this.closeLive(oldest.topicId, 'evicted (session cap)')
     }
@@ -539,7 +545,9 @@ export class TopicManager {
               if (ev.text.includes(HANDOFF_MARKER) && b) {
                 const h = parseHandoff(ev.text)
                 if (h) {
-                  b.handoff = { at: this.now(), text: h.text }
+                  // Bounded: the registry is rewritten whole on every result, and a hand-off is a
+                  // member's text to make as long as they like (fifth security read).
+                  b.handoff = { at: this.now(), text: h.text.slice(0, HANDOFF_MAX) }
                   this.d.store.saveRegistry()
                   if (l.wrap) l.wrap.handoff = h.text
                 }

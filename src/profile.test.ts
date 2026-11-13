@@ -142,6 +142,8 @@ describe('a profile is refused when', () => {
       expect(String((e as Error).message)).toContain('kb')
     }
     expect(() => parseProfile(raw({ mcpServers: { local: { type: 'stdio', command: 'kb-server', args: ['--port', '0'] } }, allowedTools: ['mcp__local__search'] }), source())).not.toThrow()
+    // a command with no type is a stdio server: the SDK's own default and the shape every .mcp.json uses
+    expect(() => parseProfile(raw({ mcpServers: { local: { command: 'kb-server' } }, allowedTools: ['mcp__local__search'] }), source())).not.toThrow()
   })
 
   test('an allowed tool must name a declared MCP server or a kept built-in tool', () => {
