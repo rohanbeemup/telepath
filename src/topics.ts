@@ -11,6 +11,7 @@ import type { Effort } from './models'
 import { effortFor, type Catalog } from './models'
 import type { Binding, Store } from './state'
 import type { Logger, Metrics } from './log'
+import { Throttle } from './throttle'
 
 export type SessionExtras = {
   canUseTool: CanUseTool
@@ -146,6 +147,8 @@ export class TopicManager {
   readonly live = new Map<string, Live>()
   private readonly primed = new Set<string>()
   private readonly resumeTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  /** A refusal is said at most once a minute per topic; the rest are counted. */
+  private readonly refusals = new Throttle(60_000, () => this.now())
   /** Bumped by every user action on a topic; a pending rotation watch compares against it. */
   private readonly takeoverGen = new Map<string, number>()
   private readonly now: () => number
@@ -189,15 +192,23 @@ export class TopicManager {
   }
 
   /**
+   * In a shared forum, a running turn that has been silent (no output, no message) past
+   * stuckTurnMs. Output counts as activity (the pump bumps lastActive on every stream
+   * message), so a long turn still producing is never stuck (thirteenth review).
+   */
+  private stuck(l: Live, now = this.now()): boolean {
+    return !!this.d.shared && isBusy(l) && now - l.lastActive >= (this.d.stuckTurnMs ?? DEFAULT_STUCK_TURN_MS)
+  }
+
+  /**
    * Whether a live session may be paused to free a slot. Where the forum is one person's,
    * any session: the longest-idle one goes, running or not, as before. In a shared forum
-   * only an idle one, or a turn stuck past stuckTurnMs: pausing a colleague's running turn
-   * would let one member kill it by opening topics (security review), while a turn that
-   * never ends must not hold its slot forever (twelfth review).
+   * only an idle one, or a stuck turn: pausing a colleague's running turn would let one
+   * member kill it by opening topics (security review), while a turn that never ends must
+   * not hold its slot forever (twelfth review).
    */
   private pausable(l: Live): boolean {
-    if (!this.d.shared || !isBusy(l)) return true
-    return this.now() - l.lastActive >= (this.d.stuckTurnMs ?? DEFAULT_STUCK_TURN_MS)
+    return !this.d.shared || !isBusy(l) || this.stuck(l)
   }
 
   /**
@@ -297,8 +308,7 @@ export class TopicManager {
     const why = this.openRefusal(topicId)
     if (why) {
       if (opts.quiet) return false
-      this.d.metrics.inc(`${why}_refusals`)
-      await this.d.say(topicId, this.refusalNotice(why))
+      await this.refuse(topicId, why)
       return true
     }
     let l = this.ensureLive(topicId)
@@ -319,8 +329,7 @@ export class TopicManager {
       const again = this.openRefusal(topicId)
       if (again) {
         if (opts.quiet) return false
-        this.d.metrics.inc(`${again}_refusals`)
-        await this.d.say(topicId, this.refusalNotice(again))
+        await this.refuse(topicId, again)
         return true
       }
       const l2 = this.ensureLive(topicId)
@@ -373,11 +382,17 @@ export class TopicManager {
 
   /** Idle eviction: a session with no turn in flight and nothing said for idleMinutes. */
   evictIdle(): void {
-    const cutoff = this.now() - this.d.idleMinutes * 60_000
+    const now = this.now()
+    const cutoff = now - this.d.idleMinutes * 60_000
     for (const l of [...this.live.values()]) {
       if (!isBusy(l) && l.lastActive < cutoff) {
         this.d.metrics.inc('sessions_evicted_idle')
         this.closeLive(l.topicId, 'idle')
+      } else if (this.stuck(l, now)) {
+        // A hung process in a shared forum is not kept until cap pressure finds it.
+        void this.d.say(l.topicId, '💤 Paused: no output for a while. Send a message here to resume — your context is kept.')
+        this.d.metrics.inc('sessions_evicted_stuck')
+        this.closeLive(l.topicId, 'stuck')
       }
     }
   }
@@ -411,7 +426,8 @@ export class TopicManager {
     this.userTookOver(topicId) // clears the reset nudge; the rotation supersedes it
     this.closeLive(topicId, `account rotated ${before ?? '?'} -> ${now}`)
     this.d.metrics.inc('rotations_resumed')
-    await this.resumeWith(topicId, CONTINUE_AFTER_ROTATION, `🔁 Account rotated to ${now} — continuing now.`)
+    // The account's label is the operator's, not a shared forum's (security read).
+    await this.resumeWith(topicId, CONTINUE_AFTER_ROTATION, this.d.shared ? '🔁 Continuing now.' : `🔁 Account rotated to ${now} — continuing now.`)
   }
 
   /**
@@ -430,6 +446,16 @@ export class TopicManager {
     else if (why === 'busy') await this.d.say(topicId, '⏳ Not resumed: every session slot is busy. Send a message here when one is free.')
   }
 
+  /**
+   * A refused message is counted every time and answered at most once a minute per topic:
+   * a member's flood of refused messages is otherwise the bot's flood (security read).
+   */
+  private async refuse(topicId: string, why: 'closed' | 'budget' | 'busy'): Promise<void> {
+    this.d.metrics.inc(`${why}_refusals`)
+    if (this.refusals.allow(topicId)) await this.d.say(topicId, this.refusalNotice(why))
+    else this.d.metrics.inc('refusals_muted')
+  }
+
   private refusalNotice(why: 'closed' | 'budget' | 'busy'): string {
     switch (why) {
       case 'closed':
@@ -446,6 +472,7 @@ export class TopicManager {
     const st = newPumpState(this.d.store.registry[topicId]?.sessionId)
     try {
       for await (const msg of l.session.stream()) {
+        l.lastActive = this.now() // output is activity: a turn still producing is never stuck
         const b = this.d.store.registry[topicId]
         // Output with no turn known (a turn the CLI began on its own after a preemption,
         // or an init this pump missed) is a running turn: count it, or eviction and the
@@ -476,11 +503,13 @@ export class TopicManager {
               const rot = this.d.rotator.enabled()
               const until = this.scheduleResume(topicId, ev.resetsAt)
               const rotating = rot ? ' If the account rotator switches accounts I continue right away.' : ''
+              // Under a profile there is no model to switch to: the offer would name a button that is not there.
+              const lighter = this.d.profileSessions ? '' : ' Or switch to a lighter model via ⚙️ Controls to keep going now.'
               await this.d.say(
                 topicId,
                 until
-                  ? `⏳ Rate limit hit on this model — resets at ${until}.${rotating} Otherwise I'll continue automatically then, or switch to a lighter model via ⚙️ Controls to keep going now.`
-                  : `⏳ Rate limit hit on this model.${rotating} Otherwise wait a moment and send your message again, or switch to a lighter model via ⚙️ Controls.`,
+                  ? `⏳ Rate limit hit on this model — resets at ${until}.${rotating} Otherwise I'll continue automatically then.${lighter}`
+                  : `⏳ Rate limit hit on this model.${rotating} Otherwise wait a moment and send your message again.${lighter}`,
               )
               if (rot) void this.resumeAfterRotation(topicId, activeBefore)
               await this.d.onEvent(topicId, { kind: 'turn', phase: 'waiting', inFlight: 1 + l.queued, note: until ? `resets at ${until}` : undefined })

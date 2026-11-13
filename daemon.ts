@@ -131,12 +131,14 @@ const CHILD_ENV: Record<string, string | undefined> = { ...process.env }
 function statusText(): string {
   const up = Math.round((Date.now() - STARTED) / 60000)
   const snap = metrics.snapshot()
+  const head =
+    `📊 telepath ${VERSION} · SDK ${SDK_VERSION} · ${versionVerdict.message}\n` +
+    `up ${up} min · ${topics.live.size}/${cfg.maxLiveSessions} live · ${Object.keys(store.registry).length} topics bound · idle ${cfg.idleMinutes}m\n`
   // Team mode: the forum reads this, so no admin ids, no topic titles, no error strings
   // (those stay in the journal and health.json); counts only.
   if (cfg.teamMode) {
     return (
-      `📊 telepath ${VERSION} · SDK ${SDK_VERSION} · ${versionVerdict.message}\n` +
-      `up ${up} min · ${topics.live.size}/${cfg.maxLiveSessions} live · ${Object.keys(store.registry).length} topics bound · idle ${cfg.idleMinutes}m\n` +
+      head +
       `team mode · ${profile ? `profile ${profile.name} (${profile.allowedTools.length} tools)` : 'no profile'} · ${cfg.teamTopicsPerDay} topics per member per day\n` +
       `turns ${snap.turns ?? 0} · errors ${snap.turn_errors ?? 0} (details in the journal)`
     )
@@ -145,8 +147,7 @@ function statusText(): string {
   const errors = ring.list().slice(-5).map(e => `• ${new Date(e.at).toISOString().slice(11, 19)} ${e.ev}${e.message ? `: ${e.message.slice(0, 120)}` : ''}`)
   const counters = Object.entries(snap).map(([k, v]) => `${k}=${v}`).join('  ')
   return (
-    `📊 telepath ${VERSION} · SDK ${SDK_VERSION} · ${versionVerdict.message}\n` +
-    `up ${up} min · ${topics.live.size}/${cfg.maxLiveSessions} live · ${Object.keys(store.registry).length} topics bound · idle ${cfg.idleMinutes}m\n` +
+    head +
     `default ${store.prefs.defaultModel} @ ${store.prefs.defaultEffort ?? 'default'} · models ${cfg.catalog.enabled.join(',')} · rotator ${rotatorEnabled() ? 'on' : 'off'}\n` +
     `${profile ? `profile ${profile.name} (${profile.allowedTools.length} tools)` : 'no profile'}\n\n` +
     (liveList.length ? `Live:\n${liveList.join('\n')}\n\n` : '') +

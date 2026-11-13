@@ -135,11 +135,12 @@ describe('TopicManager', () => {
 
   test('in a shared forum a running turn is paused for another topic only once it is stuck; until then the newcomer waits', async () => {
     let t = 1000
-    const h = harness({ maxLive: 2, now: () => t, shared: true, stuckTurnMs: 10 * 60_000 })
+    const h = harness({ maxLive: 2, now: () => t, shared: true, stuckTurnMs: 10 * 60_000, idleMinutes: 60 })
     h.bind('busy')
     h.bind('idle')
     h.bind('next')
     await h.tm.sendToTopic('busy', 'think hard') // running: no result yet, and the least recently active
+    const busySession = h.backend.last()
     t += 10
     await h.tm.sendToTopic('idle', 'quick one')
     h.backend.last().emit(result('s-idle'))
@@ -161,12 +162,23 @@ describe('TopicManager', () => {
     expect(h.said.find(([topic, text]) => topic === 'busy' && text.includes('Paused'))).toBeFalsy()
     expect(await h.tm.sendToTopic('late', 'continue', { takeover: false, quiet: true })).toBe(false)
     expect(h.backend.opens.length).toBe(3)
-    // a turn with no result past the bound is stuck and pausable after all: three hung tools do not hold the forum
+    // stuck means silent: ten minutes on, the turn still producing output is kept and the silent one is
+    // paused for the newcomer, so hung tools do not hold the forum and a long turn is not killed
     t += 10 * 60_000
+    busySession.emit({ type: 'keepalive' }) // output, whatever its kind, is activity
+    await h.tick()
     expect(await h.tm.sendToTopic('late', 'and me')).toBe(true)
     expect(h.tm.isLive('late')).toBe(true)
-    expect(h.tm.isLive('busy')).toBe(false) // the longest-running of the stuck turns
-    expect(h.tm.isLive('next')).toBe(true)
+    expect(h.tm.isLive('busy')).toBe(true)
+    expect(h.tm.isLive('next')).toBe(false)
+    expect(h.said.find(([topic, text]) => topic === 'next' && text.includes('Paused'))).toBeTruthy()
+    // and idle eviction ends a stuck turn too, so a hung process does not wait for cap pressure
+    t += 10 * 60_000
+    h.backend.last().emit({ type: 'keepalive' }) // late is producing
+    await h.tick()
+    h.tm.evictIdle()
+    expect(h.tm.isLive('busy')).toBe(false) // silent for ten minutes
+    expect(h.tm.isLive('late')).toBe(true)
     expect(h.said.find(([topic, text]) => topic === 'busy' && text.includes('Paused'))).toBeTruthy()
     // where the forum is one person's, the longest-idle session is paused for the new topic, running or not, as before
     const own = harness({ maxLive: 1 })
@@ -640,6 +652,11 @@ describe('a profile budget', () => {
     await h.tick()
     expect(h.store.registry['m'].spentUsd).toBeCloseTo(0.45)
     expect(h.store.registry['m'].reportedUsd).toBeCloseTo(0.45)
+    // a second refused message within the minute is counted, not answered: a member's flood is not the bot's
+    const before = h.said.filter(([topic, text]) => topic === 'b' && /budget/i.test(text)).length
+    expect(before).toBeGreaterThan(0)
+    expect(await h.tm.sendToTopic('b', 'again')).toBe(true)
+    expect(h.said.filter(([topic, text]) => topic === 'b' && /budget/i.test(text)).length).toBe(before)
     // a nudge into an exhausted topic posts nothing and reports undelivered
     const notices = h.said.filter(([topic, text]) => topic === 'b' && /budget/i.test(text)).length
     expect(await h.tm.sendToTopic('b', 'continue', { takeover: false, quiet: true })).toBe(false)

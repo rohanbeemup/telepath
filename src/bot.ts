@@ -11,6 +11,7 @@ import type { CanUseTool, PermissionResult } from '@anthropic-ai/claude-agent-sd
 import { basename } from 'path'
 import type { Config } from './config'
 import { admitted, allowedAction, membershipRequired, profileFreshOnly, profileLocked, promptTapAllowed, Membership, type AccessConfig } from './access'
+import { Throttle } from './throttle'
 import { KNOWN_COMMANDS, parseTyped, type Typed } from './commands'
 import type { Profile } from './profile'
 import { parseTeamNew, TITLE_MAX, TopicQuota, type Member } from './team'
@@ -73,6 +74,8 @@ const FREE_TEXT = Symbol('free-text')
 const TEXT_ONLY = '📎 This assistant reads text only: type your question.'
 /** Transcriptions at once: one sender's run of audio is otherwise that many transcriber processes and files. */
 const MAX_TRANSCRIBING = 2
+/** One text for the three places a topic creation can fail; Telegram's own error goes to the log. */
+const TOPIC_CREATE_FAILED = "Couldn't create the topic. Is the bot an admin of this group with Manage Topics?"
 const PROFILE_OWNS = '🔒 This install runs a profile: the model, effort and approvals are set there.'
 const PROFILE_FRESH = '🔒 Not under a profile: every topic starts fresh.'
 /** grammy types its optional signal with the abort-controller polyfill; the platform's AbortSignal is what runs. */
@@ -517,9 +520,9 @@ export class TelegramBot {
         return await this.say(topicId, `🎙️ Voice note too large (${(media.file_size / 1048576).toFixed(1)} MB): Telegram caps bot downloads at 20 MB.`)
       }
       if (!this.d.cfg.transcribeCmd) {
-        return await this.say(topicId, this.d.profile ? '🎙️ Voice notes are not transcribed on this install: type your question.' : `🎙️ Voice note not transcribed: ${NO_TRANSCRIBER}`)
+        return await this.notice(topicId, this.d.profile ? '🎙️ Voice notes are not transcribed on this install: type your question.' : `🎙️ Voice note not transcribed: ${NO_TRANSCRIBER}`)
       }
-      if (this.transcribing >= MAX_TRANSCRIBING) return await this.say(topicId, `🎙️ ${MAX_TRANSCRIBING} voice notes are being transcribed already. Send it again in a moment.`)
+      if (this.transcribing >= MAX_TRANSCRIBING) return await this.notice(topicId, `🎙️ ${MAX_TRANSCRIBING} voice notes are being transcribed already. Send it again in a moment.`)
       // Reserved before any await, so notes arriving in other topics meanwhile cannot all pass
       // the check; the download counts too, which bounds the disk as well as the processes.
       this.transcribing++
@@ -586,7 +589,7 @@ export class TelegramBot {
   /** One guard for every inbound media kind: a profile session has no file tool, and the host path stays out of the chat. */
   private async mediaRefusedUnderProfile(topicId: string): Promise<boolean> {
     if (!this.d.profile) return false
-    await this.say(topicId, this.d.cfg.transcribeCmd ? `${TEXT_ONLY} Voice notes are transcribed.` : TEXT_ONLY)
+    await this.notice(topicId, this.d.cfg.transcribeCmd ? `${TEXT_ONLY} Voice notes are transcribed.` : TEXT_ONLY)
     return true
   }
 
@@ -708,7 +711,7 @@ export class TelegramBot {
     if (!membershipRequired(this.access, uid)) return true // the cap is a member's; admins and single users are exempt
     if (uid && this.quota.take(uid)) return true
     this.d.metrics.inc('topic_quota_refused')
-    await this.say(where, `🧮 You have opened ${this.d.cfg.teamTopicsPerDay} topics today, the daily allowance. Keep asking in one of them, or come back tomorrow.`)
+    await this.notice(where, `🧮 You have opened ${this.d.cfg.teamTopicsPerDay} topics today, the daily allowance. Keep asking in one of them, or come back tomorrow.`)
     return false
   }
 
@@ -761,7 +764,7 @@ export class TelegramBot {
     } catch (e) {
       this.refundTopic(ctx) // only an opening that happened counts
       this.d.log.error('topic.create_failed', { error: e }) // the forum gets the hint, not Telegram's raw text
-      return tell("Couldn't create the topic. Is the bot an admin of this group with Manage Topics?", backKb())
+      return tell(TOPIC_CREATE_FAILED, backKb())
     }
     this.bindProfileTopic(topicId, title)
     await this.postPinnedControls(topicId)
@@ -773,7 +776,8 @@ export class TelegramBot {
     try {
       topicId = await this.createTopic(name)
     } catch (e) {
-      await this.paint(intoTopic, `Couldn't create topic (is the bot admin with Manage Topics?): ${e}`, backKb())
+      this.d.log.error('topic.create_failed', { error: e })
+      await this.paint(intoTopic, TOPIC_CREATE_FAILED, backKb())
       return undefined
     }
     this.bind(topicId, { cwd, model, effort, title: name, auto })
@@ -878,7 +882,8 @@ export class TelegramBot {
       try {
         topicId = await this.createTopic(name)
       } catch (e) {
-        await this.send(undefined, `Couldn't create topic (is the bot admin with Manage Topics?): ${e}`)
+        this.d.log.error('topic.create_failed', { error: e })
+        await this.send(undefined, TOPIC_CREATE_FAILED)
         return
       }
     }
@@ -1104,8 +1109,14 @@ export class TelegramBot {
       if (!b) return void this.paint(topicId, 'That session no longer exists.', backKb())
       b.closed = false
       store.saveRegistry()
-      const live = this.topics.ensureLive(topicId)
-      await ack(live ? '♻️ Reopened' : '♻️ Reopened, but no session could open (budget spent?)')
+      if (this.d.cfg.teamMode) {
+        // Reopened, not resumed: like a fresh topic, it costs no process until someone writes in it.
+        await ack('♻️ Reopened')
+      } else {
+        const live = this.topics.ensureLive(topicId)
+        const why = live ? undefined : this.topics.openRefusal(topicId)
+        await ack(live ? '♻️ Reopened' : `♻️ Reopened, but no session could open${why ? ` (${why})` : ''}`)
+      }
       await this.repaintControls(topicId, b)
       if (b.controlMsgId) await this.bot.api.pinChatMessage(this.d.cfg.forumChatId, b.controlMsgId).catch(() => {})
       return
@@ -1171,13 +1182,15 @@ export class TelegramBot {
     const fromId = this.senderId(ctx)
     const refuse = (): Promise<void> => {
       this.d.metrics.inc('admin_only_refused')
-      return this.say(topicId, '🔒 Admins only.')
+      return this.notice(topicId, '🔒 Admins only.')
     }
 
     if (typed.kind === 'slash') {
       // An unknown command (/start, a typo) is nobody's to refuse: the menu, or silence in a team's General.
       if (!KNOWN_COMMANDS.has(typed.cmd)) {
         if (!topicId && this.d.cfg.teamMode) return
+        // In a shared forum a menu per unknown command is a flood a member can cause: once a minute per topic.
+        if (this.d.cfg.teamMode && !this.refusals.allow(topicId ?? 'general')) return void this.d.metrics.inc('refusals_muted')
         return this.showMainMenu(topicId)
       }
       if (!allowedAction(this.access, fromId, `/${typed.cmd}`)) return refuse()
@@ -1284,6 +1297,19 @@ export class TelegramBot {
 
   /** Topics where a post made as the group has been answered with the reason once. */
   private readonly anonymousNoticed = new Set<string>()
+
+  /** A refusal is said at most once a minute per topic (General counted as one); the rest are counted, not posted. */
+  private readonly refusals = new Throttle(60_000)
+
+  /**
+   * A refusal notice: "Admins only", the quota, the text-only and voice notices, an unknown
+   * command's menu. Every refused message is counted; a member's flood of them is not the
+   * bot's flood (security read), so the notice goes out once a minute per topic.
+   */
+  private async notice(topicId: string | undefined, text: string): Promise<void> {
+    if (!this.refusals.allow(topicId ?? 'general')) return void this.d.metrics.inc('refusals_muted')
+    await this.say(topicId, text)
+  }
 
   /**
    * A post made as the group (an admin with "Remain anonymous" on) carries no sender to
@@ -1400,7 +1426,9 @@ export class TelegramBot {
         forwarded: originName(ctx.message.forward_origin),
         caption: ctx.message.caption?.trim() || undefined,
       }
-      // queued per topic, so whatever is sent after the note is handled after it
+      // queued per topic, so whatever is sent after the note is handled after it; in a shared
+      // forum one at a time per topic, or a run of notes holds the topic and both slots for hours
+      if (this.d.cfg.teamMode && this.order.busy(topicId)) return await this.notice(topicId, '🎙️ A voice note is still being transcribed here. Send the next one when it is done.')
       this.order.queue(topicId, () => this.handleVoice(ctx, topicId, media, shared),
         e => this.d.log.error('voice.failed', { topic: topicId, error: e }))
     })
