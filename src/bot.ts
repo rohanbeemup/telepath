@@ -338,6 +338,8 @@ export class TelegramBot {
         return
       }
       case 'denied':
+        // A hook denial emits no such frame (the SDK says so), so under a profile this is unreachable; on the rule anyway.
+        if (this.d.profile && this.muted(topicId, 'error')) return
         await this.send(topicId, `🚫 ${ev.tool} was denied: ${ev.message}`)
         return
       case 'assistantError':
@@ -765,22 +767,28 @@ export class TelegramBot {
   }
 
   /**
-   * Team mode: each member may open only so many topics a day. Reserves the opening
-   * (synchronously, so two in flight cannot both pass) and says so when the allowance is
-   * spent; a creation Telegram then refuses is given back with refundTopic.
+   * One opening, both allowances: the day's (`TEAM_TOPICS_PER_DAY`, taken synchronously so two
+   * in flight cannot both pass) and then the minute's (ten creations, since a creation
+   * Telegram refuses is given back from the day and the day alone would not bound the
+   * attempts; a topic made by hand in Telegram costs the same pin and counts the same). Says
+   * which was spent and returns nothing, or returns the refund for an opening that did not
+   * happen. Admins and single users are exempt by the one rule the membership gate uses.
    */
-  private async reserveTopic(ctx: Context, where: string | undefined): Promise<boolean> {
+  private async reserveOpening(ctx: Context, where: string | undefined): Promise<(() => void) | undefined> {
     const uid = this.senderId(ctx)
-    if (!membershipRequired(this.access, uid)) return true // the cap is a member's; admins and single users are exempt
-    if (uid && this.quota.take(uid)) return true
-    this.d.metrics.inc('topic_quota_refused')
-    await this.notice(where, 'quota', `🧮 You have opened ${this.d.cfg.teamTopicsPerDay} topics today, the daily allowance. Keep asking in one of them, or come back tomorrow.`, uid)
-    return false
-  }
-
-  private refundTopic(ctx: Context): void {
-    const uid = this.senderId(ctx)
-    if (uid && membershipRequired(this.access, uid)) this.quota.refund(uid)
+    if (!membershipRequired(this.access, uid)) return () => {}
+    if (!uid) return undefined
+    if (!this.quota.take(uid)) {
+      this.d.metrics.inc('topic_quota_refused')
+      await this.notice(where, 'quota', `🧮 You have opened ${this.d.cfg.teamTopicsPerDay} topics today, the daily allowance. Keep asking in one of them, or come back tomorrow.`, uid)
+      return undefined
+    }
+    if (!this.creations.allow(uid)) {
+      this.quota.refund(uid)
+      await this.notice(where, 'create', '⏳ Too many new topics in a minute. Try again shortly.', uid)
+      return undefined
+    }
+    return () => this.quota.refund(uid)
   }
 
   /**
@@ -788,26 +796,9 @@ export class TelegramBot {
    * Every caller reads the registry just before, under the topic's own ordering (one update
    * at a time, handlers queued per topic), so the topic is still unbound here.
    */
-  /**
-   * A member's own creation allowance, ten a minute, asked after the day's (which is cheaper
-   * and refuses first) and given back with it when the creation fails: a refused creation is
-   * refunded from the day, so the day alone does not bound the attempts (fourth security read);
-   * a topic made by hand in Telegram costs the same pin and counts the same (sixth). Admins
-   * are exempt, as from the day's.
-   */
-  private async reserveCreation(ctx: Context, where: string | undefined): Promise<boolean> {
-    const sender = this.senderId(ctx)
-    if (!this.d.cfg.teamMode || !sender || !membershipRequired(this.access, sender)) return true
-    if (this.creations.allow(sender)) return true
-    this.refundTopic(ctx)
-    await this.notice(where, 'create', '⏳ Too many new topics in a minute. Try again shortly.', sender)
-    return false
-  }
-
   private async bindFreshProfileTopic(ctx: Context, topicId: string): Promise<boolean> {
     if (this.removed.has(topicId)) return false // deleted by an admin while this message waited: gone, or going
-    if (!(await this.reserveTopic(ctx, topicId))) return false
-    if (!(await this.reserveCreation(ctx, topicId))) return false
+    if (!(await this.reserveOpening(ctx, topicId))) return false
     this.bindProfileTopic(topicId, this.topicTitleOf(ctx) ?? this.defaultTitle(ctx))
     await this.postPinnedControls(topicId)
     return true
@@ -855,11 +846,11 @@ export class TelegramBot {
     // while creation fails: a member's own creation allowance does (fourth security read), apart
     // from the reply allowance so that ten replies do not cost a topic; admins are exempt, as from
     // the daily allowance.
-    if (!(await this.reserveTopic(ctx, intoTopic))) return
-    if (!(await this.reserveCreation(ctx, intoTopic))) return
+    const refund = await this.reserveOpening(ctx, intoTopic)
+    if (!refund) return
     const topicId = await this.createTopic(title)
     if (!topicId) {
-      this.refundTopic(ctx) // only an opening that happened counts
+      refund() // only an opening that happened counts
       return tell(TOPIC_CREATE_FAILED, backKb())
     }
     this.bindProfileTopic(topicId, title)
@@ -1260,7 +1251,10 @@ export class TelegramBot {
     if (data === 'm:tdelyes') {
       this.removeTopic(topicId, false)
       await ack('🗑 Deleted')
-      await this.bot.api.deleteForumTopic(this.d.cfg.forumChatId, Number(topicId)).catch(e => this.d.log.warn('topic.delete_failed', { topic: topicId, error: e }))
+      await this.bot.api.deleteForumTopic(this.d.cfg.forumChatId, Number(topicId)).catch(e => {
+        this.removed.delete(topicId) // still there: not a tombstone after all (twenty-second review)
+        this.d.log.warn('topic.delete_failed', { topic: topicId, error: e })
+      })
       return
     }
     if (data === 'm:twipe') {
@@ -1274,7 +1268,10 @@ export class TelegramBot {
     if (data === 'm:twipeyes') {
       this.removeTopic(topicId, true)
       await ack('🧹 Wiped')
-      await this.bot.api.deleteForumTopic(this.d.cfg.forumChatId, Number(topicId)).catch(e => this.d.log.warn('topic.wipe_failed', { topic: topicId, error: e }))
+      await this.bot.api.deleteForumTopic(this.d.cfg.forumChatId, Number(topicId)).catch(e => {
+        this.removed.delete(topicId)
+        this.d.log.warn('topic.wipe_failed', { topic: topicId, error: e })
+      })
       return
     }
     await ack()

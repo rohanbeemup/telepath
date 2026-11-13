@@ -245,7 +245,7 @@ export class TopicManager {
   openRefusal(topicId: string): 'closed' | 'budget' | 'busy' | undefined {
     const b = this.d.store.registry[topicId]
     if (!b) return undefined
-    if (b.closed && this.d.shared) return 'closed' // ♻️ Reopen clears it
+    if (b.closed) return 'closed' // written in team mode, cleared at boot outside it; ♻️ Reopen clears it
     const left = this.remainingBudget(b)
     if (left !== undefined && left <= 0) return 'budget'
     if (!this.live.has(topicId) && this.live.size >= this.d.maxLiveSessions && ![...this.live.values()].some(l => this.pausable(l))) return 'busy'
@@ -253,28 +253,41 @@ export class TopicManager {
   }
 
   /**
-   * A binding made before the profile becomes the profile's: its session id goes (another
-   * binding's transcript, a full session's tool results, files and questions, is not this
-   * topic's to show), and with it the hand-off (a repo path, a branch, the operator's next
-   * command, which ▶️ Resume would feed to the profile), the approval mode, and the old
-   * transcript's total as a baseline. True when something changed. Run over the whole
-   * registry at boot, and here for any binding added since, so no reader sees the old values.
+   * A binding made on the other side of the profile line becomes this side's: its session id
+   * goes, in either direction, since a transcript is not the other context's to resume (a full
+   * session's tool results, files and questions are not a forum's to show; a forum's transcript,
+   * with whatever a member left in it, is not to run under the operator's full toolset), and
+   * with it the hand-off (a repo path, a branch, a next command, which ▶️ Resume would feed
+   * across), the approval mode, and the old transcript's total as a baseline. True when
+   * something changed. Run over the whole registry at boot, and here for any binding added
+   * since, so no reader sees the old values (twenty-second review: the reverse direction).
    */
   private adopt(topicId: string, b: Binding): boolean {
-    if (!this.d.profileSessions || b.profile) return false
-    if (b.sessionId) this.d.log.info('session.resume_dropped', { topic: topicId, sessionId: b.sessionId, why: 'binding predates the profile' })
+    const underProfile = !!this.d.profileSessions
+    if (!!b.profile === underProfile) return false
+    if (b.sessionId) this.d.log.info('session.resume_dropped', { topic: topicId, sessionId: b.sessionId, why: underProfile ? 'binding predates the profile' : 'binding was made under a profile' })
     b.sessionId = undefined
-    b.profile = true
+    b.profile = underProfile
     delete b.handoff
     b.auto = false
     if (this.d.budgetUsd !== undefined) b.reportedUsd = 0
     return true
   }
 
-  /** Every binding from before the profile, adopted at once (boot). */
+  /**
+   * Every binding from the other side of the profile line, adopted at once (boot); and, where
+   * the forum is one person's, every `closed` flag a team-mode run left behind, cleared, so the
+   * flag is honoured wherever it is read without a mode check (twenty-second review).
+   */
   adoptAll(): void {
     let changed = false
-    for (const [topicId, b] of Object.entries(this.d.store.registry)) if (this.adopt(topicId, b)) changed = true
+    for (const [topicId, b] of Object.entries(this.d.store.registry)) {
+      if (this.adopt(topicId, b)) changed = true
+      if (!this.d.shared && b.closed) {
+        delete b.closed
+        changed = true
+      }
+    }
     if (changed) this.d.store.saveRegistry()
   }
 
@@ -284,13 +297,6 @@ export class TopicManager {
     const b = this.d.store.registry[topicId]
     if (!b) return undefined
     if (this.openRefusal(topicId)) return undefined
-    if (b.closed) {
-      // Written by Close & keep in team mode and honoured only there: a flag an earlier team-mode
-      // run left behind is cleared on the resume it does not block, so switching team mode back
-      // on cannot lock a topic that has been in use all along (twelfth review).
-      delete b.closed
-      this.d.store.saveRegistry()
-    }
     // A stretch gets what is left of the topic's budget, so it cannot overshoot the cap by
     // a whole fresh budget. This is consistent with the pump's accounting, not at odds with
     // it: the SDK's `maxBudgetUsd` counts only the spend since this query() started (the CLI
@@ -337,14 +343,10 @@ export class TopicManager {
    */
   async sendToTopic(topicId: string, text: string, opts: { takeover?: boolean; quiet?: boolean; senderId?: string } = {}): Promise<boolean> {
     if (opts.takeover !== false) this.userTookOver(topicId)
-    const why = this.openRefusal(topicId)
-    if (why) {
-      if (opts.quiet) return false
-      await this.refuse(topicId, why, opts.senderId)
-      return true
-    }
-    let l = this.ensureLive(topicId)
-    if (!l) return false
+    const first = this.openFor(topicId)
+    if (!first) return false
+    if ('refused' in first) return this.refused(topicId, first.refused, opts)
+    let l = first
     l.lastActive = this.now()
     // A new turn's silence counts from its send, not from the last turn's end: a session idle
     // past the stuck bound would otherwise be stuck before its first output (Codex hook).
@@ -361,15 +363,10 @@ export class TopicManager {
       // (the slot may be gone meanwhile), said the same way.
       this.d.log.warn('session.send_failed', { topic: topicId, error: e })
       this.live.delete(topicId)
-      const again = this.openRefusal(topicId)
-      if (again) {
-        if (opts.quiet) return false
-        await this.refuse(topicId, again, opts.senderId)
-        return true
-      }
-      const l2 = this.ensureLive(topicId)
-      if (!l2) return false
-      l = l2
+      const again = this.openFor(topicId)
+      if (!again) return false
+      if ('refused' in again) return this.refused(topicId, again.refused, opts)
+      l = again
       l.session.send(payload)
     }
     this.d.metrics.inc('messages_in')
@@ -485,6 +482,25 @@ export class TopicManager {
    * A refused message is counted every time and answered at most once a minute per topic:
    * a member's flood of refused messages is otherwise the bot's flood (security read).
    */
+  /**
+   * The topic's live session for a message, the refusal when the topic cannot take one now,
+   * or undefined when nothing is bound. Synchronous, so nothing can run between a session's
+   * opening and its first send: an await there let cap pressure from another topic pause the
+   * new, still idle session before it was used (Codex hook).
+   */
+  private openFor(topicId: string): Live | { refused: 'closed' | 'budget' | 'busy' } | undefined {
+    const why = this.openRefusal(topicId)
+    if (why) return { refused: why }
+    return this.ensureLive(topicId)
+  }
+
+  /** A refused send: said, unless the message is a quiet nudge, which reports undelivered. */
+  private async refused(topicId: string, why: 'closed' | 'budget' | 'busy', opts: { quiet?: boolean; senderId?: string }): Promise<boolean> {
+    if (opts.quiet) return false
+    await this.refuse(topicId, why, opts.senderId)
+    return true
+  }
+
   private async refuse(topicId: string, why: 'closed' | 'budget' | 'busy', senderId?: string): Promise<void> {
     this.d.metrics.inc(`${why}_refusals`)
     // The bot's one rule for replies a member can trigger: topic and kind, and the sender's allowance.

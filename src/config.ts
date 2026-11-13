@@ -86,6 +86,9 @@ export function parseConfig(env: Record<string, string | undefined>, stateDir: s
   for (const id of adminUserIds.slice(1)) {
     if (!/^\d+$/.test(id)) problems.push(`ADMIN_USER_IDS: "${id}" is not a numeric Telegram user id (comma-separated ids, from @userinfobot)`)
   }
+  // Outside team mode only the allowed user is admitted at all, so further admins would boot
+  // clean and get silence (twenty-second review).
+  if (!teamMode && adminUserIds.length > 1) problems.push('ADMIN_USER_IDS beyond ALLOWED_USER_ID needs TEAM_MODE=1: outside team mode only the allowed user is admitted, so the others would be dead configuration')
   const profileFile = env.PROFILE_FILE ? (isAbsolute(env.PROFILE_FILE) ? env.PROFILE_FILE : join(stateDir, env.PROFILE_FILE)) : undefined
   if (teamMode && !profileFile) problems.push('TEAM_MODE requires PROFILE_FILE: a locked session profile is what makes a shared forum safe (README, Team mode)')
   const teamTopicsPerDay = num('TEAM_TOPICS_PER_DAY', 20)

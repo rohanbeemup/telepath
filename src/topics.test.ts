@@ -730,15 +730,16 @@ describe('an admin-closed topic', () => {
     expect(h.backend.opens.length).toBe(1)
     expect(h.tm.ensureLive('z')).toBeUndefined()
     expect(h.said.find(([topic, text]) => topic === 'z' && /closed/i.test(text))).toBeTruthy()
-    // outside a shared forum the flag is written but not honoured: a single user's kept topic resumes on its
-    // next message, which clears the flag, so a later switch to team mode cannot lock a topic in use
+    // outside a shared forum a flag a team-mode run left behind is cleared at boot, so the kept topic
+    // resumes on its next message and a later switch to team mode cannot lock a topic in use
     const single = harness()
     single.bind('y')
     single.store.registry['y'].closed = true
+    single.tm.adoptAll()
+    expect(single.store.registry['y'].closed).toBeFalsy()
     expect(await single.tm.sendToTopic('y', 'back again')).toBe(true)
     expect(single.backend.opens.length).toBe(1)
     expect(single.said.find(([topic, text]) => topic === 'y' && /closed/i.test(text))).toBeFalsy()
-    expect(single.store.registry['y'].closed).toBeFalsy()
     // a nudge into a closed topic posts nothing and reports undelivered
     const closedNotices = h.said.filter(([topic, text]) => topic === 'z' && /closed/i.test(text)).length
     expect(await h.tm.sendToTopic('z', 'continue', { takeover: false, quiet: true })).toBe(false)
@@ -771,6 +772,17 @@ describe('bindings from before the profile', () => {
     expect(boot.store.registry['kept']).toMatchObject({ profile: true, auto: false, reportedUsd: 0 })
     expect(boot.store.registry['kept'].sessionId).toBeUndefined()
     expect(boot.store.registry['kept'].handoff).toBeUndefined()
+    // and the other way: a binding made under a profile does not resume its transcript under the full toolset
+    const back = harness()
+    back.bind('shared', { sessionId: 'forum-session-1', auto: true })
+    back.store.registry['shared'].profile = true
+    back.store.registry['shared'].handoff = { at: 1, text: 'Resume: whatever a member left here' }
+    back.tm.adoptAll()
+    expect(back.store.registry['shared']).toMatchObject({ profile: false, auto: false })
+    expect(back.store.registry['shared'].sessionId).toBeUndefined()
+    expect(back.store.registry['shared'].handoff).toBeUndefined()
+    await back.tm.sendToTopic('shared', 'hello')
+    expect(back.backend.opens[0].resume).toBeUndefined()
     // and it is the profile's from now on: the fresh session it opened is resumed by the next stretch
     expect(h.store.registry['old'].profile).toBe(true)
     h.backend.last().emit(result('fresh-1'))

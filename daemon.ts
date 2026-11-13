@@ -183,9 +183,10 @@ const topics = new TopicManager({
   profileSessions: !!profile, shared: cfg.teamMode, stuckTurnMs: cfg.stuckTurnMinutes * 60_000, replyAllowed: (t, k, s) => bot.replyAllowed(t, k, s),
 })
 bot.attachTopics(topics)
-// Bindings from before the profile become its own in one pass, so no reader sees their old session,
-// hand-off or approval mode; the manager adopts any binding added since on its first open.
-if (profile) topics.adoptAll()
+// Bindings from the other side of the profile line become this side's in one pass, so no reader
+// sees their old session, hand-off or approval mode, and outside team mode every `closed` flag a
+// team-mode run left is cleared; the manager adopts any binding added since on its first open.
+topics.adoptAll()
 
 // ── periodic work ───────────────────────────────────────────────────────────
 setInterval(() => topics.evictIdle(), 60_000).unref()

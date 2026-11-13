@@ -86,8 +86,19 @@ describe('team mode', () => {
   })
 
   test('admins are the allowed user plus ADMIN_USER_IDS', () => {
+    const team = { ...REQUIRED, TEAM_MODE: '1', PROFILE_FILE: '/p.json' }
     expect(parseConfig({ ...REQUIRED }, '/state').adminUserIds).toEqual(['1'])
-    expect(parseConfig({ ...REQUIRED, ADMIN_USER_IDS: ' 2, 3 ,1,,2 ' }, '/state').adminUserIds).toEqual(['1', '2', '3'])
+    expect(parseConfig({ ...team, ADMIN_USER_IDS: ' 2, 3 ,1,,2 ' }, '/state').adminUserIds).toEqual(['1', '2', '3'])
+    // outside team mode only the allowed user is admitted, so further admins would be dead configuration: refused, naming TEAM_MODE
+    let dead: unknown
+    try {
+      parseConfig({ ...REQUIRED, ADMIN_USER_IDS: '2' }, '/state')
+    } catch (e) {
+      dead = e
+    }
+    expect(dead).toBeInstanceOf(ConfigError)
+    expect(String((dead as Error).message)).toContain('TEAM_MODE')
+    expect(parseConfig({ ...REQUIRED, ADMIN_USER_IDS: '1' }, '/state').adminUserIds).toEqual(['1']) // the allowed user again is not a further admin
     // each a numeric Telegram id: a space for a comma, a handle or a stray letter is a config problem that names it
     for (const bad of ['123 456', '@rohan', '12a']) {
       let err: unknown
