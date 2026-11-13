@@ -11,7 +11,8 @@
   the cache), so a public forum that lets non-members post is no hole. A post made as the
   group (an anonymous admin) or by a linked channel is dropped, and inside a topic the reason
   is said once. Members chat and open topics (typing in a fresh topic, the 🆕 button, or
-  `/new <title>`, capped at Telegram's 120 characters; `TEAM_TOPICS_PER_DAY` per member per
+  `/new <title>`, capped at 120 UTF-16 units, under Telegram's topic-name limit however it
+  counts, so emoji count double; `TEAM_TOPICS_PER_DAY` per member per
   local day, default 20, admins exempt, a refused creation not counted; a topic costs no
   process until someone writes in it). Closing, deleting and wiping a topic, model, effort,
   approvals, settings, the session list, `/attach`, `/status` and wrapping up at the next step stay with `ALLOWED_USER_ID`

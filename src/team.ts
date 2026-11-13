@@ -13,9 +13,14 @@ export type Member = { firstName?: string; username?: string }
 /** Telegram's topic-name limit; applied here, and by createTopic from the same constant. */
 export const TITLE_MAX = 120
 
-/** The first TITLE_MAX characters, counted as Telegram counts them: a cut inside an emoji would hand it a lone surrogate it refuses. */
+/**
+ * The first TITLE_MAX UTF-16 units, the unit Telegram's limits are counted in (a count of code
+ * points let 120 emoji through as 240 units; thirtieth review), with a trailing high surrogate
+ * dropped rather than handed over as the half of an emoji Telegram refuses.
+ */
 export function clipTitle(s: string): string {
-  return Array.from(s).slice(0, TITLE_MAX).join('')
+  const out = s.slice(0, TITLE_MAX)
+  return /[\uD800-\uDBFF]$/.test(out) ? out.slice(0, -1) : out
 }
 
 export function parseTeamNew(args: string, member: Member, now: Date): { title: string } {

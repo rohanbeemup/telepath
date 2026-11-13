@@ -13,10 +13,16 @@ test('/new in team mode takes the rest of the line as the title and ignores cwd=
   const long = parseTeamNew('x'.repeat(4000), { firstName: 'Ann' }, at).title
   expect(long.length).toBe(120)
   expect(parseTeamNew('y'.repeat(120), {}, at).title.length).toBe(120)
-  // counted as Telegram counts: a cut never splits an emoji into a lone surrogate Telegram refuses
+  // counted in UTF-16 units, the unit Telegram's limits are counted in: a title of emoji cannot run to
+  // twice the limit (thirtieth review: a count of code points did), and a cut never leaves the half of
+  // an emoji, the lone surrogate Telegram refuses, at the end
   const fiery = parseTeamNew('z'.repeat(119) + '🔥 and more', {}, at).title
-  expect(Array.from(fiery).length).toBe(120)
-  expect(fiery.endsWith('🔥')).toBe(true)
+  expect(fiery).toBe('z'.repeat(119))
+  const emoji = parseTeamNew('🔥'.repeat(121), {}, at).title
+  expect(emoji.length).toBe(120)
+  expect(Array.from(emoji).length).toBe(60)
+  expect(() => encodeURIComponent(emoji)).not.toThrow() // no lone surrogate anywhere
+  expect(() => encodeURIComponent(fiery)).not.toThrow()
 })
 
 test('a member may open only so many topics a day', () => {

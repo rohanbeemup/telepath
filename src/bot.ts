@@ -1190,6 +1190,9 @@ export class TelegramBot {
       // A binding from before the profile was adopted at boot, so no hand-off here is the operator's.
       const h = hb?.handoff ? parseHandoff(hb.handoff.text) : undefined
       if (!h) return void ack('No hand-off saved for this topic')
+      // The topic's refusal first, as a typed line asks it: a closed, spent or slot-starved topic must
+      // not hear "Resuming" and then a refusal, or nothing (thirtieth review).
+      if (await this.topics.refuseNow(topicId, this.senderId(ctx))) return void ack('Not now: see the notice in this topic')
       await ack('▶️ Resuming')
       this.status.bump(topicId)
       await this.typing(topicId)
@@ -1205,7 +1208,18 @@ export class TelegramBot {
       await ack(b.feed ? '🔎 Feed ON' : '🔎 Feed OFF')
       // In a shared forum the pinned panel is what everyone reads: refreshed on a state change,
       // whichever copy carried the tap; for one user the tapped message, as on main.
-      if (this.d.cfg.teamMode) return void (await this.refreshPinnedControls(topicId, b))
+      if (this.d.cfg.teamMode) {
+        await this.refreshPinnedControls(topicId, b)
+        // A tap on an unpinned copy (posted when the pinned one could not be edited, or by /menu) edits
+        // that copy too, so its button does not read the old state and flip it back on the next tap
+        // (thirtieth review).
+        const tappedId = ctx.callbackQuery?.message?.message_id
+        if (tappedId !== undefined && tappedId !== b.controlMsgId) {
+          const p = this.panel(b)
+          await ctx.editMessageText(p.text, { reply_markup: p.kb }).catch(() => {})
+        }
+        return
+      }
       return this.repaintControls(topicId, b)
     }
     if (data === 'm:ta') {
