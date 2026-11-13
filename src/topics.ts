@@ -141,6 +141,8 @@ export type TopicDeps = {
   /** The profile's pinned model and effort, when it pins them: what an adopted binding records, as a fresh profile topic does. */
   profileModel?: string
   profileEffort?: Effort
+  /** The profile's name: a binding made under another profile is adopted like one made under none. */
+  profileName?: string
   /** The bot's one rule for replies a member can trigger at will (topic and kind, and the sender's allowance): true when a notice is muted now, counted there. */
   replyMuted: (topicId: string, kind: string, senderId?: string) => boolean
   /** Whether a session's transcript is still on disk (undefined: could not look); without a definite no, a failed resume is never read as a lost transcript. */
@@ -242,8 +244,11 @@ export class TopicManager {
    */
   private enforceCap(): void {
     while (this.live.size >= this.d.maxLiveSessions) {
+      // A stuck turn goes before an idle colleague, longest silent first, and only then the longest
+      // idle by activity: members typing "hello?" into a hung topic refresh its activity, which must
+      // not keep the hung process while a colleague's warm session is paused (thirty-fourth review).
       let oldest: Live | undefined
-      for (const l of this.live.values()) if (this.pausable(l) && (!oldest || l.lastActive < oldest.lastActive)) oldest = l
+      for (const l of this.live.values()) if (this.pausable(l) && (!oldest || this.pausesBefore(l, oldest))) oldest = l
       if (!oldest) break
       // Said on the paused topic, which in a shared forum is usually a colleague's: on the reply
       // rule, so a member alternating between their own topics cannot post there at will.
@@ -257,6 +262,16 @@ export class TopicManager {
       if (this.d.shared) this.userTookOver(oldest.topicId)
       this.closeLive(oldest.topicId, 'evicted (session cap)')
     }
+  }
+
+  /** Whether `a` is paused before `b` at the cap: stuck before not, then the longer silent, then the longer idle. */
+  private pausesBefore(a: Live, b: Live): boolean {
+    const now = this.now()
+    const sa = this.stuck(a, now)
+    const sb = this.stuck(b, now)
+    if (sa !== sb) return sa
+    if (sa) return a.lastOutput < b.lastOutput
+    return a.lastActive < b.lastActive
   }
 
   /**
@@ -301,11 +316,18 @@ export class TopicManager {
    */
   private adopt(topicId: string, b: Binding): boolean {
     const underProfile = !!this.d.profileSessions
-    if (!!b.profile === underProfile) return false
-    if (b.sessionId) this.d.log.info('session.resume_dropped', { topic: topicId, sessionId: b.sessionId, why: underProfile ? 'binding predates the profile' : 'binding was made under a profile' })
+    // Under a profile, a binding is this side's only when it was made under this profile by name: one
+    // made under another holds that profile's prompt and tool results, and its spend was read against
+    // that profile's cap (thirty-fourth review: a boolean told a helpdesk topic from a sales one not at all).
+    const thisSide = underProfile ? !!b.profile && b.profileName === this.d.profileName : !b.profile
+    if (thisSide) return false
+    const why = !underProfile ? 'binding was made under a profile' : b.profile ? `binding was made under another profile (${b.profileName ?? 'unnamed'})` : 'binding predates the profile'
+    if (b.sessionId) this.d.log.info('session.resume_dropped', { topic: topicId, sessionId: b.sessionId, why })
     b.sessionId = undefined
     this.primed.delete(topicId) // the session that heard the contract is gone with its id
     b.profile = underProfile
+    if (underProfile) b.profileName = this.d.profileName
+    else delete b.profileName
     delete b.handoff
     b.auto = false
     // Its model and effort were never checked against the profile or the enabled catalog (a model

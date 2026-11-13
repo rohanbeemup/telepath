@@ -62,7 +62,7 @@ function fakeRotator(over: Partial<Rotator> = {}): Rotator & { handedOff: unknow
 
 type FakeRotator = ReturnType<typeof fakeRotator>
 
-function harness(over: { maxLive?: number; idleMinutes?: number; rotator?: FakeRotator; now?: () => number; resumeBufferMs?: number; primeContract?: boolean; budgetUsd?: number; profileSessions?: boolean; shared?: boolean; stuckTurnMs?: number; transcriptExists?: (id: string) => boolean | undefined; profileModel?: string; profileEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' } = {}) {
+function harness(over: { maxLive?: number; idleMinutes?: number; rotator?: FakeRotator; now?: () => number; resumeBufferMs?: number; primeContract?: boolean; budgetUsd?: number; profileSessions?: boolean; shared?: boolean; stuckTurnMs?: number; transcriptExists?: (id: string) => boolean | undefined; profileModel?: string; profileEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max'; profileName?: string } = {}) {
   const store = new Store('/nowhere', {}, { defaultModel: 'claude-opus-5', defaultCwd: '/w' }, { defaultModel: 'claude-opus-5', defaultCwd: '/w' })
   // never touch disk in these tests
   store.saveRegistry = () => {}
@@ -99,6 +99,7 @@ function harness(over: { maxLive?: number; idleMinutes?: number; rotator?: FakeR
     transcriptExists: over.transcriptExists,
     profileModel: over.profileModel,
     profileEffort: over.profileEffort,
+    profileName: over.profileName,
   })
   const bind = (topicId: string, b: Partial<{ model: string; effort: 'low' | 'high' | 'max'; sessionId: string; auto: boolean }> = {}) => {
     store.registry[topicId] = { cwd: '/w', model: b.model ?? 'claude-opus-5', effort: b.effort, sessionId: b.sessionId, title: 't' + topicId, lastActive: 0, auto: b.auto }
@@ -219,6 +220,26 @@ describe('TopicManager', () => {
     // "your context is kept" alone (thirty-third review)
     expect(h.said.find(([topic, text]) => topic === 'parked' && /2 messages[^.]*did not reach/.test(text))).toBeTruthy()
     expect(h.said.find(([topic, text]) => topic === 'parked' && /Send a message here to resume/.test(text))).toBeFalsy()
+    // a stuck turn goes before an idle colleague, whatever its topic's last message: members typing
+    // "hello?" into a hung topic refresh its activity, which must not keep the hung process while a
+    // colleague's warm, idle session is paused instead (thirty-fourth review)
+    let u = 1000
+    const order = harness({ maxLive: 2, now: () => u, shared: true, stuckTurnMs: 10 * 60_000, idleMinutes: 60 })
+    order.bind('hung')
+    await order.tm.sendToTopic('hung', 'x') // running, never answers
+    u += 10
+    order.bind('warm')
+    await order.tm.sendToTopic('warm', 'quick one')
+    order.backend.last().emit(result('s-warm'))
+    await order.tick()
+    u += 10 * 60_000 // hung is stuck now; warm is idle
+    await order.tm.sendToTopic('hung', 'hello?') // the hung topic's activity is the freshest
+    u += 10
+    order.bind('third')
+    expect(await order.tm.sendToTopic('third', 'x')).toBe(true)
+    expect(order.tm.isLive('hung')).toBe(false)
+    expect(order.tm.isLive('warm')).toBe(true)
+    expect(order.tm.isLive('third')).toBe(true)
     // for one user the timer stays: the rate-limit notice promised a continuation at the reset, so the cap's
     // pause leaves it to reopen the topic then, as main did (twenty-ninth review: the cancellation was unconditional)
     const solo = harness({ maxLive: 2, now: () => t })
@@ -806,6 +827,22 @@ describe('bindings from before the profile', () => {
     await pinned.tm.sendToTopic('o2', 'hello')
     expect(pinned.store.registry['o2'].model).toBe('claude-fable-5-1')
     expect(pinned.store.registry['o2'].effort).toBe('high')
+    // a binding made under another profile is adopted too: its transcript holds that profile's prompt and
+    // tool results, and its spend was read against that profile's cap (thirty-fourth review: a boolean
+    // told a helpdesk topic from a sales one not at all); one made under this profile resumes
+    const named = harness({ profileSessions: true, profileName: 'sales' })
+    named.bind('swap', { sessionId: 'helpdesk-1' })
+    named.store.registry['swap'].profile = true
+    named.store.registry['swap'].profileName = 'helpdesk'
+    named.bind('same', { sessionId: 'sales-1' })
+    named.store.registry['same'].profile = true
+    named.store.registry['same'].profileName = 'sales'
+    await named.tm.sendToTopic('swap', 'hello')
+    await named.tm.sendToTopic('same', 'hello')
+    expect(named.backend.opens.map(o => o.resume)).toEqual([undefined, 'sales-1'])
+    expect(named.store.registry['swap'].sessionId).toBeUndefined()
+    expect(named.store.registry['swap'].profileName).toBe('sales')
+    expect(named.store.registry['same'].sessionId).toBe('sales-1')
     // its hand-off and approval mode go with it: neither is the profile topic's to resume
     expect(h.store.registry['old'].handoff).toBeUndefined()
     expect(h.store.registry['old'].auto).toBe(false)

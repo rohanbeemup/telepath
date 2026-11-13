@@ -189,7 +189,7 @@ const topics = new TopicManager({
   primeContract: !profile,
   budgetUsd: profile?.maxBudgetUsd,
   profileSessions: !!profile, shared: cfg.teamMode, stuckTurnMs: cfg.stuckTurnMinutes * 60_000, replyMuted: (t, k, s) => bot.muted(t, k, s), transcriptExists,
-  profileModel: profile?.model, profileEffort: profile?.effort,
+  profileModel: profile?.model, profileEffort: profile?.effort, profileName: profile?.name,
 })
 bot.attachTopics(topics)
 // Bindings from the other side of the profile line become this side's in one pass, so no reader

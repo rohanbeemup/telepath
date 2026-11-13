@@ -28,6 +28,8 @@ export type Binding = {
   closed?: boolean
   /** Made under a session profile; only such a binding may resume its session under one. */
   profile?: boolean
+  /** The profile's name: a binding made under another profile is adopted like one made under none. */
+  profileName?: string
 }
 export type Registry = Record<string, Binding>
 export type Prefs = { defaultModel: string; defaultCwd: string; defaultEffort?: Effort }

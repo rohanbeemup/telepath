@@ -27,7 +27,13 @@ export const NO_TRANSCRIBER = "voice notes need TRANSCRIBE_CMD in telepath's .en
  * names them (a unit whose EnvironmentFile is the same .env names every one of them). Anything
  * else .env holds goes; a transcriber that needs a key of its own takes it on its command line.
  */
-const TRANSCRIBER_KEEPS = new Set(['PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'LANG', 'LANGUAGE', 'LC_ALL', 'LC_CTYPE', 'TZ', 'TMPDIR', 'TEMP', 'TMP', 'XDG_CACHE_HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_RUNTIME_DIR', 'HF_HOME', 'TRANSFORMERS_CACHE', 'TORCH_HOME'])
+const TRANSCRIBER_KEEPS = new Set([
+  'PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'LANG', 'LANGUAGE', 'LC_ALL', 'LC_CTYPE', 'TZ', 'TMPDIR', 'TEMP', 'TMP',
+  'XDG_CACHE_HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_RUNTIME_DIR',
+  // what a Python or CUDA transcriber (a whisper script) needs, none of it a secret (thirty-fourth review)
+  'PYTHONPATH', 'PYTHONIOENCODING', 'PYTHONUNBUFFERED', 'VIRTUAL_ENV', 'LD_LIBRARY_PATH', 'CUDA_HOME', 'CUDA_VISIBLE_DEVICES',
+  'NVIDIA_VISIBLE_DEVICES', 'OMP_NUM_THREADS', 'HF_HOME', 'TRANSFORMERS_CACHE', 'TORCH_HOME',
+])
 
 /**
  * Transcribe one audio file. Async, so a slow transcription holds up nothing else. `scrub` is

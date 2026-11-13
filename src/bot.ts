@@ -26,9 +26,8 @@ import { htmlEsc, htmlToPlain, renderWithDeadline, chunkHtml, chunkPlain } from 
 import { isEnabledModelKey, modelLabel, parseEffort, supportsEffort, MODEL_MENU, type Effort } from './models'
 import { listSessions } from './session'
 import { transcribe, TopicOrder, voiceTurn, NO_TRANSCRIBER, type Heard } from './voice'
-import { budgetNotice } from './topics'
 import { feedOn, type Binding, type Store } from './state'
-import { isBusy, type SessionExtras, type TopicManager } from './topics'
+import { budgetNotice, isBusy, type SessionExtras, type TopicManager } from './topics'
 import {
   approveKb,
   askKeyboard,
@@ -828,7 +827,7 @@ export class TelegramBot {
   private bindProfileTopic(topicId: string, title: string): void {
     const p = this.d.profile
     const { prefs } = this.d.store
-    this.bind(topicId, { cwd: p?.cwd ?? this.d.store.defaultCwd(), model: p?.model ?? prefs.defaultModel, effort: p?.effort ?? prefs.defaultEffort, title, auto: false, profile: true })
+    this.bind(topicId, { cwd: p?.cwd ?? this.d.store.defaultCwd(), model: p?.model ?? prefs.defaultModel, effort: p?.effort ?? prefs.defaultEffort, title, auto: false, profile: true, profileName: p?.name })
     this.d.metrics.inc('topics_created')
   }
 
