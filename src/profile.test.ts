@@ -148,6 +148,9 @@ describe('a profile is refused when', () => {
     expect(() => parseProfile(raw({ tools: ['WebFetch'], allowedTools: ['WebFetch'] }), source())).not.toThrow()
     // no patterns: the hook matches exact names, so a pattern would be accepted here and allow nothing there
     expect(() => parseProfile(raw({ allowedTools: ['mcp__kb__*'] }), source())).toThrow(/no patterns/)
+    // and at least one: with none, every call in every topic is denied while the boot looks fine
+    expect(() => parseProfile(raw({ allowedTools: [] }), source())).toThrow(/at least one/)
+    expect(() => parseProfile(raw({ allowedTools: undefined }), source())).toThrow(/at least one/)
     // the converse: a kept built-in that is not allowed is a tool the hook would deny on every call
     expect(() => parseProfile(raw({ tools: ['Read'] }), source())).toThrow(ProfileError)
     // a question tool can never prompt in a profile session, so it is refused outright

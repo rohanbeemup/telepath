@@ -52,6 +52,8 @@ export type Live = {
   model: string
   cwd: string
   lastActive: number
+  /** When the session last produced a stream message; what "stuck" is measured from, since a member's messages into a hung topic must not keep its slot. */
+  lastOutput: number
   /**
    * A turn is running: set when a message is sent into an idle session or the stream
    * shows a turn beginning (`system/init`, or output with no turn known), cleared by the
@@ -192,12 +194,13 @@ export class TopicManager {
   }
 
   /**
-   * In a shared forum, a running turn that has been silent (no output, no message) past
-   * stuckTurnMs. Output counts as activity (the pump bumps lastActive on every stream
-   * message), so a long turn still producing is never stuck (thirteenth review).
+   * In a shared forum, a running turn that has produced nothing past stuckTurnMs. Measured
+   * from the session's last stream message (the pump keeps lastOutput), so a long turn
+   * still producing is never stuck (thirteenth review), and a member typing "hello?" into
+   * a hung topic does not keep its slot (fourteenth review).
    */
   private stuck(l: Live, now = this.now()): boolean {
-    return !!this.d.shared && isBusy(l) && now - l.lastActive >= (this.d.stuckTurnMs ?? DEFAULT_STUCK_TURN_MS)
+    return !!this.d.shared && isBusy(l) && now - l.lastOutput >= (this.d.stuckTurnMs ?? DEFAULT_STUCK_TURN_MS)
   }
 
   /**
@@ -286,7 +289,7 @@ export class TopicManager {
       budgetUsd,
       ...this.d.extras(topicId),
     })
-    const l: Live = { session, topicId, model: b.model, cwd: b.cwd, lastActive: this.now(), running: false, queued: 0 }
+    const l: Live = { session, topicId, model: b.model, cwd: b.cwd, lastActive: this.now(), lastOutput: this.now(), running: false, queued: 0 }
     this.live.set(topicId, l)
     this.d.metrics.inc('sessions_opened')
     this.d.log.info('session.open', { topic: topicId, model: b.model, effort: effortFor(this.d.catalog, b) ?? null, resume: resume ?? null })
@@ -314,6 +317,9 @@ export class TopicManager {
     let l = this.ensureLive(topicId)
     if (!l) return false
     l.lastActive = this.now()
+    // A new turn's silence counts from its send, not from the last turn's end: a session idle
+    // past the stuck bound would otherwise be stuck before its first output (Codex hook).
+    if (!l.running) l.lastOutput = this.now()
     let payload = text
     if (!this.primed.has(topicId)) {
       this.primed.add(topicId)
@@ -472,7 +478,10 @@ export class TopicManager {
     const st = newPumpState(this.d.store.registry[topicId]?.sessionId)
     try {
       for await (const msg of l.session.stream()) {
-        l.lastActive = this.now() // output is activity: a turn still producing is never stuck
+        // A turn still producing is never stuck. lastActive stays what it is on main (a message or
+        // a result): idle eviction never reads it for a running session, and the cap's victim
+        // order in a one-person forum is main's.
+        l.lastOutput = this.now()
         const b = this.d.store.registry[topicId]
         // Output with no turn known (a turn the CLI began on its own after a preemption,
         // or an init this pump missed) is a running turn: count it, or eviction and the

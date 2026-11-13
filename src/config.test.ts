@@ -107,6 +107,12 @@ describe('the per-member topic cap', () => {
     expect(parseConfig({ ...REQUIRED }, '/state').teamTopicsPerDay).toBe(20)
     expect(parseConfig({ ...REQUIRED, TEAM_TOPICS_PER_DAY: '5' }, '/state').teamTopicsPerDay).toBe(5)
     expect(() => parseConfig({ ...REQUIRED, TEAM_TOPICS_PER_DAY: '0' }, '/state')).toThrow(ConfigError)
+  })
+
+  test('the stuck-turn bound defaults to ten minutes and must be positive', () => {
+    expect(parseConfig(REQUIRED, '/state').stuckTurnMinutes).toBe(10)
+    expect(parseConfig({ ...REQUIRED, STUCK_TURN_MINUTES: '30' }, '/state').stuckTurnMinutes).toBe(30)
+    expect(() => parseConfig({ ...REQUIRED, STUCK_TURN_MINUTES: '0' }, '/state')).toThrow(ConfigError)
     expect(() => parseConfig({ ...REQUIRED, TEAM_TOPICS_PER_DAY: '-3' }, '/state')).toThrow(ConfigError)
   })
 })

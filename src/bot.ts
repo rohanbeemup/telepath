@@ -522,6 +522,10 @@ export class TelegramBot {
       if (!this.d.cfg.transcribeCmd) {
         return await this.notice(topicId, this.d.profile ? '🎙️ Voice notes are not transcribed on this install: type your question.' : `🎙️ Voice note not transcribed: ${NO_TRANSCRIBER}`)
       }
+      // A forwarded note or an audio file is content for the session, so in team mode a fresh topic
+      // binds (and pays its opening) before any download: a refused opening costs no transcription.
+      // The member's own note is their turn and binds the way typed text does, after it is heard.
+      if ((shared.forwarded || shared.audioFile) && this.d.cfg.teamMode && !this.d.store.registry[topicId] && !(await this.bindFreshProfileTopic(ctx, topicId))) return
       if (this.transcribing >= MAX_TRANSCRIBING) return await this.notice(topicId, `🎙️ ${MAX_TRANSCRIBING} voice notes are being transcribed already. Send it again in a moment.`)
       // Reserved before any await, so notes arriving in other topics meanwhile cannot all pass
       // the check; the download counts too, which bounds the disk as well as the processes.
@@ -546,7 +550,6 @@ export class TelegramBot {
         return await this.handleText(ctx, turn)
       }
       await this.say(topicId, `🎙️ ${shared.audioFile ? 'Audio file' : 'Forwarded voice note'}, passed on as content: ${words}`)
-      if (!this.d.store.registry[topicId] && this.d.cfg.teamMode && !(await this.bindFreshProfileTopic(ctx, topicId))) return
       if (!(await this.topics.sendToTopic(topicId, turn))) await this.say(topicId, this.noSessionHint())
     } catch (e) {
       const reason = e instanceof Error ? e.message : String(e)
@@ -696,9 +699,10 @@ export class TelegramBot {
     return parseTeamNew('', this.memberOf(ctx), new Date()).title
   }
 
-  /** The topic's own name, carried by messages that reply to its creation. */
+  /** The topic's own name, carried by messages that reply to its creation: a member's text, or the bot's message a tap sits on. */
   private topicTitleOf(ctx: Context): string | undefined {
-    return ctx.message?.reply_to_message?.forum_topic_created?.name
+    const m = ctx.message ?? ctx.callbackQuery?.message
+    return m?.reply_to_message?.forum_topic_created?.name
   }
 
   /**
@@ -745,9 +749,9 @@ export class TelegramBot {
   }
 
   /** ⚙️ and /menu: the pinned panel of a bound topic, refreshed in place, or the main menu. */
-  private controlsOrMenu(topicId: string | undefined): Promise<void> {
+  private controlsOrMenu(topicId: string | undefined, fresh = false): Promise<void> {
     const b = topicId ? this.d.store.registry[topicId] : undefined
-    return topicId && b ? this.refreshPinnedControls(topicId, b) : this.showMainMenu(topicId)
+    return topicId && b ? this.refreshPinnedControls(topicId, b) : this.showMainMenu(topicId, fresh)
   }
 
   /**
@@ -822,8 +826,15 @@ export class TelegramBot {
 
   // ── screens ──────────────────────────────────────────────────────────────
 
-  private async showMainMenu(topicId: string | undefined): Promise<void> {
-    await this.paint(topicId, '👋 What would you like to do?', mainMenuKb(this.kbMode()))
+  /**
+   * The main menu: painted over the tapped menu message, or, for a typed command, sent
+   * fresh. The tapped message is whoever's tapped last, which in a shared forum is another
+   * member's screen (fourteenth review).
+   */
+  private async showMainMenu(topicId: string | undefined, fresh = false): Promise<void> {
+    const text = '👋 What would you like to do?'
+    if (fresh) await this.send(topicId, text, mainMenuKb(this.kbMode()))
+    else await this.paint(topicId, text, mainMenuKb(this.kbMode()))
   }
 
   private async showSettings(topicId: string | undefined): Promise<void> {
@@ -1191,7 +1202,7 @@ export class TelegramBot {
         if (!topicId && this.d.cfg.teamMode) return
         // In a shared forum a menu per unknown command is a flood a member can cause: once a minute per topic.
         if (this.d.cfg.teamMode && !this.refusals.allow(topicId ?? 'general')) return void this.d.metrics.inc('refusals_muted')
-        return this.showMainMenu(topicId)
+        return this.showMainMenu(topicId, true)
       }
       if (!allowedAction(this.access, fromId, `/${typed.cmd}`)) return refuse()
       if (this.d.profile && profileLocked(`/${typed.cmd}`)) return void this.say(topicId, PROFILE_OWNS)
@@ -1224,17 +1235,17 @@ export class TelegramBot {
         case 'status':
           return void this.send(topicId, this.d.statusText())
         case 'menu':
-          return this.controlsOrMenu(topicId)
+          return this.controlsOrMenu(topicId, true)
         case 'help':
           return void this.say(topicId, this.d.cfg.teamMode ? teamHelp() : help(this.d.cfg.reposDir))
         default:
-          return this.showMainMenu(topicId)
+          return this.showMainMenu(topicId, true)
       }
     }
 
     if (!topicId) {
       if (this.d.cfg.teamMode) return // General is the members' own; the bot answers commands there, not chatter
-      return this.showMainMenu(undefined) // plain text in General → the menu
+      return this.showMainMenu(undefined, true) // plain text in General → the menu
     }
 
     // A pending clarifying question takes any typed reply as its free-text answer, before
@@ -1322,7 +1333,7 @@ export class TelegramBot {
     if (!this.d.cfg.teamMode || !ctx.message?.sender_chat || !topicId || !ctx.chat || String(ctx.chat.id) !== this.access.forumChatId) return
     if (this.anonymousNoticed.has(topicId)) return
     this.anonymousNoticed.add(topicId)
-    await this.say(topicId, '🎭 Posts made as the group get no answer: Telegram hides who wrote them. Turn off "Remain anonymous" to chat here.')
+    await this.say(topicId, '🎭 Posts made as the group or as a channel get no answer: Telegram hides who wrote them. Post as yourself to chat here ("Remain anonymous" off, "Send as" yourself).')
   }
 
   /**

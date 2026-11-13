@@ -110,6 +110,8 @@ export function parseProfile(raw: unknown, src: ProfileSource): Profile {
   }
 
   const allowedTools = stringList(o.allowedTools, 'allowedTools', problems)
+  // With none, the hook denies every call in every topic and the bot boots as if fine.
+  if (!allowedTools.length) problems.push('allowedTools must name at least one tool (mcp__<server>__<tool>); with none, every call in every topic is denied')
   for (const t of allowedTools) {
     if (t.includes('*')) {
       // The hook matches exact names, so a pattern would be accepted here and allow nothing there.

@@ -167,6 +167,7 @@ describe('TopicManager', () => {
     t += 10 * 60_000
     busySession.emit({ type: 'keepalive' }) // output, whatever its kind, is activity
     await h.tick()
+    await h.tm.sendToTopic('next', 'hello?') // a member's message into the silent topic does not keep its slot
     expect(await h.tm.sendToTopic('late', 'and me')).toBe(true)
     expect(h.tm.isLive('late')).toBe(true)
     expect(h.tm.isLive('busy')).toBe(true)
@@ -180,6 +181,13 @@ describe('TopicManager', () => {
     expect(h.tm.isLive('busy')).toBe(false) // silent for ten minutes
     expect(h.tm.isLive('late')).toBe(true)
     expect(h.said.find(([topic, text]) => topic === 'busy' && text.includes('Paused'))).toBeTruthy()
+    // a new turn into a session idle for a long time is not stuck at its start: its silence counts from the send
+    h.backend.last().emit(result('s-late'))
+    await h.tick()
+    t += 10 * 60_000
+    await h.tm.sendToTopic('late', 'one more')
+    h.tm.evictIdle()
+    expect(h.tm.isLive('late')).toBe(true)
     // where the forum is one person's, the longest-idle session is paused for the new topic, running or not, as before
     const own = harness({ maxLive: 1 })
     own.bind('p')
