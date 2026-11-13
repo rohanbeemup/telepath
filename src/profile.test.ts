@@ -1,6 +1,6 @@
 import { test, expect, describe } from 'bun:test'
 import { join } from 'path'
-import { parseProfile, profileOptions, teamProfileProblems, ProfileError, type ProfileSource } from './profile'
+import { parseProfile, profileOptions, teamProfileProblems, profileModelProblem, ProfileError, type ProfileSource } from './profile'
 import type { OpenOptions } from './topics'
 
 const DIR = '/srv/bot'
@@ -157,6 +157,14 @@ describe('a profile is refused when', () => {
     expect(() => parseProfile(raw({ tools: ['Read'] }), source())).toThrow(ProfileError)
     // a question tool can never prompt in a profile session, so it is refused outright
     expect(() => parseProfile(raw({ tools: ['AskUserQuestion'], allowedTools: ['mcp__kb__search', 'AskUserQuestion'] }), source())).toThrow(ProfileError)
+  })
+
+  test("a profile's model must be one of the catalog's ids", () => {
+    const p = parseProfile(raw(), source())
+    expect(profileModelProblem(p, ['claude-opus-5', 'claude-sonnet-5'])).toBeUndefined()
+    expect(profileModelProblem(p, ['claude-sonnet-5'])).toMatch(/^model: claude-opus-5 /)
+    // none set: the binding's default applies, nothing to check
+    expect(profileModelProblem(parseProfile(raw({ model: undefined }), source()), ['claude-sonnet-5'])).toBeUndefined()
   })
 
   test('team mode refuses a profile without a budget', () => {

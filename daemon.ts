@@ -24,7 +24,7 @@ import { ConfigError, mergeEnvFile, parseConfig, parseEnvFile, type Config } fro
 import { Files } from './src/files'
 import { ErrorRing, Logger, Metrics } from './src/log'
 import { bundledClaudePath, checkClaudeVersion, MIN_CLAUDE_VERSION, readClaudeVersion } from './src/preflight'
-import { parseProfile, ProfileError, teamProfileProblems, type Profile } from './src/profile'
+import { parseProfile, ProfileError, profileModelProblem, teamProfileProblems, type Profile } from './src/profile'
 import { handOffToRotator, rotatorActive, rotatorEnabled, waitForRotation } from './src/rotator'
 import { drainSeedRequests } from './src/seed'
 import { SdkBackend } from './src/session'
@@ -114,6 +114,12 @@ if (cfg.profileFile) {
     process.stderr.write((e instanceof ProfileError ? e.message : `session profile ${cfg.profileFile}: ${e instanceof Error ? e.message : String(e)}`) + '\n')
     process.exit(2)
   }
+  // A model name goes to the SDK as given: a typo would boot clean and end every turn in an error.
+  const modelProblem = profileModelProblem(profile, Object.values(cfg.catalog.ids))
+  if (modelProblem) {
+    process.stderr.write(`session profile ${cfg.profileFile}:\n  - ${modelProblem}\n`)
+    process.exit(2)
+  }
   if (cfg.teamMode) {
     const problems = teamProfileProblems(profile)
     if (problems.length) {
@@ -174,7 +180,7 @@ const topics = new TopicManager({
   metrics,
   primeContract: !profile,
   budgetUsd: profile?.maxBudgetUsd,
-  profileSessions: !!profile, shared: cfg.teamMode, stuckTurnMs: cfg.stuckTurnMinutes * 60_000,
+  profileSessions: !!profile, shared: cfg.teamMode, stuckTurnMs: cfg.stuckTurnMinutes * 60_000, replyAllowed: (t, k, s) => bot.replyAllowed(t, k, s),
 })
 bot.attachTopics(topics)
 

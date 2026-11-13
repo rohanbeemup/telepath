@@ -74,7 +74,7 @@ const FREE_TEXT = Symbol('free-text')
 const TEXT_ONLY = '📎 This assistant reads text only: type your question.'
 /** Transcriptions at once: one sender's run of audio is otherwise that many transcriber processes and files. */
 const MAX_TRANSCRIBING = 2
-/** One text for the three places a topic creation can fail; Telegram's own error goes to the log. */
+/** One text for every place a topic creation can fail; Telegram's own error goes to the log. */
 const TOPIC_CREATE_FAILED = "Couldn't create the topic. Is the bot an admin of this group with Manage Topics?"
 const PROFILE_OWNS = '🔒 This install runs a profile: the model, effort and approvals are set there.'
 const PROFILE_FRESH = '🔒 Not under a profile: every topic starts fresh.'
@@ -536,11 +536,11 @@ export class TelegramBot {
       this.transcribing++
       let words: string
       try {
-        // A forwarded note or an audio file is content for the session, so in team mode a fresh
-        // topic binds (and pays its opening) before any download and after the refusals that cost
-        // nothing: a refused opening costs no transcription, and a refused note costs no opening.
-        // The member's own note is their turn and binds the way typed text does, once heard.
-        if ((shared.forwarded || shared.audioFile) && this.d.cfg.teamMode && !this.d.store.registry[topicId] && !(await this.bindFreshProfileTopic(ctx, topicId))) return
+        // In team mode a fresh topic binds (and pays its opening) before any download and after the
+        // refusals that cost nothing: a refused opening costs no transcription, and a refused note
+        // costs no opening. The member's own note then goes the way typed text does, once heard,
+        // into a topic already bound.
+        if (this.d.cfg.teamMode && !this.d.store.registry[topicId] && !(await this.bindFreshProfileTopic(ctx, topicId))) return
         if (topicId) await this.typing(topicId)
         const path = this.d.files.saveInbox(media.file_name || `${media.file_unique_id}.ogg`, await this.download(media.file_id))
         try {
@@ -559,7 +559,7 @@ export class TelegramBot {
         return await this.handleText(ctx, turn)
       }
       await this.say(topicId, `🎙️ ${shared.audioFile ? 'Audio file' : 'Forwarded voice note'}, passed on as content: ${words}`)
-      if (!(await this.topics.sendToTopic(topicId, turn))) await this.say(topicId, this.noSessionHint())
+      if (!(await this.topics.sendToTopic(topicId, turn, { senderId: this.senderId(ctx) }))) await this.say(topicId, this.noSessionHint())
     } catch (e) {
       const reason = e instanceof Error ? e.message : String(e)
       if (!this.d.profile) return await this.say(topicId, `🎙️ Voice note not transcribed: ${reason}`)
@@ -573,7 +573,7 @@ export class TelegramBot {
   private async handleIncomingMedia(ctx: Context, kind: InboundKind): Promise<void> {
     const topicId = this.topicIdOf(ctx)
     if (!topicId) return void this.generalOnly('Send media inside a session topic.')
-    if (await this.mediaRefusedUnderProfile(topicId)) return
+    if (await this.mediaRefusedUnderProfile(topicId, this.senderId(ctx))) return
     this.status.bump(topicId)
     const m = ctx.message
     const src = kind === 'video' ? m?.video : kind === 'animation' ? m?.animation : m?.video_note
@@ -599,9 +599,9 @@ export class TelegramBot {
   }
 
   /** One guard for every inbound media kind: a profile session has no file tool, and the host path stays out of the chat. */
-  private async mediaRefusedUnderProfile(topicId: string): Promise<boolean> {
+  private async mediaRefusedUnderProfile(topicId: string, senderId?: string): Promise<boolean> {
     if (!this.d.profile) return false
-    await this.notice(topicId, 'media', this.d.cfg.transcribeCmd ? `${TEXT_ONLY} Voice notes are transcribed.` : TEXT_ONLY)
+    await this.notice(topicId, 'media', this.d.cfg.transcribeCmd ? `${TEXT_ONLY} Voice notes are transcribed.` : TEXT_ONLY, senderId)
     return true
   }
 
@@ -660,9 +660,9 @@ export class TelegramBot {
   }
 
   /** The wrap-up confirmation, with the queue count from the live session. */
-  private async offerWrapUp(topicId: string): Promise<void> {
+  private async offerWrapUp(topicId: string, senderId?: string): Promise<void> {
     const live = this.topics.live.get(topicId)
-    if (!live || !isBusy(live)) return this.notice(topicId, 'wrap', 'Nothing is running in this topic right now, so there is nothing to wrap up.')
+    if (!live || !isBusy(live)) return this.notice(topicId, 'wrap', 'Nothing is running in this topic right now, so there is nothing to wrap up.', senderId)
     await this.send(topicId, wrapConfirmText(live.queued), wrapConfirmKb())
   }
 
@@ -825,7 +825,8 @@ export class TelegramBot {
     try {
       topicId = await this.createTopic(title)
     } catch (e) {
-      await this.say(fromTopic, `Couldn't create topic: ${e}`)
+      this.d.log.error('topic.create_failed', { error: e })
+      await this.say(fromTopic, TOPIC_CREATE_FAILED)
       return
     }
     this.bind(topicId, { sessionId: match.sessionId, cwd: match.cwd || this.d.cfg.defaultCwd, model: this.d.store.prefs.defaultModel, effort: this.d.store.prefs.defaultEffort, title })
@@ -1083,7 +1084,7 @@ export class TelegramBot {
     }
     if (data === 'm:twrap') {
       await ack()
-      return this.offerWrapUp(topicId)
+      return this.offerWrapUp(topicId, this.senderId(ctx))
     }
     const tw = /^m:tw:(now|turn)$/.exec(data)
     if (tw) {
@@ -1278,7 +1279,7 @@ export class TelegramBot {
       if (!(await this.bindFreshProfileTopic(ctx, topicId))) return
       b = this.d.store.registry[topicId]
     }
-    if (typed.kind === 'wrap') return this.offerWrapUp(topicId)
+    if (typed.kind === 'wrap') return this.offerWrapUp(topicId, fromId)
     if (typed.kind === 'use' || typed.kind === 'effort' || typed.kind === 'feed') {
       if (!b) return void this.say(topicId, 'No session bound here.')
       if (typed.kind === 'use') {
@@ -1308,7 +1309,7 @@ export class TelegramBot {
     if (!b) return void this.send(topicId, 'This topic has no Claude session yet.', new InlineKeyboard().text('🆕 Start a session here', 'm:newhere'))
     this.status.bump(topicId) // the user's own message now sits below the status
     await this.typing(topicId)
-    if (!(await this.topics.sendToTopic(topicId, typed.text))) await this.say(topicId, this.noSessionHint())
+    if (!(await this.topics.sendToTopic(topicId, typed.text, { senderId: fromId }))) await this.say(topicId, this.noSessionHint())
   }
 
   /** Under a profile every topic starts fresh, so /attach is not on offer. */
@@ -1336,9 +1337,11 @@ export class TelegramBot {
    * flood (security read), which under Telegram's 429 retries on the bot's replies would
    * stall the update loop for everyone.
    */
-  private replyAllowed(topicId: string | undefined, kind: string, senderId?: string): boolean {
-    if (!this.refusals.allow(`${topicId ?? 'general'}:${kind}`)) return false
-    return senderId === undefined || this.senderReplies.allow(senderId)
+  replyAllowed(topicId: string | undefined, kind: string, senderId?: string): boolean {
+    // The sender's allowance first: a member past theirs must not use up the topic's one slot
+    // for that kind and silence the notice for a colleague who has not been answered.
+    if (senderId !== undefined && !this.senderReplies.allow(senderId)) return false
+    return this.refusals.allow(`${topicId ?? 'general'}:${kind}`)
   }
 
   /** A refusal notice: "Admins only", the quota, the text-only and voice notices. */
@@ -1393,7 +1396,7 @@ export class TelegramBot {
       await this.inOrder(ctx, async () => {
         const topicId = this.topicIdOf(ctx)
         if (!topicId) return await this.generalOnly('Send images inside a session topic.')
-        if (await this.mediaRefusedUnderProfile(topicId)) return
+        if (await this.mediaRefusedUnderProfile(topicId, this.senderId(ctx))) return
         this.status.bump(topicId)
         try {
           const best = ctx.message.photo[ctx.message.photo.length - 1]
@@ -1429,7 +1432,7 @@ export class TelegramBot {
       await this.inOrder(ctx, async () => {
         const topicId = this.topicIdOf(ctx)
         if (!topicId) return await this.generalOnly('Send files inside a session topic.')
-        if (await this.mediaRefusedUnderProfile(topicId)) return
+        if (await this.mediaRefusedUnderProfile(topicId, this.senderId(ctx))) return
         this.status.bump(topicId)
         const doc = ctx.message.document
         try {

@@ -74,6 +74,8 @@ export function isBusy(l: Live): boolean {
 
 /** A turn with no result for this long, in a shared forum, is stuck: it may be paused for a new topic. */
 export const DEFAULT_STUCK_TURN_MS = 10 * 60_000
+/** Said when a running turn is ended as stuck: the turn and what was sent during it are gone, the transcript before it stays. */
+const STUCK_PAUSED = '💤 Paused: no output for a while. The unfinished turn, and anything sent during it, is lost; send it again to continue — the earlier context is kept.'
 
 export type Rotator = {
   enabled(): boolean
@@ -125,6 +127,8 @@ export type TopicDeps = {
   shared?: boolean
   /** In a shared forum, a turn with no result for this long is stuck and may be paused for a new topic. */
   stuckTurnMs?: number
+  /** The bot's one rule for replies a member can trigger at will (topic and kind, and the sender's allowance); the manager's own per-topic-and-kind throttle when absent. */
+  replyAllowed?: (topicId: string, kind: string, senderId?: string) => boolean
 }
 
 export const CONTINUE_AFTER_LIMIT =
@@ -223,7 +227,7 @@ export class TopicManager {
       let oldest: Live | undefined
       for (const l of this.live.values()) if (this.pausable(l) && (!oldest || l.lastActive < oldest.lastActive)) oldest = l
       if (!oldest) break
-      void this.d.say(oldest.topicId, `💤 Paused to free a slot (max ${this.d.maxLiveSessions} live sessions). Send a message here to resume — your context is kept.`)
+      void this.d.say(oldest.topicId, isBusy(oldest) ? STUCK_PAUSED : `💤 Paused to free a slot (max ${this.d.maxLiveSessions} live sessions). Send a message here to resume — your context is kept.`)
       this.d.metrics.inc('sessions_evicted_cap')
       this.closeLive(oldest.topicId, 'evicted (session cap)')
     }
@@ -259,7 +263,11 @@ export class TopicManager {
       this.d.store.saveRegistry()
     }
     // A stretch gets what is left of the topic's budget, so it cannot overshoot the cap by
-    // a whole fresh budget.
+    // a whole fresh budget. This is consistent with the pump's accounting, not at odds with
+    // it: the SDK's `maxBudgetUsd` counts only the spend since this query() started (the CLI
+    // subtracts the restored cost), while `total_cost_usd` in results carries the transcript's
+    // cumulative total (sdk.d.ts, Options.maxBudgetUsd). Three review rounds read the two as
+    // one number; they are not.
     const budgetUsd = this.remainingBudget(b)
     this.enforceCap()
     // Child sessions must not see the bot token: a prompt-injected session could read
@@ -310,12 +318,12 @@ export class TopicManager {
    * A user message into the topic's session, or a nudge (`quiet`: the rate-limit or
    * rotation continuation), which posts no refusal into a topic nobody wrote in.
    */
-  async sendToTopic(topicId: string, text: string, opts: { takeover?: boolean; quiet?: boolean } = {}): Promise<boolean> {
+  async sendToTopic(topicId: string, text: string, opts: { takeover?: boolean; quiet?: boolean; senderId?: string } = {}): Promise<boolean> {
     if (opts.takeover !== false) this.userTookOver(topicId)
     const why = this.openRefusal(topicId)
     if (why) {
       if (opts.quiet) return false
-      await this.refuse(topicId, why)
+      await this.refuse(topicId, why, opts.senderId)
       return true
     }
     let l = this.ensureLive(topicId)
@@ -339,7 +347,7 @@ export class TopicManager {
       const again = this.openRefusal(topicId)
       if (again) {
         if (opts.quiet) return false
-        await this.refuse(topicId, again)
+        await this.refuse(topicId, again, opts.senderId)
         return true
       }
       const l2 = this.ensureLive(topicId)
@@ -400,7 +408,7 @@ export class TopicManager {
         this.closeLive(l.topicId, 'idle')
       } else if (this.stuck(l, now)) {
         // A hung process in a shared forum is not kept until cap pressure finds it.
-        void this.d.say(l.topicId, '💤 Paused: no output for a while. Send a message here to resume — your context is kept.')
+        void this.d.say(l.topicId, STUCK_PAUSED)
         this.d.metrics.inc('sessions_evicted_stuck')
         this.closeLive(l.topicId, 'stuck')
       }
@@ -460,10 +468,12 @@ export class TopicManager {
    * A refused message is counted every time and answered at most once a minute per topic:
    * a member's flood of refused messages is otherwise the bot's flood (security read).
    */
-  private async refuse(topicId: string, why: 'closed' | 'budget' | 'busy'): Promise<void> {
+  private async refuse(topicId: string, why: 'closed' | 'budget' | 'busy', senderId?: string): Promise<void> {
     this.d.metrics.inc(`${why}_refusals`)
-    // Keyed by kind too, so a refusal of one kind does not mute a different one that follows.
-    if (this.refusals.allow(`${topicId}:${why}`)) await this.d.say(topicId, this.refusalNotice(why))
+    // The bot's one rule for replies a member can trigger (topic and kind, and the sender's
+    // allowance) when it provides it; the manager's own per-topic-and-kind throttle otherwise.
+    const allowed = this.d.replyAllowed ? this.d.replyAllowed(topicId, why, senderId) : this.refusals.allow(`${topicId}:${why}`)
+    if (allowed) await this.d.say(topicId, this.refusalNotice(why))
     else this.d.metrics.inc('refusals_muted')
   }
 
