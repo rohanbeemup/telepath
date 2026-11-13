@@ -671,8 +671,14 @@ export class TelegramBot {
   private bindProfileTopic(topicId: string, title: string): void {
     const p = this.d.profile
     const { prefs } = this.d.store
-    this.bind(topicId, { cwd: p?.cwd ?? this.d.store.defaultCwd(), model: p?.model ?? prefs.defaultModel, effort: p?.effort ?? prefs.defaultEffort, title, auto: false })
+    this.bind(topicId, { cwd: p?.cwd ?? this.d.store.defaultCwd(), model: p?.model ?? prefs.defaultModel, effort: p?.effort ?? prefs.defaultEffort, title, auto: false, profile: true })
     this.d.metrics.inc('topics_created')
+  }
+
+  /** ⚙️ and /menu: the pinned panel of a bound topic, refreshed in place, or the main menu. */
+  private controlsOrMenu(topicId: string | undefined): Promise<void> {
+    const b = topicId ? this.d.store.registry[topicId] : undefined
+    return topicId && b ? this.refreshPinnedControls(topicId, b) : this.showMainMenu(topicId)
   }
 
   /**
@@ -889,11 +895,7 @@ export class TelegramBot {
       await ack('Cancelled')
       return this.showMainMenu(topicId)
     }
-    if (data === 'm:ctl') {
-      await ack()
-      const cb = topicId ? store.registry[topicId] : undefined
-      return topicId && cb ? this.refreshPinnedControls(topicId, cb) : this.showMainMenu(topicId)
-    }
+    if (data === 'm:ctl') return void (await ack(), this.controlsOrMenu(topicId))
 
     // Settings
     const sdm = /^m:sdm:(\w+)$/.exec(data)
@@ -1148,10 +1150,8 @@ export class TelegramBot {
         case 'status':
           if (this.d.cfg.teamMode && topicId) return void this.say(topicId, '📊 Status is shown in General only: it lists every topic.')
           return void this.send(topicId, this.d.statusText())
-        case 'menu': {
-          const mb = topicId ? this.d.store.registry[topicId] : undefined
-          return topicId && mb ? this.refreshPinnedControls(topicId, mb) : this.showMainMenu(topicId)
-        }
+        case 'menu':
+          return this.controlsOrMenu(topicId)
         case 'help':
           return void this.say(topicId, this.d.cfg.teamMode ? teamHelp() : help(this.d.cfg.reposDir))
         default:

@@ -9,6 +9,10 @@ test('/new in team mode takes the rest of the line as the title and ignores cwd=
   expect(parseTeamNew('   ', { firstName: 'Ann' }, at)).toEqual({ title: 'Ann · 09:05' })
   expect(parseTeamNew('', { username: 'ann_x' }, at)).toEqual({ title: 'ann_x · 09:05' })
   expect(parseTeamNew('', {}, at)).toEqual({ title: 'member · 09:05' })
+  // capped where it is parsed, at Telegram's topic-name limit, so every surface carries the same title
+  const long = parseTeamNew('x'.repeat(4000), { firstName: 'Ann' }, at).title
+  expect(long.length).toBe(120)
+  expect(parseTeamNew('y'.repeat(120), {}, at).title.length).toBe(120)
 })
 
 test('a member may open only so many topics a day', () => {

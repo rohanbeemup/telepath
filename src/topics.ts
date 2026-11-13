@@ -63,6 +63,8 @@ export type Live = {
   /** Messages sent since the running turn began; the CLI folds them into it. Shown as "queued". */
   queued: number
   wrap?: Wrap
+  /** The last total this stretch reported; later results add their increment over it. */
+  lastTotal?: number
 }
 
 export function isBusy(l: Live): boolean {
@@ -105,6 +107,11 @@ export type TopicDeps = {
    * `query()`, so on its own every idle eviction and resume hands a topic a fresh budget.
    */
   budgetUsd?: number
+  /**
+   * Every session runs a profile: only a binding made under it may resume its session. A
+   * binding from before the profile would hand a full session's transcript to the topic.
+   */
+  profileSessions?: boolean
 }
 
 export const CONTINUE_AFTER_LIMIT =
@@ -198,12 +205,22 @@ export class TopicManager {
     const env: Record<string, string | undefined> = { ...this.d.baseEnv(), TELEPATH_OUTBOX: this.d.outboxDir(topicId) }
     delete env.TELEGRAM_BOT_TOKEN
     delete env.CLAUDE_CODE_EFFORT_LEVEL // effort is an option now; an inherited value would override it
+    // Under a profile only a binding made under it resumes its session; another binding's
+    // transcript (a full session's tool results, files, questions) is not this topic's to show.
+    let resume = b.sessionId
+    if (this.d.profileSessions && !b.profile) {
+      if (b.sessionId) this.d.log.info('session.resume_dropped', { topic: topicId, sessionId: b.sessionId, why: 'binding predates the profile' })
+      b.sessionId = undefined
+      b.profile = true // the profile's from now on: the fresh session it opens is resumed like any other
+      this.d.store.saveRegistry()
+      resume = undefined
+    }
     const session = this.d.backend.open({
       topicId,
       cwd: b.cwd,
       model: b.model,
       effort: effortFor(this.d.catalog, b),
-      resume: b.sessionId,
+      resume,
       env,
       budgetUsd,
       ...this.d.extras(topicId),
@@ -211,7 +228,7 @@ export class TopicManager {
     const l: Live = { session, topicId, model: b.model, cwd: b.cwd, lastActive: this.now(), running: false, queued: 0 }
     this.live.set(topicId, l)
     this.d.metrics.inc('sessions_opened')
-    this.d.log.info('session.open', { topic: topicId, model: b.model, effort: effortFor(this.d.catalog, b) ?? null, resume: b.sessionId ?? null })
+    this.d.log.info('session.open', { topic: topicId, model: b.model, effort: effortFor(this.d.catalog, b) ?? null, resume: resume ?? null })
     void this.pump(l)
     return l
   }
@@ -403,15 +420,26 @@ export class TopicManager {
             }
             case 'turnEnd':
             case 'turnError': {
-              // The topic's spend: a result's total, success or failure, is the running total
-              // of the whole topic (a resumed stretch continues from the transcript's saved
-              // total, per the SDK), so the latest total is the spend, never a sum across
-              // stretches. A stretch the SDK ended for its budget counts as the budget spent
-              // whatever it reported. Tracked only where a budget exists.
+              // The topic's spend, from every result, success or failure. A stretch's first total
+              // at or above the record is the topic's running total (a resumed stretch carries the
+              // earlier stretches when its transcript saved a total, per the SDK); below it, the
+              // stretch restarted at zero (no saved total: a crash or a kill mid-turn) and counts on
+              // top. Later results of the stretch add their increment over its last total. Never a
+              // sum of stretch totals, never a max that misses a restarted stretch. One bound: a
+              // restarted stretch whose first turn costs more than the record reads as carried, and
+              // the record falls short by the record, at most one cap once per lost transcript (the
+              // SDK's usage query would settle it and is experimental). A stretch the SDK ended for
+              // its budget counts as the budget spent whatever it reported. Tracked only where a
+              // budget exists.
               const budget = this.d.budgetUsd
               if (b && budget !== undefined) {
                 let spent = b.spentUsd
-                if (ev.costUsd !== undefined) spent = Math.max(spent ?? 0, ev.costUsd)
+                if (ev.costUsd !== undefined) {
+                  const recorded = spent ?? 0
+                  if (l.lastTotal === undefined) spent = ev.costUsd >= recorded ? ev.costUsd : recorded + ev.costUsd
+                  else spent = recorded + Math.max(0, ev.costUsd - l.lastTotal)
+                  l.lastTotal = ev.costUsd
+                }
                 if (ev.kind === 'turnError' && ev.subtype === 'error_max_budget_usd') spent = Math.max(spent ?? 0, budget)
                 if (spent !== b.spentUsd) {
                   b.spentUsd = spent

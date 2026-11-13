@@ -24,6 +24,8 @@ export type Binding = {
   spentUsd?: number
   /** 💾 Close & keep: no session opens here until ♻️ Reopen clears it (admins only in team mode). */
   closed?: boolean
+  /** Made under a session profile; only such a binding may resume its session under one. */
+  profile?: boolean
 }
 export type Registry = Record<string, Binding>
 export type Prefs = { defaultModel: string; defaultCwd: string; defaultEffort?: Effort }

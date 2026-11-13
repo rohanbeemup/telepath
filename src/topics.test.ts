@@ -61,7 +61,7 @@ function fakeRotator(over: Partial<Rotator> = {}): Rotator & { handedOff: unknow
 
 type FakeRotator = ReturnType<typeof fakeRotator>
 
-function harness(over: { maxLive?: number; idleMinutes?: number; rotator?: FakeRotator; now?: () => number; resumeBufferMs?: number; primeContract?: boolean; budgetUsd?: number } = {}) {
+function harness(over: { maxLive?: number; idleMinutes?: number; rotator?: FakeRotator; now?: () => number; resumeBufferMs?: number; primeContract?: boolean; budgetUsd?: number; profileSessions?: boolean } = {}) {
   const store = new Store('/nowhere', {}, { defaultModel: 'claude-opus-5', defaultCwd: '/w' }, { defaultModel: 'claude-opus-5', defaultCwd: '/w' })
   // never touch disk in these tests
   store.saveRegistry = () => {}
@@ -89,6 +89,7 @@ function harness(over: { maxLive?: number; idleMinutes?: number; rotator?: FakeR
     resumeBufferMs: over.resumeBufferMs,
     primeContract: over.primeContract,
     budgetUsd: over.budgetUsd,
+    profileSessions: over.profileSessions,
   })
   const bind = (topicId: string, b: Partial<{ model: string; effort: 'low' | 'high' | 'max'; sessionId: string; auto: boolean }> = {}) => {
     store.registry[topicId] = { cwd: '/w', model: b.model ?? 'claude-opus-5', effort: b.effort, sessionId: b.sessionId, title: 't' + topicId, lastActive: 0, auto: b.auto }
@@ -537,6 +538,21 @@ describe('a profile budget', () => {
     const opensBefore = h.backend.opens.length
     await h.tm.sendToTopic('c', 'again')
     expect(h.backend.opens.length).toBe(opensBefore)
+    // a stretch whose transcript saved no total (a crash mid-turn) restarts its count at zero: its
+    // first total is below what is recorded, so it is this stretch's own count, and later results
+    // add their increment over the stretch's last total
+    h.bind('e')
+    await h.tm.sendToTopic('e', 'q1')
+    h.backend.last().emit({ ...result('se'), total_cost_usd: 0.6 })
+    await h.tick()
+    h.tm.closeLive('e', 'crashed in test')
+    await h.tm.sendToTopic('e', 'q2')
+    h.backend.last().emit({ ...result('se'), total_cost_usd: 0.05 })
+    await h.tick()
+    expect(h.store.registry['e'].spentUsd).toBeCloseTo(0.65)
+    h.backend.last().emit({ ...result('se'), total_cost_usd: 0.2 })
+    await h.tick()
+    expect(h.store.registry['e'].spentUsd).toBeCloseTo(0.8)
     // a stretch that failed for another reason still spent what it reports
     h.bind('d')
     await h.tm.sendToTopic('d', 'hello')
@@ -576,5 +592,33 @@ describe('an admin-closed topic', () => {
     h.store.registry['z'].closed = false
     await h.tm.sendToTopic('z', 'after the reopen')
     expect(h.backend.opens.length).toBe(2)
+  })
+})
+
+describe('bindings from before the profile', () => {
+  test('under a profile, a binding made before the profile opens a fresh session, not its old transcript', async () => {
+    const h = harness({ profileSessions: true })
+    // a binding the single-user install made, with a full session's transcript behind it
+    h.bind('old', { sessionId: 'full-session-1' })
+    await h.tm.sendToTopic('old', 'hello')
+    expect(h.backend.opens[0].resume).toBeUndefined()
+    expect(h.store.registry['old'].sessionId).toBeUndefined()
+    // and it is the profile's from now on: the fresh session it opened is resumed by the next stretch
+    expect(h.store.registry['old'].profile).toBe(true)
+    h.backend.last().emit(result('fresh-1'))
+    await h.tick()
+    h.tm.closeLive('old', 'evicted in test')
+    await h.tm.sendToTopic('old', 'again')
+    expect(h.backend.opens[1].resume).toBe('fresh-1')
+    // a binding made under the profile resumes its own session
+    h.bind('new', { sessionId: 'profile-session-1' })
+    h.store.registry['new'].profile = true
+    await h.tm.sendToTopic('new', 'hello')
+    expect(h.backend.opens[2].resume).toBe('profile-session-1')
+    // without the flag (no profile) a binding resumes as before
+    const plain = harness()
+    plain.bind('p', { sessionId: 'any-session' })
+    await plain.tm.sendToTopic('p', 'hello')
+    expect(plain.backend.opens[0].resume).toBe('any-session')
   })
 })

@@ -99,6 +99,8 @@ export class Membership {
   private readonly cache = new Map<string, { until: number; verdict: Verdict; noticed: boolean }>()
   /** One lookup per sender at a time: a burst of messages shares it. */
   private readonly inflight = new Map<string, Promise<Verdict>>()
+  /** Bumped by forget(): a lookup that started before the bump must not write its answer. */
+  private readonly generation = new Map<string, number>()
   private readonly ttlMs: number
   private readonly graceMs: number
   private readonly maxEntries: number
@@ -126,12 +128,15 @@ export class Membership {
   }
 
   private async ask(userId: string): Promise<Verdict> {
+    const started = this.generation.get(userId) ?? 0
     let verdict: Verdict
     try {
       verdict = isMemberStatus(await this.lookup(userId)) ? 'member' : 'no'
     } catch (e) {
       verdict = lookupFailureVerdict(e)
     }
+    // The forum reported a change while this was pending: the answer is reported, never kept.
+    if ((this.generation.get(userId) ?? 0) !== started) return verdict
     // Strangers come and go; once the cache is full, the expired ones leave.
     if (this.cache.size >= this.maxEntries) this.sweep()
     this.cache.set(userId, { until: this.now() + (verdict === 'member' ? this.ttlMs : this.graceMs), verdict, noticed: false })
@@ -156,9 +161,11 @@ export class Membership {
     return true
   }
 
-  /** The forum reported a change for this id: the next check asks again. */
+  /** The forum reported a change for this id: the next check asks again, and a pending lookup's answer is not kept. */
   forget(userId: string): void {
     this.cache.delete(userId)
+    this.inflight.delete(userId)
+    this.generation.set(userId, (this.generation.get(userId) ?? 0) + 1)
   }
 }
 
@@ -196,8 +203,15 @@ export function promptTapAllowed(cfg: AccessConfig, tap: PromptTap): boolean {
   return tap.kind === 'question' || isAdmin(cfg, tap.fromId)
 }
 
-/** What a failed getChatMember means: a 400 is an id the chat never saw (a no); anything else is unknown. */
+/**
+ * What a failed getChatMember means. Telegram answers 400 "user not found" (or
+ * PARTICIPANT_ID_INVALID / USER_ID_INVALID) for an id the chat never saw: a no. A 400
+ * about the chat itself (chat not found, member list inaccessible) is a misconfiguration,
+ * not a stranger, and like any other failure it is unknown.
+ */
 export function lookupFailureVerdict(e: unknown): Verdict {
-  const code = e && typeof e === 'object' ? (e as { error_code?: unknown }).error_code : undefined
-  return code === 400 ? 'no' : 'unknown'
+  const err = e && typeof e === 'object' ? (e as { error_code?: unknown; description?: unknown }) : undefined
+  if (err?.error_code !== 400) return 'unknown'
+  const description = typeof err.description === 'string' ? err.description : ''
+  return /user not found|PARTICIPANT_ID_INVALID|USER_ID_INVALID/i.test(description) ? 'no' : 'unknown'
 }

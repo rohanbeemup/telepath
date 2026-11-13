@@ -10,8 +10,11 @@ export type Member = { firstName?: string; username?: string }
  * configures the session (the profile does). An empty line names the topic after the
  * member and the time, so a list of topics still reads.
  */
+/** Telegram's topic-name limit; applied once, here, so every surface carries the title the topic got. */
+const TITLE_MAX = 120
+
 export function parseTeamNew(args: string, member: Member, now: Date): { title: string } {
-  const title = args.trim().replace(/\s+/g, ' ')
+  const title = args.trim().replace(/\s+/g, ' ').slice(0, TITLE_MAX)
   if (title) return { title }
   const who = member.firstName?.trim() || member.username?.trim() || 'member'
   const hh = String(now.getHours()).padStart(2, '0')

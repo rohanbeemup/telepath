@@ -90,8 +90,14 @@ describe('membership', () => {
     const m = new Membership(async id => statuses[id] ?? { status: 'left' })
     for (const id of ['1', '2', '3', '4']) expect([id, await m.check(id)]).toEqual([id, 'member'])
     for (const id of ['5', '6', '7', '8', '9']) expect([id, await m.check(id)]).toEqual([id, 'no'])
-    // Telegram answers 400 for an id the chat has never seen: that is a no, not a blip; anything else is unknown
+    // Telegram answers 400 "user not found" for an id the chat has never seen: a no, not a blip.
+    // A 400 about the chat itself is a misconfiguration, not a stranger: unknown, like any other failure.
     expect(lookupFailureVerdict({ error_code: 400, description: 'Bad Request: user not found' })).toBe('no')
+    expect(lookupFailureVerdict({ error_code: 400, description: 'Bad Request: PARTICIPANT_ID_INVALID' })).toBe('no')
+    expect(lookupFailureVerdict({ error_code: 400, description: 'Bad Request: USER_ID_INVALID' })).toBe('no')
+    expect(lookupFailureVerdict({ error_code: 400, description: 'Bad Request: chat not found' })).toBe('unknown')
+    expect(lookupFailureVerdict({ error_code: 400, description: 'Bad Request: member list is inaccessible' })).toBe('unknown')
+    expect(lookupFailureVerdict({ error_code: 400 })).toBe('unknown')
     expect(lookupFailureVerdict({ error_code: 429, description: 'Too Many Requests' })).toBe('unknown')
     expect(lookupFailureVerdict({ error_code: 502 })).toBe('unknown')
     expect(lookupFailureVerdict(new Error('timed out'))).toBe('unknown')
@@ -183,6 +189,23 @@ describe('membership', () => {
     const burst = await Promise.all([m.check('burst'), m.check('burst'), m.check('burst')])
     expect(burst).toEqual(['member', 'member', 'member'])
     expect(calls).toBe(before + 1)
+    // a change the forum reports while a lookup is pending invalidates that lookup's answer:
+    // the stale yes is reported to the call that asked, but not cached, so the next check asks again
+    let release: (v: { status: string }) => void = () => {}
+    let askedSlow = 0
+    const slow = new Membership(
+      async () => {
+        askedSlow++
+        return askedSlow === 1 ? await new Promise<{ status: string }>(resolve => (release = resolve)) : { status: 'kicked' }
+      },
+      { ttlMs: 600_000, graceMs: 30_000, now: () => t },
+    )
+    const pendingCheck = slow.check('leaving')
+    slow.forget('leaving') // kicked while the lookup is in flight
+    release({ status: 'member' }) // the stale answer arrives
+    expect(await pendingCheck).toBe('member')
+    expect(await slow.check('leaving')).toBe('no')
+    expect(askedSlow).toBe(2)
     // expired entries are swept once the cache passes its size, so strangers do not pile up
     const small = new Membership(async () => ({ status: 'left' }), { ttlMs: 600_000, graceMs: 30_000, now: () => t, maxEntries: 3 })
     for (const id of ['s1', 's2', 's3']) await small.check(id)

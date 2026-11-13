@@ -131,6 +131,16 @@ const CHILD_ENV: Record<string, string | undefined> = { ...process.env }
 function statusText(): string {
   const up = Math.round((Date.now() - STARTED) / 60000)
   const snap = metrics.snapshot()
+  // Team mode: the forum reads this, so no admin ids, no topic titles, no error strings
+  // (those stay in the journal and health.json); counts only.
+  if (cfg.teamMode) {
+    return (
+      `📊 telepath ${VERSION} · SDK ${SDK_VERSION} · ${versionVerdict.message}\n` +
+      `up ${up} min · ${topics.live.size}/${cfg.maxLiveSessions} live · ${Object.keys(store.registry).length} topics bound · idle ${cfg.idleMinutes}m\n` +
+      `team mode · ${profile ? `profile ${profile.name} (${profile.allowedTools.length} tools)` : 'no profile'} · ${cfg.teamTopicsPerDay} topics per member per day\n` +
+      `turns ${snap.turns ?? 0} · errors ${snap.turn_errors ?? 0} (details in the journal)`
+    )
+  }
   const liveList = [...topics.live.values()].map(l => `• ${store.registry[l.topicId]?.title ?? l.topicId} — ${l.model}${isBusy(l) ? ` (running${l.queued ? `, ${l.queued} queued` : ''})` : ''}`)
   const errors = ring.list().slice(-5).map(e => `• ${new Date(e.at).toISOString().slice(11, 19)} ${e.ev}${e.message ? `: ${e.message.slice(0, 120)}` : ''}`)
   const counters = Object.entries(snap).map(([k, v]) => `${k}=${v}`).join('  ')
@@ -163,6 +173,7 @@ const topics = new TopicManager({
   metrics,
   primeContract: !profile,
   budgetUsd: profile?.maxBudgetUsd,
+  profileSessions: !!profile,
 })
 bot.attachTopics(topics)
 
@@ -240,8 +251,16 @@ try {
       log.warn('preflight.bot_membership_unknown', { error: e })
     }
   }
-  // The published menu reads the one command table (src/commands.ts), like the gate and the handler.
-  await bot.bot.api.setMyCommands([...(cfg.teamMode ? ['new'] : []), 'menu', 'status'].map(command => ({ command, description: COMMANDS[command] })))
+  // The published menu reads the one command table (src/commands.ts), like the gate and the
+  // handler. In team mode members see new and menu; status, an admin's, is published to the
+  // forum's administrators only, so no member's menu offers a command that refuses them.
+  const publish = (names: string[]) => names.map(command => ({ command, description: COMMANDS[command] }))
+  if (cfg.teamMode) {
+    await bot.bot.api.setMyCommands(publish(['new', 'menu']))
+    await bot.bot.api.setMyCommands(publish(['new', 'menu', 'status']), { scope: { type: 'chat_administrators', chat_id: Number(cfg.forumChatId) } }).catch(e => log.warn('commands.admin_scope_failed', { error: e }))
+  } else {
+    await bot.bot.api.setMyCommands(publish(['menu', 'status']))
+  }
   log.info('telepath.up', {
     version: VERSION,
     sdk: SDK_VERSION,
