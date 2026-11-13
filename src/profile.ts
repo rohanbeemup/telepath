@@ -171,6 +171,9 @@ export function profileOptions(p: Profile, open: OpenOptions): Options {
     allowedTools: allowed,
     permissionMode: 'dontAsk',
     settingSources: [],
+    // Stream deltas count as output: in a shared forum a turn is "stuck" only when no tokens
+    // are flowing, so a long answer is never killed as silent (security read).
+    includePartialMessages: true,
     systemPrompt: p.systemPrompt,
     cwd: p.cwd,
     model: p.model ?? open.model,

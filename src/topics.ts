@@ -274,6 +274,10 @@ export class TopicManager {
       if (b.sessionId) this.d.log.info('session.resume_dropped', { topic: topicId, sessionId: b.sessionId, why: 'binding predates the profile' })
       b.sessionId = undefined
       b.profile = true // the profile's from now on: the fresh session it opens is resumed like any other
+      // The old session's hand-off (a repo path, a branch, the operator's next command) and its
+      // approval mode are not this topic's either: ▶️ Resume would feed them to the profile.
+      delete b.handoff
+      b.auto = false
       // The old transcript's total is no baseline for the fresh one, which starts at zero.
       if (this.d.budgetUsd !== undefined) b.reportedUsd = 0
       this.d.store.saveRegistry()
@@ -458,7 +462,8 @@ export class TopicManager {
    */
   private async refuse(topicId: string, why: 'closed' | 'budget' | 'busy'): Promise<void> {
     this.d.metrics.inc(`${why}_refusals`)
-    if (this.refusals.allow(topicId)) await this.d.say(topicId, this.refusalNotice(why))
+    // Keyed by kind too, so a refusal of one kind does not mute a different one that follows.
+    if (this.refusals.allow(`${topicId}:${why}`)) await this.d.say(topicId, this.refusalNotice(why))
     else this.d.metrics.inc('refusals_muted')
   }
 
@@ -511,7 +516,7 @@ export class TopicManager {
               const activeBefore = this.d.rotator.active()
               const rot = this.d.rotator.enabled()
               const until = this.scheduleResume(topicId, ev.resetsAt)
-              const rotating = rot ? ' If the account rotator switches accounts I continue right away.' : ''
+              const rotating = rot ? (this.d.shared ? ' I may continue sooner on my own.' : ' If the account rotator switches accounts I continue right away.') : ''
               // Under a profile there is no model to switch to: the offer would name a button that is not there.
               const lighter = this.d.profileSessions ? '' : ' Or switch to a lighter model via ⚙️ Controls to keep going now.'
               await this.d.say(

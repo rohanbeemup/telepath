@@ -48,6 +48,8 @@ const open = (over: Partial<OpenOptions> = {}): OpenOptions => ({
 
 describe('a profile session', () => {
   test("a profile session runs with no built-in tools and only the profile's MCP servers", () => {
+    // and streams its deltas: in a shared forum "stuck" means no tokens flowing, so a long answer is never killed as silent
+    expect(profileOptions(parseProfile(raw(), source()), open()).includePartialMessages).toBe(true)
     const o = profileOptions(parseProfile(raw(), source()), open())
     expect(o.tools).toEqual([])
     expect(o.mcpServers).toEqual(SERVERS)

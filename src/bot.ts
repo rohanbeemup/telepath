@@ -234,11 +234,19 @@ export class TelegramBot {
     }
   }
 
-  /** Repaint the tapped menu message in place when possible, else send fresh. */
+  /**
+   * Repaint the tapped menu message in place when possible, else send fresh. "Tapped" is
+   * checked against the message's own keyboard, which Telegram sets and a client cannot
+   * forge: callback data sent against another message (the pinned panel, a colleague's
+   * notice) paints nothing over it (security read).
+   */
   private async paint(topicId: string | undefined, text: string, kb?: InlineKeyboard): Promise<void> {
-    if (this.menuCtx?.callbackQuery?.message) {
+    const q = this.menuCtx?.callbackQuery
+    const m = q?.message
+    const tapped = m && 'reply_markup' in m && !!m.reply_markup?.inline_keyboard.some(row => row.some(btn => 'callback_data' in btn && btn.callback_data === q.data))
+    if (tapped) {
       try {
-        await this.menuCtx.editMessageText(text, { reply_markup: kb })
+        await this.menuCtx!.editMessageText(text, { reply_markup: kb })
         return
       } catch {}
     }
@@ -520,18 +528,19 @@ export class TelegramBot {
         return await this.say(topicId, `🎙️ Voice note too large (${(media.file_size / 1048576).toFixed(1)} MB): Telegram caps bot downloads at 20 MB.`)
       }
       if (!this.d.cfg.transcribeCmd) {
-        return await this.notice(topicId, this.d.profile ? '🎙️ Voice notes are not transcribed on this install: type your question.' : `🎙️ Voice note not transcribed: ${NO_TRANSCRIBER}`)
+        return await this.notice(topicId, 'voice', this.d.profile ? '🎙️ Voice notes are not transcribed on this install: type your question.' : `🎙️ Voice note not transcribed: ${NO_TRANSCRIBER}`, this.senderId(ctx))
       }
-      // A forwarded note or an audio file is content for the session, so in team mode a fresh topic
-      // binds (and pays its opening) before any download: a refused opening costs no transcription.
-      // The member's own note is their turn and binds the way typed text does, after it is heard.
-      if ((shared.forwarded || shared.audioFile) && this.d.cfg.teamMode && !this.d.store.registry[topicId] && !(await this.bindFreshProfileTopic(ctx, topicId))) return
-      if (this.transcribing >= MAX_TRANSCRIBING) return await this.notice(topicId, `🎙️ ${MAX_TRANSCRIBING} voice notes are being transcribed already. Send it again in a moment.`)
+      if (this.transcribing >= MAX_TRANSCRIBING) return await this.notice(topicId, 'voice', `🎙️ ${MAX_TRANSCRIBING} voice notes are being transcribed already. Send it again in a moment.`, this.senderId(ctx))
       // Reserved before any await, so notes arriving in other topics meanwhile cannot all pass
       // the check; the download counts too, which bounds the disk as well as the processes.
       this.transcribing++
       let words: string
       try {
+        // A forwarded note or an audio file is content for the session, so in team mode a fresh
+        // topic binds (and pays its opening) before any download and after the refusals that cost
+        // nothing: a refused opening costs no transcription, and a refused note costs no opening.
+        // The member's own note is their turn and binds the way typed text does, once heard.
+        if ((shared.forwarded || shared.audioFile) && this.d.cfg.teamMode && !this.d.store.registry[topicId] && !(await this.bindFreshProfileTopic(ctx, topicId))) return
         if (topicId) await this.typing(topicId)
         const path = this.d.files.saveInbox(media.file_name || `${media.file_unique_id}.ogg`, await this.download(media.file_id))
         try {
@@ -592,7 +601,7 @@ export class TelegramBot {
   /** One guard for every inbound media kind: a profile session has no file tool, and the host path stays out of the chat. */
   private async mediaRefusedUnderProfile(topicId: string): Promise<boolean> {
     if (!this.d.profile) return false
-    await this.notice(topicId, this.d.cfg.transcribeCmd ? `${TEXT_ONLY} Voice notes are transcribed.` : TEXT_ONLY)
+    await this.notice(topicId, 'media', this.d.cfg.transcribeCmd ? `${TEXT_ONLY} Voice notes are transcribed.` : TEXT_ONLY)
     return true
   }
 
@@ -653,7 +662,7 @@ export class TelegramBot {
   /** The wrap-up confirmation, with the queue count from the live session. */
   private async offerWrapUp(topicId: string): Promise<void> {
     const live = this.topics.live.get(topicId)
-    if (!live || !isBusy(live)) return this.send(topicId, 'Nothing is running in this topic right now, so there is nothing to wrap up.')
+    if (!live || !isBusy(live)) return this.notice(topicId, 'wrap', 'Nothing is running in this topic right now, so there is nothing to wrap up.')
     await this.send(topicId, wrapConfirmText(live.queued), wrapConfirmKb())
   }
 
@@ -715,7 +724,7 @@ export class TelegramBot {
     if (!membershipRequired(this.access, uid)) return true // the cap is a member's; admins and single users are exempt
     if (uid && this.quota.take(uid)) return true
     this.d.metrics.inc('topic_quota_refused')
-    await this.notice(where, `🧮 You have opened ${this.d.cfg.teamTopicsPerDay} topics today, the daily allowance. Keep asking in one of them, or come back tomorrow.`)
+    await this.notice(where, 'quota', `🧮 You have opened ${this.d.cfg.teamTopicsPerDay} topics today, the daily allowance. Keep asking in one of them, or come back tomorrow.`, uid)
     return false
   }
 
@@ -966,7 +975,11 @@ export class TelegramBot {
     }
     if (data === 'm:settings') return void (await ack(), this.showSettings(topicId))
     if (data === 'm:status') return void (await ack(), this.paint(topicId, this.d.statusText(), backKb()))
-    if (data === 'm:help') return void (await ack(), this.send(topicId, this.d.cfg.teamMode ? teamHelp() : help(this.d.cfg.reposDir), backKb()))
+    if (data === 'm:help') {
+      await ack()
+      if (this.d.cfg.teamMode && !this.replyAllowed(topicId, 'help', this.senderId(ctx))) return void this.d.metrics.inc('refusals_muted')
+      return void this.send(topicId, this.d.cfg.teamMode ? teamHelp() : help(this.d.cfg.reposDir), backKb())
+    }
     if (data === 'm:cancel') {
       this.wizard.delete(uid)
       await ack('Cancelled')
@@ -1193,7 +1206,7 @@ export class TelegramBot {
     const fromId = this.senderId(ctx)
     const refuse = (): Promise<void> => {
       this.d.metrics.inc('admin_only_refused')
-      return this.notice(topicId, '🔒 Admins only.')
+      return this.notice(topicId, 'admins', '🔒 Admins only.', fromId)
     }
 
     if (typed.kind === 'slash') {
@@ -1201,7 +1214,7 @@ export class TelegramBot {
       if (!KNOWN_COMMANDS.has(typed.cmd)) {
         if (!topicId && this.d.cfg.teamMode) return
         // In a shared forum a menu per unknown command is a flood a member can cause: once a minute per topic.
-        if (this.d.cfg.teamMode && !this.refusals.allow(topicId ?? 'general')) return void this.d.metrics.inc('refusals_muted')
+        if (this.d.cfg.teamMode && !this.replyAllowed(topicId, 'menu', fromId)) return void this.d.metrics.inc('refusals_muted')
         return this.showMainMenu(topicId, true)
       }
       if (!allowedAction(this.access, fromId, `/${typed.cmd}`)) return refuse()
@@ -1235,8 +1248,11 @@ export class TelegramBot {
         case 'status':
           return void this.send(topicId, this.d.statusText())
         case 'menu':
+          // A typed menu or help text is a reply a member can trigger at will: in a shared forum, so many a minute.
+          if (this.d.cfg.teamMode && !this.replyAllowed(topicId, 'menu', fromId)) return void this.d.metrics.inc('refusals_muted')
           return this.controlsOrMenu(topicId, true)
         case 'help':
+          if (this.d.cfg.teamMode && !this.replyAllowed(topicId, 'help', fromId)) return void this.d.metrics.inc('refusals_muted')
           return void this.say(topicId, this.d.cfg.teamMode ? teamHelp() : help(this.d.cfg.reposDir))
         default:
           return this.showMainMenu(topicId, true)
@@ -1309,16 +1325,25 @@ export class TelegramBot {
   /** Topics where a post made as the group has been answered with the reason once. */
   private readonly anonymousNoticed = new Set<string>()
 
-  /** A refusal is said at most once a minute per topic (General counted as one); the rest are counted, not posted. */
+  /** A reply of one kind at most once a minute per topic (General counted as one). */
   private readonly refusals = new Throttle(60_000)
+  /** And at most ten replies a minute to one member, whatever the topics: the key space of topics is theirs to grow. */
+  private readonly senderReplies = new Throttle(60_000, () => Date.now(), 10)
 
   /**
-   * A refusal notice: "Admins only", the quota, the text-only and voice notices, an unknown
-   * command's menu. Every refused message is counted; a member's flood of them is not the
-   * bot's flood (security read), so the notice goes out once a minute per topic.
+   * Whether a reply a member can trigger at will (a refusal, the help text, a menu) goes
+   * out now. Every refused message is counted; a member's flood of them is not the bot's
+   * flood (security read), which under Telegram's 429 retries on the bot's replies would
+   * stall the update loop for everyone.
    */
-  private async notice(topicId: string | undefined, text: string): Promise<void> {
-    if (!this.refusals.allow(topicId ?? 'general')) return void this.d.metrics.inc('refusals_muted')
+  private replyAllowed(topicId: string | undefined, kind: string, senderId?: string): boolean {
+    if (!this.refusals.allow(`${topicId ?? 'general'}:${kind}`)) return false
+    return senderId === undefined || this.senderReplies.allow(senderId)
+  }
+
+  /** A refusal notice: "Admins only", the quota, the text-only and voice notices. */
+  private async notice(topicId: string | undefined, kind: string, text: string, senderId?: string): Promise<void> {
+    if (!this.replyAllowed(topicId, kind, senderId)) return void this.d.metrics.inc('refusals_muted')
     await this.say(topicId, text)
   }
 
@@ -1439,7 +1464,7 @@ export class TelegramBot {
       }
       // queued per topic, so whatever is sent after the note is handled after it; in a shared
       // forum one at a time per topic, or a run of notes holds the topic and both slots for hours
-      if (this.d.cfg.teamMode && this.order.busy(topicId)) return await this.notice(topicId, '🎙️ A voice note is still being transcribed here. Send the next one when it is done.')
+      if (this.d.cfg.teamMode && this.order.busy(topicId)) return await this.notice(topicId, 'voice', '🎙️ A voice note is still being transcribed here. Send the next one when it is done.', this.senderId(ctx))
       this.order.queue(topicId, () => this.handleVoice(ctx, topicId, media, shared),
         e => this.d.log.error('voice.failed', { topic: topicId, error: e }))
     })
