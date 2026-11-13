@@ -238,19 +238,24 @@ export class TopicManager {
     return this.d.budgetUsd === undefined ? undefined : this.d.budgetUsd - (b.spentUsd ?? 0)
   }
 
-  /** A user (or a nudge) message into the topic's session. */
-  async sendToTopic(topicId: string, text: string, opts: { takeover?: boolean } = {}): Promise<boolean> {
+  /**
+   * A user message into the topic's session, or a nudge (`quiet`: the rate-limit or
+   * rotation continuation), which posts no refusal into a topic nobody wrote in.
+   */
+  async sendToTopic(topicId: string, text: string, opts: { takeover?: boolean; quiet?: boolean } = {}): Promise<boolean> {
     if (opts.takeover !== false) this.userTookOver(topicId)
     const bound = this.d.store.registry[topicId]
     if (bound?.closed) {
+      if (opts.quiet) return false
       this.d.metrics.inc('closed_refusals')
       await this.d.say(topicId, '🔒 An admin closed this topic. An admin can reopen it from the pinned panel.')
       return true
     }
-    const cap = this.d.budgetUsd
-    if (bound && cap !== undefined && (this.remainingBudget(bound) ?? cap) <= 0) {
+    const left = bound ? this.remainingBudget(bound) : undefined
+    if (bound && left !== undefined && left <= 0) {
+      if (opts.quiet) return false
       this.d.metrics.inc('budget_refusals')
-      await this.d.say(topicId, `💸 This topic has used its budget ($${cap.toFixed(2)}). Open a new topic for the next question; an admin can delete this one.`)
+      await this.d.say(topicId, `💸 This topic has used its budget ($${(this.d.budgetUsd ?? 0).toFixed(2)}). Open a new topic for the next question; an admin can delete this one.`)
       return true
     }
     let l = this.ensureLive(topicId)
@@ -340,7 +345,7 @@ export class TopicManager {
         if (!this.d.store.registry[topicId]) return
         this.d.metrics.inc('rate_limit_resumes')
         void this.d.say(topicId, '▶️ Rate limit reset — resuming automatically.')
-        void this.sendToTopic(topicId, CONTINUE_AFTER_LIMIT, { takeover: false })
+        void this.sendToTopic(topicId, CONTINUE_AFTER_LIMIT, { takeover: false, quiet: true })
       }, delay),
     )
     const dt = new Date(at)
@@ -357,7 +362,7 @@ export class TopicManager {
     this.closeLive(topicId, `account rotated ${before ?? '?'} -> ${now}`)
     this.d.metrics.inc('rotations_resumed')
     await this.d.say(topicId, `🔁 Account rotated to ${now} — continuing now.`)
-    await this.sendToTopic(topicId, CONTINUE_AFTER_ROTATION, { takeover: false })
+    await this.sendToTopic(topicId, CONTINUE_AFTER_ROTATION, { takeover: false, quiet: true })
   }
 
   private async pump(l: Live): Promise<void> {
@@ -434,7 +439,8 @@ export class TopicManager {
               const budget = this.d.budgetUsd
               if (b && budget !== undefined) {
                 let spent = b.spentUsd
-                if (ev.costUsd !== undefined) {
+                // A zero is no information (a crash or startup-error result may carry zeroed values).
+                if (ev.costUsd !== undefined && ev.costUsd > 0) {
                   const recorded = spent ?? 0
                   if (l.lastTotal === undefined) spent = ev.costUsd >= recorded ? ev.costUsd : recorded + ev.costUsd
                   else spent = recorded + Math.max(0, ev.costUsd - l.lastTotal)

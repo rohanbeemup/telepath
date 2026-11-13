@@ -10,10 +10,10 @@ import { autoRetry } from '@grammyjs/auto-retry'
 import type { CanUseTool, PermissionResult } from '@anthropic-ai/claude-agent-sdk'
 import { basename } from 'path'
 import type { Config } from './config'
-import { admitted, allowedAction, membershipRequired, profileLocked, promptTapAllowed, Membership, type AccessConfig } from './access'
+import { admitted, allowedAction, membershipRequired, profileFreshOnly, profileLocked, promptTapAllowed, Membership, type AccessConfig } from './access'
 import { KNOWN_COMMANDS, parseTyped, type Typed } from './commands'
 import type { Profile } from './profile'
-import { parseTeamNew, TopicQuota, type Member } from './team'
+import { parseTeamNew, TITLE_MAX, TopicQuota, type Member } from './team'
 import { describeTask } from './feed'
 import { TurnStatus, type StatusTransport } from './status'
 import { parseHandoff, resumePrompt } from './handoff'
@@ -72,6 +72,7 @@ const FREE_TEXT = Symbol('free-text')
 /** A profile session has no file tool, so an inbound file has nowhere to go and the host path stays out of the chat. */
 const TEXT_ONLY = '📎 This assistant reads text only: type your question. Voice notes are transcribed.'
 const PROFILE_OWNS = '🔒 This install runs a profile: the model, effort and approvals are set there.'
+const PROFILE_FRESH = '🔒 Not under a profile: every topic starts fresh.'
 /** grammy types its optional signal with the abort-controller polyfill; the platform's AbortSignal is what runs. */
 type ApiSignal = NonNullable<Parameters<Api['getChatMember']>[2]>
 
@@ -510,7 +511,7 @@ export class TelegramBot {
   private async handleIncomingMedia(ctx: Context, kind: InboundKind): Promise<void> {
     const topicId = this.topicIdOf(ctx)
     if (!topicId) return void this.say(undefined, 'Send media inside a session topic.')
-    if (this.d.profile) return void this.say(topicId, TEXT_ONLY)
+    if (await this.mediaRefusedUnderProfile(topicId)) return
     this.status.bump(topicId)
     const m = ctx.message
     const src = kind === 'video' ? m?.video : kind === 'animation' ? m?.animation : m?.video_note
@@ -535,6 +536,13 @@ export class TelegramBot {
     }
   }
 
+  /** One guard for every inbound media kind: a profile session has no file tool, and the host path stays out of the chat. */
+  private async mediaRefusedUnderProfile(topicId: string): Promise<boolean> {
+    if (!this.d.profile) return false
+    await this.say(topicId, TEXT_ONLY)
+    return true
+  }
+
   private async download(fileId: string): Promise<Uint8Array> {
     const file = await this.bot.api.getFile(fileId)
     const url = `https://api.telegram.org/file/bot${this.d.cfg.telegramToken}/${file.file_path}`
@@ -554,7 +562,7 @@ export class TelegramBot {
   }
 
   private async createTopic(name: string): Promise<string> {
-    const topic = await this.bot.api.createForumTopic(this.d.cfg.forumChatId, name.slice(0, 120) || 'session')
+    const topic = await this.bot.api.createForumTopic(this.d.cfg.forumChatId, name.slice(0, TITLE_MAX) || 'session')
     return String(topic.message_thread_id)
   }
 
@@ -694,7 +702,8 @@ export class TelegramBot {
       topicId = await this.createTopic(title)
     } catch (e) {
       this.refundTopic(ctx) // only an opening that happened counts
-      return tell(`Couldn't create topic (is the bot admin with Manage Topics?): ${e}`, backKb())
+      this.d.log.error('topic.create_failed', { error: e }) // the forum gets the hint, not Telegram's raw text
+      return tell("Couldn't create the topic. Is the bot an admin of this group with Manage Topics?", backKb())
     }
     this.bindProfileTopic(topicId, title)
     await this.postPinnedControls(topicId)
@@ -866,7 +875,6 @@ export class TelegramBot {
     }
     if (data === 'm:list') return void (await ack(), this.showSessions(topicId, 0))
     if (data === 'm:resume') {
-      if (this.d.profile) return void ack('Not under a profile: every topic starts fresh')
       await ack('Resuming…')
       let sessions
       try {
@@ -883,12 +891,7 @@ export class TelegramBot {
       return void this.paint(topicId, tid ? `✅ Opened "${last.summary || last.sessionId.slice(0, 8)}".` : '⚠️ Could not open that session.', tid ? openLinkKb(this.d.cfg.forumChatId, tid) : backKb())
     }
     if (data === 'm:settings') return void (await ack(), this.showSettings(topicId))
-    if (data === 'm:status') {
-      await ack()
-      // The status lists every topic, the admin ids and recent errors: in team mode it stays in General.
-      if (this.d.cfg.teamMode && topicId) return this.paint(topicId, '📊 Status is shown in General only: it lists every topic.', backKb())
-      return this.paint(topicId, this.d.statusText(), backKb())
-    }
+    if (data === 'm:status') return void (await ack(), this.paint(topicId, this.d.statusText(), backKb()))
     if (data === 'm:help') return void (await ack(), this.send(topicId, this.d.cfg.teamMode ? teamHelp() : help(this.d.cfg.reposDir), backKb()))
     if (data === 'm:cancel') {
       this.wizard.delete(uid)
@@ -935,7 +938,6 @@ export class TelegramBot {
     // Open a session from the list
     const sess = /^m:sess:([0-9a-f]+)$/.exec(data)
     if (sess) {
-      if (this.d.profile) return void ack('Not under a profile: every topic starts fresh')
       await ack('Opening…')
       const already = Object.values(store.registry).find(b => b.sessionId?.startsWith(sess[1]))
       if (already) return void this.paint(topicId, `📌 "${already.title}" is already open.`, backKb())
@@ -1120,6 +1122,7 @@ export class TelegramBot {
       }
       if (!allowedAction(this.access, fromId, `/${typed.cmd}`)) return refuse()
       if (this.d.profile && profileLocked(`/${typed.cmd}`)) return void this.say(topicId, PROFILE_OWNS)
+      if (this.d.profile && profileFreshOnly(`/${typed.cmd}`)) return void this.say(topicId, PROFILE_FRESH)
       switch (typed.cmd) {
         case 'new': {
           if (this.d.profile) return this.createProfileTopic(ctx, parseTeamNew(typed.args, this.memberOf(ctx), new Date()).title, topicId, 'text')
@@ -1131,8 +1134,6 @@ export class TelegramBot {
         case 'list':
           return this.showSessions(topicId, 0)
         case 'attach': {
-          // An old transcript may hold a full session's tool results, and its saved cost is not this topic's.
-          if (this.d.profile) return void this.say(topicId, '🔒 Not under a profile: every topic starts fresh.')
           const [shortId, ...rest] = typed.args.trim().split(/\s+/)
           if (!shortId) return void this.say(topicId, 'Usage: /attach <short-id> [topic name]')
           await this.attach(shortId, rest.join(' ') || undefined, topicId)
@@ -1148,7 +1149,6 @@ export class TelegramBot {
           return void this.say(topicId, b.auto ? '⚡ Auto mode ON — tools run without asking (questions still prompt). /auto off to disable.' : '🔐 Auto mode OFF — risky tools (Bash/Write/Edit/Web) will ask for Allow/Deny.')
         }
         case 'status':
-          if (this.d.cfg.teamMode && topicId) return void this.say(topicId, '📊 Status is shown in General only: it lists every topic.')
           return void this.send(topicId, this.d.statusText())
         case 'menu':
           return this.controlsOrMenu(topicId)
@@ -1244,7 +1244,7 @@ export class TelegramBot {
       await this.inOrder(ctx, async () => {
         const topicId = this.topicIdOf(ctx)
         if (!topicId) return await this.say(undefined, 'Send images inside a session topic.')
-        if (this.d.profile) return await this.say(topicId, TEXT_ONLY)
+        if (await this.mediaRefusedUnderProfile(topicId)) return
         this.status.bump(topicId)
         try {
           const best = ctx.message.photo[ctx.message.photo.length - 1]
@@ -1280,7 +1280,7 @@ export class TelegramBot {
       await this.inOrder(ctx, async () => {
         const topicId = this.topicIdOf(ctx)
         if (!topicId) return await this.say(undefined, 'Send files inside a session topic.')
-        if (this.d.profile) return await this.say(topicId, TEXT_ONLY)
+        if (await this.mediaRefusedUnderProfile(topicId)) return
         this.status.bump(topicId)
         const doc = ctx.message.document
         try {
@@ -1329,6 +1329,7 @@ export class TelegramBot {
         return void ctx.answerCallbackQuery({ text: '🔒 Admins only.' }).catch(() => {})
       }
       if (data.startsWith('m:') && this.d.profile && profileLocked(data)) return void ctx.answerCallbackQuery({ text: 'Set in the profile.' }).catch(() => {})
+      if (data.startsWith('m:') && this.d.profile && profileFreshOnly(data)) return void ctx.answerCallbackQuery({ text: 'Not under a profile: every topic starts fresh.' }).catch(() => {})
       if (data.startsWith('m:')) {
         this.menuCtx = ctx
         try {

@@ -19,8 +19,9 @@ export type Sender = { fromId: string | undefined; chatId: string | undefined; /
  * What a member may do in team mode. An allowlist, not a denylist: an action this file
  * has never heard of is an admin's until someone decides otherwise. Everything in it is
  * reversible and local to a topic: chatting, opening a topic, wrapping up a turn, the
- * activity feed, and the screens that change nothing. Not the status screen: it lists
- * the box's recent errors, the admin ids and every topic's title.
+ * activity feed, and the screens that change nothing. Not the status screen: the full one
+ * lists the box's recent errors, the admin ids and every topic's title, and the reduced
+ * one team mode shows is still the operator's view, not a member's.
  */
 const MEMBER_ACTIONS: ReadonlySet<string> = new Set([
   'chat',
@@ -136,9 +137,18 @@ export class Membership {
       verdict = lookupFailureVerdict(e)
     }
     // The forum reported a change while this was pending: the answer is reported, never kept.
-    if ((this.generation.get(userId) ?? 0) !== started) return verdict
-    // Strangers come and go; once the cache is full, the expired ones leave.
-    if (this.cache.size >= this.maxEntries) this.sweep()
+    const invalidated = (this.generation.get(userId) ?? 0) !== started
+    this.generation.delete(userId) // served its purpose either way
+    if (invalidated) return verdict
+    // Strangers come and go; once the cache is full the expired ones leave, and when nothing
+    // has expired the oldest does, so a forum larger than the cache cannot grow it.
+    if (this.cache.size >= this.maxEntries && !this.cache.has(userId)) {
+      this.sweep()
+      if (this.cache.size >= this.maxEntries) {
+        const oldest = this.cache.keys().next().value
+        if (oldest !== undefined) this.cache.delete(oldest)
+      }
+    }
     this.cache.set(userId, { until: this.now() + (verdict === 'member' ? this.ttlMs : this.graceMs), verdict, noticed: false })
     return verdict
   }
@@ -214,4 +224,15 @@ export function lookupFailureVerdict(e: unknown): Verdict {
   if (err?.error_code !== 400) return 'unknown'
   const description = typeof err.description === 'string' ? err.description : ''
   return /user not found|PARTICIPANT_ID_INVALID|USER_ID_INVALID/i.test(description) ? 'no' : 'unknown'
+}
+
+/**
+ * The actions that would bind an old transcript under a profile: its tool results and
+ * files are not this topic's to show, and its saved cost is not this topic's spend. Every
+ * profile topic starts fresh. Consulted at the same gates as profileLocked.
+ */
+const PROFILE_FRESH_ONLY: ReadonlySet<string> = new Set(['/attach', 'm:resume'])
+
+export function profileFreshOnly(action: string): boolean {
+  return PROFILE_FRESH_ONLY.has(action) || action.startsWith('m:sess:')
 }

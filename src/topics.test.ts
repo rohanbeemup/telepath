@@ -553,6 +553,24 @@ describe('a profile budget', () => {
     h.backend.last().emit({ ...result('se'), total_cost_usd: 0.2 })
     await h.tick()
     expect(h.store.registry['e'].spentUsd).toBeCloseTo(0.8)
+    // a zeroed result (a crash or startup-error result) is no information: it moves nothing, and the
+    // next real total is not added in full on top of the record
+    h.bind('g')
+    await h.tm.sendToTopic('g', 'q1')
+    h.backend.last().emit({ ...result('sg'), total_cost_usd: 0.5 })
+    await h.tick()
+    h.tm.closeLive('g', 'evicted in test')
+    await h.tm.sendToTopic('g', 'q2')
+    h.backend.last().emit({ type: 'result', subtype: 'error_during_execution', is_error: true, session_id: 'sg', total_cost_usd: 0 })
+    await h.tick()
+    expect(h.store.registry['g'].spentUsd).toBeCloseTo(0.5)
+    h.backend.last().emit({ ...result('sg'), total_cost_usd: 0.7 })
+    await h.tick()
+    expect(h.store.registry['g'].spentUsd).toBeCloseTo(0.7)
+    // a nudge into an exhausted topic posts nothing and reports undelivered
+    const notices = h.said.filter(([topic, text]) => topic === 'b' && /budget/i.test(text)).length
+    expect(await h.tm.sendToTopic('b', 'continue', { takeover: false, quiet: true })).toBe(false)
+    expect(h.said.filter(([topic, text]) => topic === 'b' && /budget/i.test(text)).length).toBe(notices)
     // a stretch that failed for another reason still spent what it reports
     h.bind('d')
     await h.tm.sendToTopic('d', 'hello')
@@ -588,6 +606,10 @@ describe('an admin-closed topic', () => {
     expect(h.backend.opens.length).toBe(1)
     expect(h.tm.ensureLive('z')).toBeUndefined()
     expect(h.said.find(([topic, text]) => topic === 'z' && /closed/i.test(text))).toBeTruthy()
+    // a nudge into a closed topic posts nothing and reports undelivered
+    const closedNotices = h.said.filter(([topic, text]) => topic === 'z' && /closed/i.test(text)).length
+    expect(await h.tm.sendToTopic('z', 'continue', { takeover: false, quiet: true })).toBe(false)
+    expect(h.said.filter(([topic, text]) => topic === 'z' && /closed/i.test(text)).length).toBe(closedNotices)
     // ♻️ Reopen (admins only, in the bot): the flag is cleared and the topic lives again
     h.store.registry['z'].closed = false
     await h.tm.sendToTopic('z', 'after the reopen')

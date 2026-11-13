@@ -52,7 +52,10 @@
   screen is reduced to counts and published to the forum's administrators only; a `/new` title
   is capped at Telegram's 120; a forum change reported while a membership lookup is pending
   invalidates that lookup's answer; a 400 "user not found" is a no, a 400 about the chat is
-  not; a stretch whose transcript saved no total still has its spend counted. An `ANTHROPIC_API_KEY` in `.env` reaches the Claude
+  not; a stretch whose transcript saved no total still has its spend counted, and a zeroed
+  crash result moves nothing; a rate-limit or rotation nudge into a closed or exhausted topic
+  posts no refusal; the membership cache evicts its oldest entry when full and nothing has
+  expired; a failed topic creation shows the hint, not Telegram's raw error. An `ANTHROPIC_API_KEY` in `.env` reaches the Claude
   Code child, for installs that bill a Console organization rather than a login.
 - **Video, GIFs and video notes, both ways.** Inbound: videos, GIFs/animations and round video
   notes are now downloaded (under Telegram's 20 MB bot-download cap) and handed to the session

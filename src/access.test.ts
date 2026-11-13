@@ -1,5 +1,5 @@
 import { test, expect, describe } from 'bun:test'
-import { admitted, isAdmin, allowedAction, profileLocked, promptTapAllowed, membershipRequired, lookupFailureVerdict, Membership, type AccessConfig } from './access'
+import { admitted, isAdmin, allowedAction, profileLocked, profileFreshOnly, promptTapAllowed, membershipRequired, lookupFailureVerdict, Membership, type AccessConfig } from './access'
 
 const single: AccessConfig = { teamMode: false, allowedUserId: '1', forumChatId: '-100', adminUserIds: ['1'] }
 const team: AccessConfig = { teamMode: true, allowedUserId: '1', forumChatId: '-100', adminUserIds: ['1', '9'] }
@@ -71,6 +71,9 @@ describe('what a member may do', () => {
     for (const a of ['use', 'effort', 'chat', '/new', '/help', '/menu', '/status', 'feed', 'wrap', 'm:menu', 'm:new', 'm:quick', 'm:tf', 'm:tclose', 'm:tdelete', 'm:twipe', 'm:settings', 'm:sdm:opus', '/attach', 'm:future']) {
       expect([a, profileLocked(a)]).toEqual([a, false])
     }
+    // the sibling set: actions that would bind an old transcript, refused under a profile at the same gates
+    for (const a of ['/attach', 'm:resume', 'm:sess:abcd1234']) expect([a, profileFreshOnly(a)]).toEqual([a, true])
+    for (const a of ['/new', 'm:new', 'm:quick', 'm:list', 'm:newhere', 'chat', 'm:tm:opus', 'm:future']) expect([a, profileFreshOnly(a)]).toEqual([a, false])
   })
 
 })
@@ -213,6 +216,10 @@ describe('membership', () => {
     t += 31_000 // all three have expired
     await small.check('s4')
     expect(small.size).toBe(1)
+    // when nothing has expired, the oldest entry goes instead: a forum larger than the cache cannot grow it
+    const full = new Membership(async () => ({ status: 'member' }), { ttlMs: 600_000, graceMs: 30_000, now: () => t, maxEntries: 3 })
+    for (const id of ['f1', 'f2', 'f3', 'f4', 'f5']) await full.check(id)
+    expect(full.size).toBe(3)
   })
 })
 
