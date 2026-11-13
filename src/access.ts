@@ -242,11 +242,12 @@ export function lookupFailureVerdict(e: unknown): Verdict {
 }
 
 /**
- * The actions that would bind an old transcript under a profile: its tool results and
- * files are not this topic's to show, and its saved cost is not this topic's spend. Every
- * profile topic starts fresh. Consulted at the same gates as profileLocked.
+ * The actions that would bind an old transcript under a profile, or list the host's
+ * transcripts to pick one from: their tool results and files are not this topic's to
+ * show, and their saved cost is not this topic's spend. Every profile topic starts fresh.
+ * Consulted at the same gates as profileLocked.
  */
-const PROFILE_FRESH_ONLY: ReadonlySet<string> = new Set(['/attach', 'm:resume'])
+const PROFILE_FRESH_ONLY: ReadonlySet<string> = new Set(['/attach', 'm:resume', '/list', 'm:list'])
 
 export function profileFreshOnly(action: string): boolean {
   return PROFILE_FRESH_ONLY.has(action) || action.startsWith('m:sess:')

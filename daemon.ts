@@ -173,7 +173,7 @@ const topics = new TopicManager({
   metrics,
   primeContract: !profile,
   budgetUsd: profile?.maxBudgetUsd,
-  profileSessions: !!profile, honourClosed: cfg.teamMode,
+  profileSessions: !!profile, shared: cfg.teamMode,
 })
 bot.attachTopics(topics)
 

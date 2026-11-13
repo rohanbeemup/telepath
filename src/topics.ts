@@ -69,6 +69,9 @@ export function isBusy(l: Live): boolean {
   return l.running
 }
 
+/** A turn with no result for this long, in a shared forum, is stuck: it may be paused for a new topic. */
+export const DEFAULT_STUCK_TURN_MS = 10 * 60_000
+
 export type Rotator = {
   enabled(): boolean
   active(): string | undefined
@@ -110,8 +113,15 @@ export type TopicDeps = {
    * binding from before the profile would hand a full session's transcript to the topic.
    */
   profileSessions?: boolean
-  /** Honour a binding's `closed` flag (team mode): no session opens there until an admin reopens it. Elsewhere the flag is written but ignored, so a single user's kept topic resumes on its next message. */
-  honourClosed?: boolean
+  /**
+   * The forum is shared (team mode): a binding's `closed` is honoured (no session opens there
+   * until an admin reopens it), and a colleague's running turn is never paused for a new
+   * topic unless it has run past stuckTurnMs. Elsewhere, as before: `closed` is written but
+   * ignored, and the longest-idle session, running or not, is paused for the new topic.
+   */
+  shared?: boolean
+  /** In a shared forum, a turn with no result for this long is stuck and may be paused for a new topic. */
+  stuckTurnMs?: number
 }
 
 export const CONTINUE_AFTER_LIMIT =
@@ -179,15 +189,25 @@ export class TopicManager {
   }
 
   /**
-   * Frees a slot for a new session by pausing the longest-idle one. A session mid-turn is
-   * never paused for another topic: in a shared forum that would let one member kill a
-   * colleague's turn by opening topics (security review). openRefusal() refuses the open
-   * while every slot is running, so a pause is always found here when one is needed.
+   * Whether a live session may be paused to free a slot. Where the forum is one person's,
+   * any session: the longest-idle one goes, running or not, as before. In a shared forum
+   * only an idle one, or a turn stuck past stuckTurnMs: pausing a colleague's running turn
+   * would let one member kill it by opening topics (security review), while a turn that
+   * never ends must not hold its slot forever (twelfth review).
+   */
+  private pausable(l: Live): boolean {
+    if (!this.d.shared || !isBusy(l)) return true
+    return this.now() - l.lastActive >= (this.d.stuckTurnMs ?? DEFAULT_STUCK_TURN_MS)
+  }
+
+  /**
+   * Frees a slot for a new session by pausing the longest-idle pausable one. openRefusal()
+   * refuses the open while nothing is pausable, so a pause is always found here when needed.
    */
   private enforceCap(): void {
     while (this.live.size >= this.d.maxLiveSessions) {
       let oldest: Live | undefined
-      for (const l of this.live.values()) if (!isBusy(l) && (!oldest || l.lastActive < oldest.lastActive)) oldest = l
+      for (const l of this.live.values()) if (this.pausable(l) && (!oldest || l.lastActive < oldest.lastActive)) oldest = l
       if (!oldest) break
       void this.d.say(oldest.topicId, `💤 Paused to free a slot (max ${this.d.maxLiveSessions} live sessions). Send a message here to resume — your context is kept.`)
       this.d.metrics.inc('sessions_evicted_cap')
@@ -197,16 +217,17 @@ export class TopicManager {
 
   /**
    * Why no session may open for this topic now, or undefined when one may: closed by an
-   * admin (honoured in team mode), its budget spent, or every slot running a turn. Read by
-   * sendToTopic for its notice and by ensureLive, so the two cannot disagree.
+   * admin (honoured in a shared forum), its budget spent, or every slot held by a running
+   * turn that may not be paused. Read by sendToTopic for its notice and by ensureLive, so
+   * the two cannot disagree.
    */
   openRefusal(topicId: string): 'closed' | 'budget' | 'busy' | undefined {
     const b = this.d.store.registry[topicId]
     if (!b) return undefined
-    if (b.closed && this.d.honourClosed) return 'closed' // ♻️ Reopen clears it
+    if (b.closed && this.d.shared) return 'closed' // ♻️ Reopen clears it
     const left = this.remainingBudget(b)
     if (left !== undefined && left <= 0) return 'budget'
-    if (!this.live.has(topicId) && this.live.size >= this.d.maxLiveSessions && ![...this.live.values()].some(l => !isBusy(l))) return 'busy'
+    if (!this.live.has(topicId) && this.live.size >= this.d.maxLiveSessions && ![...this.live.values()].some(l => this.pausable(l))) return 'busy'
     return undefined
   }
 
@@ -216,6 +237,13 @@ export class TopicManager {
     const b = this.d.store.registry[topicId]
     if (!b) return undefined
     if (this.openRefusal(topicId)) return undefined
+    if (b.closed) {
+      // Written by Close & keep in every mode and honoured only in a shared forum: cleared on
+      // the resume it does not block, so a later switch to team mode cannot lock a topic that
+      // has been in use all along (twelfth review).
+      delete b.closed
+      this.d.store.saveRegistry()
+    }
     // A stretch gets what is left of the topic's budget, so it cannot overshoot the cap by
     // a whole fresh budget.
     const budgetUsd = this.remainingBudget(b)
@@ -284,9 +312,17 @@ export class TopicManager {
     try {
       l.session.send(payload)
     } catch (e) {
-      // A stale handle slipped through: evict and open once more.
+      // A stale handle slipped through: evict and open once more, under the same refusals
+      // (the slot may be gone meanwhile), said the same way.
       this.d.log.warn('session.send_failed', { topic: topicId, error: e })
       this.live.delete(topicId)
+      const again = this.openRefusal(topicId)
+      if (again) {
+        if (opts.quiet) return false
+        this.d.metrics.inc(`${again}_refusals`)
+        await this.d.say(topicId, this.refusalNotice(again))
+        return true
+      }
       const l2 = this.ensureLive(topicId)
       if (!l2) return false
       l = l2
@@ -539,7 +575,8 @@ export class TopicManager {
     } catch (e) {
       this.d.metrics.inc('sdk_stream_errors')
       this.d.log.error('session.stream_error', { topic: topicId, error: e })
-      await this.d.say(topicId, `⚠️ session error: ${e instanceof Error ? e.message : String(e)}`)
+      // Under a profile the detail stays in the log: a spawn or transcript error names host paths.
+      await this.d.say(topicId, this.d.profileSessions ? '⚠️ session error; the operator has the detail. Send your message again in a moment.' : `⚠️ session error: ${e instanceof Error ? e.message : String(e)}`)
     } finally {
       // The stream ended (closed, crashed or completed): always terminate the process,
       // otherwise every resume spawns a fresh one while the old lingers.

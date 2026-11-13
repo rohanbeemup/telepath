@@ -1089,7 +1089,7 @@ export class TelegramBot {
       this.topics.userTookOver(topicId)
       this.topics.closeLive(topicId, 'closed & kept by user')
       if (b) {
-        b.closed = true // honoured in team mode only (TopicManager's honourClosed): no session opens here until an admin's ♻️ Reopen; a single user's kept topic resumes on its next message
+        b.closed = true // honoured in a shared forum only (TopicManager's `shared`): no session opens here until an admin's ♻️ Reopen; a single user's kept topic resumes on its next message, which clears it
         store.saveRegistry()
       }
       void this.status.drop(topicId)
@@ -1114,7 +1114,9 @@ export class TelegramBot {
       await ack()
       return this.paint(
         topicId,
-        '🗑 Delete this topic and forget its session here?\nThe transcript stays on disk and can be reopened later from 📋 My sessions or /attach. To remove everything, use 🧹 instead.',
+        this.d.profile
+          ? '🗑 Delete this topic and forget its session here?\nThe transcript stays on disk. To remove everything, use 🧹 instead.'
+          : '🗑 Delete this topic and forget its session here?\nThe transcript stays on disk and can be reopened later from 📋 My sessions or /attach. To remove everything, use 🧹 instead.',
         new InlineKeyboard().text('🗑 Yes, delete', 'm:tdelyes').text('↩️ Cancel', 'm:ctl'),
       )
     }

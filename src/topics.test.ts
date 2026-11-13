@@ -61,7 +61,7 @@ function fakeRotator(over: Partial<Rotator> = {}): Rotator & { handedOff: unknow
 
 type FakeRotator = ReturnType<typeof fakeRotator>
 
-function harness(over: { maxLive?: number; idleMinutes?: number; rotator?: FakeRotator; now?: () => number; resumeBufferMs?: number; primeContract?: boolean; budgetUsd?: number; profileSessions?: boolean; honourClosed?: boolean } = {}) {
+function harness(over: { maxLive?: number; idleMinutes?: number; rotator?: FakeRotator; now?: () => number; resumeBufferMs?: number; primeContract?: boolean; budgetUsd?: number; profileSessions?: boolean; shared?: boolean; stuckTurnMs?: number } = {}) {
   const store = new Store('/nowhere', {}, { defaultModel: 'claude-opus-5', defaultCwd: '/w' }, { defaultModel: 'claude-opus-5', defaultCwd: '/w' })
   // never touch disk in these tests
   store.saveRegistry = () => {}
@@ -90,7 +90,8 @@ function harness(over: { maxLive?: number; idleMinutes?: number; rotator?: FakeR
     primeContract: over.primeContract,
     budgetUsd: over.budgetUsd,
     profileSessions: over.profileSessions,
-    honourClosed: over.honourClosed,
+    shared: over.shared,
+    stuckTurnMs: over.stuckTurnMs,
   })
   const bind = (topicId: string, b: Partial<{ model: string; effort: 'low' | 'high' | 'max'; sessionId: string; auto: boolean }> = {}) => {
     store.registry[topicId] = { cwd: '/w', model: b.model ?? 'claude-opus-5', effort: b.effort, sessionId: b.sessionId, title: 't' + topicId, lastActive: 0, auto: b.auto }
@@ -121,8 +122,6 @@ describe('TopicManager', () => {
     h.bind('b')
     h.bind('c')
     await h.tm.sendToTopic('a', 'x')
-    h.backend.last().emit(result('sa')) // a's turn ends: idle, and the least recently active
-    await h.tick()
     t += 10
     await h.tm.sendToTopic('b', 'x')
     t += 10
@@ -134,9 +133,9 @@ describe('TopicManager', () => {
     expect(h.said.find(([topic, text]) => topic === 'a' && text.includes('Paused'))).toBeTruthy()
   })
 
-  test('a session mid-turn is never paused for another topic; when every slot is running the newcomer waits', async () => {
+  test('in a shared forum a running turn is paused for another topic only once it is stuck; until then the newcomer waits', async () => {
     let t = 1000
-    const h = harness({ maxLive: 2, now: () => t })
+    const h = harness({ maxLive: 2, now: () => t, shared: true, stuckTurnMs: 10 * 60_000 })
     h.bind('busy')
     h.bind('idle')
     h.bind('next')
@@ -162,6 +161,22 @@ describe('TopicManager', () => {
     expect(h.said.find(([topic, text]) => topic === 'busy' && text.includes('Paused'))).toBeFalsy()
     expect(await h.tm.sendToTopic('late', 'continue', { takeover: false, quiet: true })).toBe(false)
     expect(h.backend.opens.length).toBe(3)
+    // a turn with no result past the bound is stuck and pausable after all: three hung tools do not hold the forum
+    t += 10 * 60_000
+    expect(await h.tm.sendToTopic('late', 'and me')).toBe(true)
+    expect(h.tm.isLive('late')).toBe(true)
+    expect(h.tm.isLive('busy')).toBe(false) // the longest-running of the stuck turns
+    expect(h.tm.isLive('next')).toBe(true)
+    expect(h.said.find(([topic, text]) => topic === 'busy' && text.includes('Paused'))).toBeTruthy()
+    // where the forum is one person's, the longest-idle session is paused for the new topic, running or not, as before
+    const own = harness({ maxLive: 1 })
+    own.bind('p')
+    own.bind('q')
+    await own.tm.sendToTopic('p', 'long task')
+    expect(await own.tm.sendToTopic('q', 'switching')).toBe(true)
+    expect(own.tm.isLive('q')).toBe(true)
+    expect(own.tm.isLive('p')).toBe(false)
+    expect(own.said.find(([topic, text]) => topic === 'p' && text.includes('Paused'))).toBeTruthy()
   })
 
   test('evicts idle sessions and leaves a session mid-turn alone', async () => {
@@ -666,7 +681,7 @@ describe('a profile budget', () => {
 
 describe('an admin-closed topic', () => {
   test('a topic an admin closed opens no session until an admin reopens it', async () => {
-    const h = harness({ honourClosed: true })
+    const h = harness({ shared: true })
     h.bind('z')
     await h.tm.sendToTopic('z', 'before the close')
     expect(h.backend.opens.length).toBe(1)
@@ -677,13 +692,15 @@ describe('an admin-closed topic', () => {
     expect(h.backend.opens.length).toBe(1)
     expect(h.tm.ensureLive('z')).toBeUndefined()
     expect(h.said.find(([topic, text]) => topic === 'z' && /closed/i.test(text))).toBeTruthy()
-    // outside team mode the flag is written but not honoured: a single user's kept topic resumes on its next message
+    // outside a shared forum the flag is written but not honoured: a single user's kept topic resumes on its
+    // next message, which clears the flag, so a later switch to team mode cannot lock a topic in use
     const single = harness()
     single.bind('y')
     single.store.registry['y'].closed = true
     expect(await single.tm.sendToTopic('y', 'back again')).toBe(true)
     expect(single.backend.opens.length).toBe(1)
     expect(single.said.find(([topic, text]) => topic === 'y' && /closed/i.test(text))).toBeFalsy()
+    expect(single.store.registry['y'].closed).toBeFalsy()
     // a nudge into a closed topic posts nothing and reports undelivered
     const closedNotices = h.said.filter(([topic, text]) => topic === 'z' && /closed/i.test(text)).length
     expect(await h.tm.sendToTopic('z', 'continue', { takeover: false, quiet: true })).toBe(false)
@@ -730,5 +747,31 @@ describe('bindings from before the profile', () => {
     await priced.tick()
     expect(priced.store.registry['paid'].spentUsd).toBeCloseTo(1.4) // not 1.0: the old total is no baseline
     expect(priced.store.registry['paid'].reportedUsd).toBeCloseTo(1)
+    // a stream error under a profile is said without its detail: a spawn or transcript error names host paths
+    const failing = {
+      sent: [] as string[],
+      send() {},
+      close() {},
+      stream: () => ({
+        async *[Symbol.asyncIterator]() {
+          throw new Error('spawn /home/op/.bun/install/cache/cli.js ENOENT')
+        },
+      }),
+    }
+    const broken = harness({ profileSessions: true })
+    broken.backend.open = () => failing as unknown as LiveSession
+    broken.bind('err')
+    await broken.tm.sendToTopic('err', 'hello')
+    await broken.tick()
+    const said = broken.said.find(([topic, text]) => topic === 'err' && /session error/i.test(text))
+    expect(said).toBeTruthy()
+    expect(said![1]).not.toMatch(/ENOENT|\/home\//)
+    // and with its detail where the forum is one person's, as before
+    const own = harness()
+    own.backend.open = () => failing as unknown as LiveSession
+    own.bind('err')
+    await own.tm.sendToTopic('err', 'hello')
+    await own.tick()
+    expect(own.said.find(([topic, text]) => topic === 'err' && /ENOENT/.test(text))).toBeTruthy()
   })
 })

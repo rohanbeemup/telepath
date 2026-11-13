@@ -72,8 +72,9 @@ describe('what a member may do', () => {
       expect([a, profileLocked(a)]).toEqual([a, false])
     }
     // the sibling set: actions that would bind an old transcript, refused under a profile at the same gates
-    for (const a of ['/attach', 'm:resume', 'm:sess:abcd1234']) expect([a, profileFreshOnly(a)]).toEqual([a, true])
-    for (const a of ['/new', 'm:new', 'm:quick', 'm:list', 'm:newhere', 'chat', 'm:tm:opus', 'm:future']) expect([a, profileFreshOnly(a)]).toEqual([a, false])
+    // the list of the host's transcripts too: every pick on it is refused, so the screen would be dead and its titles are not the forum's to read
+    for (const a of ['/attach', 'm:resume', 'm:sess:abcd1234', '/list', 'm:list']) expect([a, profileFreshOnly(a)]).toEqual([a, true])
+    for (const a of ['/new', 'm:new', 'm:quick', 'm:newhere', 'chat', 'm:tm:opus', 'm:future']) expect([a, profileFreshOnly(a)]).toEqual([a, false])
   })
 
 })
