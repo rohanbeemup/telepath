@@ -956,7 +956,7 @@ export class TelegramBot {
 
   private async renderWizard(uid: string, topicId: string | undefined, page = 0): Promise<void> {
     const w = this.wizard.get(uid)
-    if (!w) return void this.paint(topicId, 'Expired — tap 🆕 again.', mainMenuKb())
+    if (!w) return void this.paint(topicId, 'Expired — tap 🆕 again.', mainMenuKb(this.kbMode()))
     switch (w.step) {
       case 'folder': {
         const buttons = w.folders.map((f, i) => ({ label: '📁 ' + basename(f), data: `m:nf:${i}` }))

@@ -34,7 +34,8 @@
   assistant. Under a profile there is no wizard, the pinned panel loses its model, effort
   and approvals buttons (`/auto` and those taps say so; typed `use` and `effort` go to the
   session as text), old sessions are not attached or resumed (a binding made before the
-  profile opens a fresh session), an inbound photo, file or video is answered with a notice
+  profile opens a fresh session; a seed request from the todo queue is refused and consumed,
+  said in the log), an inbound photo, file or video is answered with a notice
   rather than a host path, a turn or voice note that failed is said without the error
   detail (the log has it), and the budget is enforced per topic across idle stretches: the
   spend is accounted from the running total the SDK reports (increments over the last

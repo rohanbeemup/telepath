@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync, existsSync, readdirSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { drainSeedRequests, type SeedStore, type SeedRequest } from './seed'
+import { Logger } from './log'
 
 let dir: string
 let saves: number
@@ -70,5 +71,18 @@ describe('drainSeedRequests', () => {
     expect(drainSeedRequests(dir, store, () => 1)).toEqual([])
     expect(saves).toBe(0)
     expect(existsSync(join(dir, '1.json'))).toBe(false)
+  })
+
+  test('under a profile every request is refused and deleted, none bound, nothing saved', () => {
+    drop('1.json', good())
+    drop('2.json', good({ topicId: '777', sessionId: 'sess-def' }))
+    const lines: string[] = []
+    const log = new Logger({ level: 'info', sink: l => void lines.push(l) })
+    expect(drainSeedRequests(dir, store, () => 1, log, true)).toEqual([])
+    expect(store.registry).toEqual({}) // the profile owns every session: the run is not resumed
+    expect(saves).toBe(0)
+    expect(readdirSync(dir)).toEqual([]) // consumed, so each is said once and never loops
+    expect(lines.filter(l => l.includes('seed.refused')).length).toBe(2)
+    expect(lines.some(l => l.includes('seed.bound'))).toBe(false)
   })
 })

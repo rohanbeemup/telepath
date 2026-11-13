@@ -192,10 +192,11 @@ topics.adoptAll()
 setInterval(() => topics.evictIdle(), 60_000).unref()
 // A todo-queue run drops a seed-request per finished item; bind each to its session so it
 // can be continued by typing in the topic. Binding only (the topic already exists); paint controls.
+// Under a profile the requests are refused and consumed: the profile owns every session.
 const seedDir = join(stateDir, 'seed-requests')
 setInterval(() => {
   try {
-    for (const id of drainSeedRequests(seedDir, store, Date.now, log)) {
+    for (const id of drainSeedRequests(seedDir, store, Date.now, log, !!profile)) {
       metrics.inc('seed_bindings')
       void bot.postPinnedControls(id)
     }

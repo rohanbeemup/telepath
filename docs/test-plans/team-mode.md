@@ -10,6 +10,7 @@ suite:
   - src/throttle.test.ts
   - src/files.test.ts
   - src/ui/keyboards.test.ts
+  - src/seed.test.ts
 gate: bun test
 ---
 
@@ -100,7 +101,10 @@ nothing else. What was checked, against the code at `ca72e9f`:
   once per hang. It is not charged as the stretch's cap: that would close a topic for a
   tool's hang. The fifteenth round's claim that the remainder handed to a resumed stretch
   trips against the transcript's cumulative total is refuted by the same typings:
-  `maxBudgetUsd` counts the current `query()` only.
+  `maxBudgetUsd` counts the current `query()` only. The twenty-sixth read made the claim
+  again from the `maxBudgetUsd` comment alone ("maximum budget in USD for the query"), which
+  does not say either way; the `total_cost_usd` text in the same file does, and the Ring 2
+  run below includes a resumed stretch so the box shows it rather than the typings.
 - **No prompt can occur under a profile today**: `tools` cannot hold `AskUserQuestion`,
   `dontAsk` never prompts, and no `canUseTool` is passed. The tap policy for Allow/Deny and
   question buttons (second round) was removed in the fifth round as unreachable and put
@@ -151,6 +155,17 @@ directions and a paraphrase reads as a missing test.
 | `the team main menu offers only a new topic and help` | `mainMenuKb({ team: true })` has exactly those two buttons (status is the admins', typed); under a profile alone the menu drops the old sessions and the resume, which the gate would refuse (twenty-fourth review); the default menu is unchanged | The full menu in team mode: settings, the session list and the status screen reachable by every member; the session list offered under a profile, every tap on it refused |
 | `the team topic panel has no model, effort or auto buttons` | `topicControlsKb(catalog, b, { team: true })` and `topicControlsKb(catalog, b, { profile: true })` carry the feed toggle and the close, delete and wipe actions only; the panel text names neither model nor approvals; the default panel is unchanged; a closed binding's panel in team mode is the closed state (♻️ Reopen, delete, wipe; "Closed by an admin"), so the pinned panel is where the refusal says to reopen and a refresh keeps the button, while outside team mode the flag changes nothing on the panel (seventeenth review); the wrap-up confirmation in team mode offers "finish this turn first" and cancel only, since "at the next step" interrupts a colleague's turn and is an admin's (eighth security read) | The full panel in team mode: a tap switches the shared profile's model. The full panel in a single-user profile install: buttons that change what the panel shows and nothing the session does (Codex finding, 12 Nov 2026). The open panel painted over a closed topic's, so the only Reopen button vanishes on the next ⚙️ (seventeenth review); "at the next step" offered to members, every tap on it refused as "Admins only" |
 
+The seed-request suite (`src/seed.test.ts`, the todo queue's seam into the registry) predates
+this plan and was named by none; the twenty-sixth review added a case to it, so the six it
+had on main are listed here as they are, and the gate sees the suite from now on.
+
+| `binds a well-formed request as an attended session and deletes the file` | the binding carries the request's session id, cwd, model and title, `auto: false` (the continued run asks before tools) and `lastActive` from the clock; the file is consumed and the registry saved once | `auto: true`, so the continued run runs tools unasked; the file left, so the topic is rebound every five seconds |
+| `a malformed or incomplete file is skipped and deleted, never looping, and does not stop a good one` | a file that is not JSON, or lacks one of the five fields, binds nothing, is deleted, and the next file is still drained | a bad file left in place and warned about every five seconds for the process's life; the loop ended at the first bad file |
+| `a missing directory returns empty and does not throw` | no directory yet is nothing to do | the readdir error thrown, so the daemon's timer logs a failure every five seconds until the first run |
+| `is idempotent: a second drain finds nothing and does not save again` | a second drain of the emptied directory binds nothing and writes nothing | the registry saved on every drain, a write every five seconds |
+| `the last request for a topic wins (files drained in filename order)` | two requests for one topic, drained in filename order, leave the later file's session bound | files drained in readdir order, so an older request can overwrite a newer |
+| `does not save when nothing was bound` | a drain that consumed only bad files writes nothing | the registry saved unconditionally |
+
 ### Negative cases
 
 The rows above say what must happen. These say what must **not**: the refusals and the
@@ -167,6 +182,7 @@ caps a wrong implementation would happily allow.
 | `an allowed tool must name a declared MCP server or a kept built-in tool` | `allowedTools` entries are `mcp__<server>__<tool>` with `<server>` in `mcpServers`, or a name in `tools`; anything else is refused. The converse holds too: every name in `tools` is in `allowedTools`, or the profile is refused. `AskUserQuestion` is refused in `tools` outright: a profile session never prompts (`dontAsk` denies it, and an allowlisted tool is auto-approved before the question could be rendered), so the model would get an empty answer (review, 13 Nov). A pattern (`*`) in `allowedTools` is refused: the hook matches exact names, so a pattern would be accepted at boot and allow nothing at the first call (security review). An empty or absent `allowedTools` is refused too: with none, every call in every topic is denied while the boot looks fine (fourteenth review) | Any name accepted: a typo in the allowlist means a bot that denies every call and nobody knows why. A kept-but-unlisted built-in accepted: the model is shown a tool the hook denies on every call. `AskUserQuestion` accepted: question-less turns that look like a silent model. A pattern accepted: a bot that denies every call from its first tool use. An empty list accepted: the same bot, from a `[]` or a misspelt key |
 | `a profile's model must be one of the catalog's ids` | `profileModelProblem()` names a model that is not one of the ids it is given, and nothing for a known one or none set (the binding's default applies); the daemon hands it the install's enabled model ids (`ENABLED_MODELS` over `OPUS_MODEL` and friends), so a model the operator disabled is refused too (twentieth review), and refuses to boot on it, since a model name goes to the SDK as given and a typo would otherwise boot clean and end every topic's turns in an error said without its detail (sixteenth review) | Any string accepted: every member topic dead until the operator reads the journal; none set refused, so a profile that leaves the model to the install cannot boot |
 | `team mode refuses a profile without a budget` | `teamProfileProblems()` names `maxBudgetUsd` when the profile has none, `tools` when it keeps any built-in (every built-in reaches the host or the network from the box: a shell, the files with the `.env` among them, the web), and nothing otherwise; the daemon refuses to boot on it in team mode, as it does without a profile | No check: a shared forum runs with unbounded spend per topic while the docs promise a cap (review finding); a built-in kept in team mode, so every member has a shell or the host's files (eleventh review) |
+| `under a profile every request is refused and deleted, none bound, nothing saved` | with the daemon's `profile` flag, `drainSeedRequests()` binds no request, saves nothing, consumes every file and logs `seed.refused` with the topic and session id, never `seed.bound`: the profile owns every session's options, so `adopt()` would drop the run on the topic's first message anyway, and in a shared forum the run's transcript would sit bound to a member-visible topic until then (twenty-sixth review: the one path that still wrote a binding past the profile line) | The flag misread (`profile === undefined`), so the run is bound and silently dropped on first use (M165); the refused file left in place, so it is refused again every drain (M166); the refusal logged as `seed.bound`, so the operator reads a binding that never happened (M167) |
 
 ## Out of scope
 
@@ -389,7 +405,23 @@ caps a wrong implementation would happily allow.
   rename a colleague's; the default title and the help text come from one place each;
   Reopen writes only when there is a flag to clear; a topic Telegram would not delete is
   the admin's to delete by hand, said so. Accepted, recorded: a spoken "/new title" in a
-  fresh hand-made topic pays two openings; such a tombstone lasts the process.
+  fresh hand-made topic pays two openings; such a tombstone lasts the process. After the
+  twenty-sixth (the independent read of `bbdb6c2`): a seed request from the todo queue is
+  refused and consumed under a profile, the one path that still wrote a binding past the
+  profile line (`adopt()` then dropped the run on the topic's first message, and in a shared
+  forum the run's transcript sat bound to a member-visible topic until then); the
+  wizard-expired repaint builds the menu for the mode, the last keyboard call outside
+  `kbMode()`; the seed suite is named by this plan from now on, with its six cases from
+  main. Refuted: the remainder handed to a resumed stretch trips against the cumulative
+  total (the read quoted the `maxBudgetUsd` comment alone; the `total_cost_usd` text in the
+  same file says the cap counts this `query()` only, and Ring 2 now runs the resumed stretch
+  so the box shows it); a voice note charged two refusal notices (the refusal before the
+  download returns on a refusal, so the check after the transcription, there for a budget
+  spent between the two, is the first notice for that message or none). Accepted, recorded:
+  a profile that sets `systemPrompt` to an empty string beside `systemPromptFile` is refused
+  at boot with both keys named, since one is the prompt and the other a leftover. Follow-ups,
+  not defects: the budget notice's three wordings (`refusalNotice`, `resumeWith`, the turn
+  error) become one constant; the voice path's refusal points fold into `sendToTopic`'s own.
 - **The membership lookup runs on the update loop.** grammY handles updates one at a time,
   and `admit()` asks the forum before a message is queued, so a cache miss costs every
   topic that lookup (bounded at five seconds, deduplicated per sender). Moving it into the
@@ -405,6 +437,8 @@ caps a wrong implementation would happily allow.
 Ring 1 (`bun test`, `bun run typecheck`) on its own. Ring 2 is a run on a host with a
 second Telegram account in a test forum: the second account chats in a fresh topic and is
 answered; its taps on delete, wipe and model are refused; the activity feed shows only
-`mcp__*` calls; a topic whose budget is spent ends with `error_max_budget_usd`; a DM to
+`mcp__*` calls; a topic whose budget is spent ends with `error_max_budget_usd`; a topic
+that spent part of its budget, was idle-evicted and resumed, still answers (the remainder
+is the stretch's own cap) and ends only once the remainder is spent; a DM to
 the bot gets nothing; and, on a host with no `claude login`, the sessions run on the
 `ANTHROPIC_API_KEY` from `.env`.

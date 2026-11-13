@@ -48,8 +48,13 @@ function parse(raw: string): SeedRequest | undefined {
  * topic wins. Each file is deleted after it is read — valid or not — so a malformed one is
  * logged once and never loops. Returns the topic ids newly bound, for the caller to paint
  * controls into. The registry is saved once, only when something was bound.
+ *
+ * Under a session profile (`profile`) every request is refused, said once in the log and
+ * consumed: the profile owns every session's options, so the run's transcript would be
+ * dropped on the topic's first message anyway, and in a shared forum it would sit bound
+ * to a member-visible topic until then.
  */
-export function drainSeedRequests(dir: string, store: SeedStore, now: () => number, log?: Logger): string[] {
+export function drainSeedRequests(dir: string, store: SeedStore, now: () => number, log?: Logger, profile = false): string[] {
   let names: string[]
   try {
     names = readdirSync(dir).filter(n => n.endsWith('.json')).sort()
@@ -66,13 +71,15 @@ export function drainSeedRequests(dir: string, store: SeedStore, now: () => numb
       continue // vanished between listing and read
     }
     const req = parse(raw)
-    if (req) {
+    if (!req) {
+      log?.warn('seed.malformed', { file: name })
+    } else if (profile) {
+      log?.warn('seed.refused', { topic: req.topicId, sessionId: req.sessionId, reason: 'a session profile owns every session; the run is not resumed' })
+    } else {
       const b: Binding = { sessionId: req.sessionId, cwd: req.cwd, model: req.model, title: req.title, lastActive: now(), auto: false }
       store.registry[req.topicId] = b
       bound.push(req.topicId)
       log?.info('seed.bound', { topic: req.topicId, sessionId: req.sessionId, cwd: req.cwd })
-    } else {
-      log?.warn('seed.malformed', { file: name })
     }
     try {
       unlinkSync(path)
