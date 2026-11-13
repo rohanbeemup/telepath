@@ -328,6 +328,8 @@ export class TopicManager {
     b.profile = underProfile
     if (underProfile) b.profileName = this.d.profileName
     else delete b.profileName
+    // The spend stays: it is the topic's, whichever cap was current when it was made (tenth review),
+    // so a lowered cap closes a topic over it, by design (thirty-fifth review, refuted).
     delete b.handoff
     b.auto = false
     // Its model and effort were never checked against the profile or the enabled catalog (a model

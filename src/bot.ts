@@ -242,6 +242,17 @@ export class TelegramBot {
    * forge: callback data sent against another message (the pinned panel, a colleague's
    * notice) paints nothing over it (security read).
    */
+  /**
+   * Whether the tapped message's own keyboard holds this data. A forged tap (any client can name
+   * any message id) or a stale one names a message that does not; an inaccessible message (too old
+   * for Telegram to hand over) has no keyboard to check, so it reads as not held.
+   */
+  private tappedHolds(ctx: Context, data: string): boolean {
+    const m = ctx.callbackQuery?.message
+    const keyboard = m && 'reply_markup' in m ? m.reply_markup?.inline_keyboard : undefined
+    return !!keyboard?.some(row => row.some(btn => 'callback_data' in btn && btn.callback_data === data))
+  }
+
   private async paint(topicId: string | undefined, text: string, kb?: InlineKeyboard): Promise<void> {
     const q = this.menuCtx?.callbackQuery
     const m = q?.message
@@ -251,7 +262,7 @@ export class TelegramBot {
     // In a shared forum only the tapped message's own button is edited (a forged or stale tap is
     // not); for one user any tapped message is, as on main, so a quick second tap edits in place
     // rather than posting a second screen (twenty-third review).
-    const tapped = this.d.cfg.teamMode ? !!keyboard?.some(row => row.some(btn => 'callback_data' in btn && btn.callback_data === q?.data)) : !!m
+    const tapped = this.d.cfg.teamMode ? !!this.menuCtx && q?.data !== undefined && this.tappedHolds(this.menuCtx, q.data) : !!m
     if (tapped) {
       try {
         await this.menuCtx!.editMessageText(text, { reply_markup: kb })
@@ -1078,8 +1089,9 @@ export class TelegramBot {
     if (data === 'm:ctl') {
       if (this.muted(topicId, 'menu', this.senderId(ctx))) return void ack('Try again in a moment')
       const shown = await this.controlsOrMenu(topicId)
-      // A panel already current edits to nothing: say where it is, or the tap looks dead.
-      return void ack(shown === 'unchanged' ? '⚙️ The controls are pinned at the top of this topic' : undefined)
+      // A panel edited in place, or already current, changes nothing where the tap was: say where
+      // it is, or the tap looks dead (thirty-fifth review: the edited case toasted nothing).
+      return void ack(shown === 'unchanged' ? '⚙️ The controls are pinned at the top of this topic' : shown === 'edited' ? '⚙️ The controls are pinned at the top of this topic, refreshed' : undefined)
     }
 
     // Settings
@@ -1218,8 +1230,10 @@ export class TelegramBot {
         // A tap on an unpinned copy (posted when the pinned one could not be edited, or by /menu) edits
         // that copy too, so its button does not read the old state and flip it back on the next tap
         // (thirtieth review).
+        // Only when that copy's own keyboard holds the button: a forged tap names any message in the
+        // forum, and editing it would replace a colleague's answer with the panel (thirty-fifth review).
         const tappedId = ctx.callbackQuery?.message?.message_id
-        if (tappedId !== undefined && tappedId !== b.controlMsgId) {
+        if (tappedId !== undefined && tappedId !== b.controlMsgId && this.tappedHolds(ctx, 'm:tf')) {
           const p = this.panel(b)
           await ctx.editMessageText(p.text, { reply_markup: p.kb }).catch(() => {})
         }

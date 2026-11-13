@@ -266,10 +266,21 @@ try {
     // and topics are created with Manage Topics. Refused, not warned (twenty-eighth review): the forum
     // would run with fewer limits than asked, as with a profile problem, and the fix is one Telegram
     // setting. A lookup that fails is a precondition not read, refused too (thirty-first review): a
-    // boot that went on would run with exactly the two gaps the check exists to refuse, and the
-    // service restarts it.
+    // boot that went on would run with exactly the two gaps the check exists to refuse. Retried in
+    // process first (thirty-fifth review): a transient failure that exits at once would exhaust the
+    // service's start limit and leave the bot down until a person resets it.
     try {
-      const self = await bot.bot.api.getChatMember(cfg.forumChatId, me.id)
+      const self = await (async () => {
+        for (let attempt = 1; ; attempt++) {
+          try {
+            return await bot.bot.api.getChatMember(cfg.forumChatId, me.id)
+          } catch (e) {
+            if (attempt >= 6) throw e
+            log.warn('preflight.bot_membership_retry', { attempt, error: e instanceof Error ? e.message : String(e) })
+            await new Promise(r => setTimeout(r, 10_000))
+          }
+        }
+      })()
       if (self.status !== 'administrator' && self.status !== 'creator') {
         process.stderr.write(`team mode: the bot is "${self.status}" in ${cfg.forumChatId}, not an admin. Make it an admin of the forum with Manage Topics: topics are created with it, and chat_member updates, which end a removed member's cached access early, reach admin bots only.\n`)
         process.exit(2)
@@ -282,7 +293,7 @@ try {
         process.exit(2)
       }
     } catch (e) {
-      process.stderr.write(`team mode: could not read the bot's membership of ${cfg.forumChatId} (${e instanceof Error ? e.message : String(e)}); the admin check is not skipped. Start again once Telegram answers.\n`)
+      process.stderr.write(`team mode: could not read the bot's membership of ${cfg.forumChatId} in six tries over a minute (${e instanceof Error ? e.message : String(e)}); the admin check is not skipped. Start again once Telegram answers.\n`)
       process.exit(2)
     }
   }
