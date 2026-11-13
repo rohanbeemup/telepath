@@ -854,7 +854,9 @@ export class TelegramBot {
    * runs outside the update loop and the shared menu context may be another member's.
    */
   private async createProfileTopic(ctx: Context, title: string, intoTopic: string | undefined, via: 'tap' | 'text'): Promise<void> {
-    const tell = (text: string, kb?: InlineKeyboard): Promise<void> => (via === 'tap' ? this.paint(intoTopic, text, kb) : this.send(intoTopic, text, kb))
+    // A tap's receipt edits the tapped menu for one user, as on main; in team mode that menu is a shared
+    // screen (General's, or a topic's), so the receipt goes out fresh and the menu stays (twenty-eighth review).
+    const tell = (text: string, kb?: InlineKeyboard): Promise<void> => (via === 'tap' && !this.d.cfg.teamMode ? this.paint(intoTopic, text, kb) : this.send(intoTopic, text, kb))
     // A creation Telegram refuses is refunded, so the daily allowance does not bound the attempts
     // while creation fails: a member's own creation allowance does (fourth security read), apart
     // from the reply allowance so that ten replies do not cost a topic; admins are exempt, as from

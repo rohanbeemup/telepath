@@ -18,9 +18,11 @@
   plus `ADMIN_USER_IDS` (numeric ids; an allowlist of member actions in `src/access.ts`, so
   an action it has not heard of is an admin's); a closed topic opens no session for anyone
   until an admin reopens it. General is the members' own: commands are answered there,
-  chatter and media are not. The published menu is `new` and `menu`; `/status` in team mode
+  chatter and media are not. The published menu is `new`, `menu` and `help`; `/status` in team mode
   is a reduced screen (counts, uptime, the profile's name) safe wherever it is shown.
-  Team mode requires `PROFILE_FILE`, a locked session profile (`src/profile.ts`,
+  Team mode requires the bot to be an admin of the forum (the boot refuses otherwise: topics are
+  created with Manage Topics, and the forum's membership changes reach admin bots only) and
+  `PROFILE_FILE`, a locked session profile (`src/profile.ts`,
   `profile.example.json`): one set of MCP servers and nothing from the machine's own MCP
   config, an explicit tool allowlist (exact names, no patterns) with everything else denied
   and never prompted (`permissionMode: dontAsk` plus a PreToolUse hook of the profile's own,
@@ -36,8 +38,8 @@
   assistant. Under a profile there is no wizard, the pinned panel loses its model, effort
   and approvals buttons (`/auto` and those taps say so; typed `use` and `effort` go to the
   session as text), old sessions are not attached or resumed (a binding made before the
-  profile opens a fresh session; a seed request from the todo queue is refused and consumed,
-  said in the log), an inbound photo, file or video is answered with a notice
+  profile opens a fresh session; a seed request from the todo queue is refused and set aside
+  under `seed-requests/refused/`, said in the log), an inbound photo, file or video is answered with a notice
   rather than a host path, a turn or voice note that failed is said without the error
   detail (the log has it), and the budget is enforced per topic across idle stretches: the
   spend is accounted from the running total the SDK reports (increments over the last

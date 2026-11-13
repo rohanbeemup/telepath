@@ -73,7 +73,7 @@ describe('drainSeedRequests', () => {
     expect(existsSync(join(dir, '1.json'))).toBe(false)
   })
 
-  test('under a profile every request is refused and deleted, none bound, nothing saved', () => {
+  test('under a profile every request is refused and set aside, none bound, nothing saved', () => {
     drop('1.json', good())
     drop('2.json', good({ topicId: '777', sessionId: 'sess-def' }))
     const lines: string[] = []
@@ -81,8 +81,32 @@ describe('drainSeedRequests', () => {
     expect(drainSeedRequests(dir, store, () => 1, log, true)).toEqual([])
     expect(store.registry).toEqual({}) // the profile owns every session: the run is not resumed
     expect(saves).toBe(0)
-    expect(readdirSync(dir)).toEqual([]) // consumed, so each is said once and never loops
+    // set aside, not deleted: the request is valid, and a later run without the profile can still serve it by hand
+    expect(readdirSync(dir)).toEqual(['refused'])
+    expect(readdirSync(join(dir, 'refused')).sort()).toEqual(['1.json', '2.json'])
     expect(lines.filter(l => l.includes('seed.refused')).length).toBe(2)
     expect(lines.some(l => l.includes('seed.bound'))).toBe(false)
+    expect(drainSeedRequests(dir, store, () => 1, log, true)).toEqual([]) // said once: a second drain finds nothing
+    expect(lines.filter(l => l.includes('seed.refused')).length).toBe(2)
+    // a later request with a name already set aside does not overwrite it: both are kept (Codex hook)
+    drop('1.json', good({ sessionId: 'sess-ghi' }))
+    expect(drainSeedRequests(dir, store, () => 1, log, true)).toEqual([])
+    expect(readdirSync(dir)).toEqual(['refused'])
+    expect(readdirSync(join(dir, 'refused')).length).toBe(3)
+  })
+
+  test('under a profile a request that cannot be set aside stays where it is, said once', () => {
+    writeFileSync(join(dir, 'refused'), 'not a directory') // the archive cannot be made
+    drop('1.json', good())
+    const lines: string[] = []
+    const log = new Logger({ level: 'info', sink: l => void lines.push(l) })
+    expect(drainSeedRequests(dir, store, () => 1, log, true)).toEqual([])
+    expect(store.registry).toEqual({})
+    // kept: an archival failure must not lose a valid request (Codex hook, twenty-eighth round)
+    expect(readdirSync(dir).sort()).toEqual(['1.json', 'refused'])
+    expect(lines.filter(l => l.includes('seed.refused')).length).toBe(1)
+    expect(drainSeedRequests(dir, store, () => 1, log, true)).toEqual([])
+    expect(readdirSync(dir).sort()).toEqual(['1.json', 'refused'])
+    expect(lines.filter(l => l.includes('seed.refused')).length).toBe(1) // said once per process, not every drain
   })
 })

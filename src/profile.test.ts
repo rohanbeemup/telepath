@@ -174,6 +174,17 @@ describe('a profile is refused when', () => {
     // and at least one: with none, every call in every topic is denied while the boot looks fine
     expect(() => parseProfile(raw({ allowedTools: [] }), source())).toThrow(/at least one/)
     expect(() => parseProfile(raw({ allowedTools: undefined }), source())).toThrow(/at least one/)
+    // a list that is not all strings is one mistake, said once; a list of blanks is a list of none (twenty-eighth review)
+    let shape: unknown
+    try {
+      parseProfile(raw({ allowedTools: ['mcp__kb__search', 1] }), source())
+    } catch (e) {
+      shape = e
+    }
+    const shapeMsg = String((shape as Error).message)
+    expect(shapeMsg).toContain('list of strings')
+    expect(shapeMsg).not.toContain('at least one')
+    expect(() => parseProfile(raw({ allowedTools: ['  '] }), source())).toThrow(/at least one/)
     // the converse: a kept built-in that is not allowed is a tool the hook would deny on every call
     expect(() => parseProfile(raw({ tools: ['Read'] }), source())).toThrow(ProfileError)
     // a question tool can never prompt in a profile session, so it is refused outright

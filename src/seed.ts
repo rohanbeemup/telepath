@@ -12,7 +12,7 @@
  * it at finish, never at start), so telepath never opens a second process on a transcript the
  * headless run is still writing.
  */
-import { readdirSync, readFileSync, unlinkSync } from 'fs'
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync } from 'fs'
 import { join } from 'path'
 import type { Binding, Registry } from './state'
 import type { Logger } from './log'
@@ -29,6 +29,30 @@ export type SeedRequest = {
 }
 
 const REQUIRED: (keyof SeedRequest)[] = ['topicId', 'sessionId', 'cwd', 'model', 'title']
+
+/**
+ * Refused requests that could not be set aside and were said: a file that stays is said once per
+ * process rather than every drain (a restart says it again, once).
+ */
+const saidStuck = new Set<string>()
+
+/**
+ * Move a refused request under `refused/` beside the others, under a name not already there (a
+ * later request that reuses a filename must not land on an earlier one; Codex hook); where it
+ * went, or undefined when it could not be moved.
+ */
+function setAside(dir: string, name: string, path: string): string | undefined {
+  const aside = join(dir, 'refused')
+  try {
+    mkdirSync(aside, { recursive: true })
+    let to = join(aside, name)
+    for (let n = 1; existsSync(to); n++) to = join(aside, `${n}-${name}`)
+    renameSync(path, to)
+    return to
+  } catch {
+    return undefined
+  }
+}
 
 function parse(raw: string): SeedRequest | undefined {
   let obj: unknown
@@ -50,9 +74,10 @@ function parse(raw: string): SeedRequest | undefined {
  * controls into. The registry is saved once, only when something was bound.
  *
  * Under a session profile (`profile`) every request is refused, said once in the log and
- * consumed: the profile owns every session's options, so the run's transcript would be
- * dropped on the topic's first message anyway, and in a shared forum it would sit bound
- * to a member-visible topic until then.
+ * set aside under `refused/` (it is valid, so a later run without the profile can still
+ * serve it by hand): the profile owns every session's options, so the run's transcript
+ * would be dropped on the topic's first message anyway, and in a shared forum it would
+ * sit bound to a member-visible topic until then.
  */
 export function drainSeedRequests(dir: string, store: SeedStore, now: () => number, log?: Logger, profile = false): string[] {
   let names: string[]
@@ -74,7 +99,15 @@ export function drainSeedRequests(dir: string, store: SeedStore, now: () => numb
     if (!req) {
       log?.warn('seed.malformed', { file: name })
     } else if (profile) {
-      log?.warn('seed.refused', { topic: req.topicId, sessionId: req.sessionId, reason: 'a session profile owns every session; the run is not resumed' })
+      const keptAt = setAside(dir, name, path)
+      const reason = 'a session profile owns every session; the run is not resumed'
+      if (keptAt) log?.warn('seed.refused', { topic: req.topicId, sessionId: req.sessionId, keptAt, reason })
+      else if (!saidStuck.has(path)) {
+        // Never deleted: the request is valid, and an archival failure must not lose it (Codex hook).
+        saidStuck.add(path)
+        log?.warn('seed.refused', { topic: req.topicId, sessionId: req.sessionId, keptAt: path, reason, note: 'could not be moved under refused/; left where it is' })
+      }
+      continue
     } else {
       const b: Binding = { sessionId: req.sessionId, cwd: req.cwd, model: req.model, title: req.title, lastActive: now(), auto: false }
       store.registry[req.topicId] = b

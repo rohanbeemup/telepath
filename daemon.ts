@@ -253,22 +253,27 @@ process.on('SIGTERM', () => shutdown('SIGTERM'))
 try {
   const me = await bot.bot.api.getMe()
   if (cfg.teamMode) {
-    // chat_member updates reach admins only; without them a removed member keeps access until the TTL.
+    // chat_member updates reach admins only; without them a removed member keeps access until the TTL,
+    // and topics are created with Manage Topics. Refused, not warned (twenty-eighth review): the forum
+    // would run with fewer limits than asked, as with a profile problem, and the fix is one Telegram
+    // setting. A lookup that fails is unknown, not a no: the boot goes on, said.
     try {
       const self = await bot.bot.api.getChatMember(cfg.forumChatId, me.id)
       if (self.status !== 'administrator' && self.status !== 'creator') {
-        log.warn('preflight.bot_not_admin', { status: self.status, hint: 'make the bot an admin of the forum (Manage Topics), so membership changes reach it' })
+        process.stderr.write(`team mode: the bot is "${self.status}" in ${cfg.forumChatId}, not an admin. Make it an admin of the forum with Manage Topics: topics are created with it, and chat_member updates, which end a removed member's cached access early, reach admin bots only.\n`)
+        process.exit(2)
       }
     } catch (e) {
       log.warn('preflight.bot_membership_unknown', { error: e })
     }
   }
   // The published menu reads the one command table (src/commands.ts), like the gate and the
-  // handler. In team mode everyone sees new and menu, and /status, an admin's, is in no menu:
-  // Telegram's administrators are not ADMIN_USER_IDS, so a scope for them would offer some a
-  // command that refuses them and hide it from others. Admins have it from the README.
+  // handler. In team mode everyone sees new, menu and help (the member actions with a typed form),
+  // and /status, an admin's, is in no menu: Telegram's administrators are not ADMIN_USER_IDS, so a
+  // scope for them would offer some a command that refuses them and hide it from others. Admins
+  // have it from the README.
   const publish = (names: string[]) => names.map(command => ({ command, description: COMMANDS[command] }))
-  await bot.bot.api.setMyCommands(publish(cfg.teamMode ? ['new', 'menu'] : ['menu', 'status']))
+  await bot.bot.api.setMyCommands(publish(cfg.teamMode ? ['new', 'menu', 'help'] : ['menu', 'status']))
   log.info('telepath.up', {
     version: VERSION,
     sdk: SDK_VERSION,

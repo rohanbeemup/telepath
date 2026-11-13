@@ -182,7 +182,8 @@ caps a wrong implementation would happily allow.
 | `an allowed tool must name a declared MCP server or a kept built-in tool` | `allowedTools` entries are `mcp__<server>__<tool>` with `<server>` in `mcpServers`, or a name in `tools`; anything else is refused. The converse holds too: every name in `tools` is in `allowedTools`, or the profile is refused. `AskUserQuestion` is refused in `tools` outright: a profile session never prompts (`dontAsk` denies it, and an allowlisted tool is auto-approved before the question could be rendered), so the model would get an empty answer (review, 13 Nov). A pattern (`*`) in `allowedTools` is refused: the hook matches exact names, so a pattern would be accepted at boot and allow nothing at the first call (security review). An empty or absent `allowedTools` is refused too: with none, every call in every topic is denied while the boot looks fine (fourteenth review) | Any name accepted: a typo in the allowlist means a bot that denies every call and nobody knows why. A kept-but-unlisted built-in accepted: the model is shown a tool the hook denies on every call. `AskUserQuestion` accepted: question-less turns that look like a silent model. A pattern accepted: a bot that denies every call from its first tool use. An empty list accepted: the same bot, from a `[]` or a misspelt key |
 | `a profile's model must be one of the catalog's ids` | `profileModelProblem()` names a model that is not one of the ids it is given, and nothing for a known one or none set (the binding's default applies); the daemon hands it the install's enabled model ids (`ENABLED_MODELS` over `OPUS_MODEL` and friends), so a model the operator disabled is refused too (twentieth review), and refuses to boot on it, since a model name goes to the SDK as given and a typo would otherwise boot clean and end every topic's turns in an error said without its detail (sixteenth review) | Any string accepted: every member topic dead until the operator reads the journal; none set refused, so a profile that leaves the model to the install cannot boot |
 | `team mode refuses a profile without a budget` | `teamProfileProblems()` names `maxBudgetUsd` when the profile has none, `tools` when it keeps any built-in (every built-in reaches the host or the network from the box: a shell, the files with the `.env` among them, the web), and nothing otherwise; the daemon refuses to boot on it in team mode, as it does without a profile | No check: a shared forum runs with unbounded spend per topic while the docs promise a cap (review finding); a built-in kept in team mode, so every member has a shell or the host's files (eleventh review) |
-| `under a profile every request is refused and deleted, none bound, nothing saved` | with the daemon's `profile` flag, `drainSeedRequests()` binds no request, saves nothing, consumes every file and logs `seed.refused` with the topic and session id, never `seed.bound`: the profile owns every session's options, so `adopt()` would drop the run on the topic's first message anyway, and in a shared forum the run's transcript would sit bound to a member-visible topic until then (twenty-sixth review: the one path that still wrote a binding past the profile line) | The flag misread (`profile === undefined`), so the run is bound and silently dropped on first use (M165); the refused file left in place, so it is refused again every drain (M166); the refusal logged as `seed.bound`, so the operator reads a binding that never happened (M167) |
+| `under a profile every request is refused and set aside, none bound, nothing saved` | with the daemon's `profile` flag, `drainSeedRequests()` binds no request, saves nothing, moves every file under `refused/` beside the others, under a name not already there (never deleted, never overwritten: the request is valid, and a later run without the profile can still serve it by hand; twenty-eighth review, Codex hook), so a second drain finds nothing, and logs `seed.refused` with the topic, the session id and where the file went, never `seed.bound`: the profile owns every session's options, so `adopt()` would drop the run on the topic's first message anyway, and in a shared forum the run's transcript would sit bound to a member-visible topic until then (twenty-sixth review: the one path that still wrote a binding past the profile line) | The flag misread (`profile === undefined`), so the run is bound and silently dropped on first use (M165); the refused file left in place, so it is refused again every drain (M166); the refusal logged as `seed.bound`, so the operator reads a binding that never happened (M167); the refused file deleted, so a valid request is lost to a later run without the profile (M172, twenty-eighth review); a later request with a name already set aside moved over it, so archiving one deletes the other (M177, Codex hook) |
+| `under a profile a request that cannot be set aside stays where it is, said once` | when `refused/` cannot be made or the file cannot be moved there, the request stays in the directory, nothing is bound, and it is logged `seed.refused` once per process, not on every drain (the names said are kept in memory, so a restart says it again once) | The request deleted when it cannot be moved, so an archival failure loses a valid request (M175, Codex hook, twenty-eighth round); said on every drain, a warning every five seconds for as long as it stays (M176) |
 
 ## Out of scope
 
@@ -208,8 +209,11 @@ caps a wrong implementation would happily allow.
   forwarded voice note in a fresh team topic binds the topic like typed text does and a
   failed send is said; the membership lookup is capped at five seconds (an `AbortSignal`
   on the API call), so one slow API answer cannot hold every topic's updates; ♻️ Reopen
-  reports when no session could open; the boot warns when the bot is not an admin of the
-  forum, since `chat_member` updates reach admins only. After the third round (13 Nov): a
+  reports when no session could open; the boot refuses team mode when the forum reports the
+  bot as not an admin (a warning at first; the twenty-eighth review made it the refusal a
+  profile problem gets, since the forum would otherwise run with fewer limits than asked),
+  because `chat_member` updates reach admins only and topics are created with Manage Topics,
+  while a lookup that fails is unknown, not a no, and only warns. After the third round (13 Nov): a
   topic binds without spawning a session (the first message opens it, so ten taps on 🆕
   cost ten topics and no processes); ⚙️ Controls refreshes the pinned panel itself (an edit
   of the pinned message, never a re-post, never the notice the button sat on), and 🆕 in a
@@ -440,7 +444,26 @@ caps a wrong implementation would happily allow.
   not); the membership lookup on the update loop, a stranger's "no" cached thirty seconds,
   as recorded below (the forum is private, so a stranger cannot post; the short cache is
   deliberate, so a member added a moment ago is admitted even when the join update is
-  missed).
+  missed). After the twenty-eighth (the independent read of `48a355d`): a member's 🆕 tap
+  in team mode gets its receipt as a fresh message, since the tapped menu is a shared
+  screen (painting it into one member's receipt took the menu from everyone, and `/menu`
+  to restore it is one reply a minute per topic); `/help` is in the published team menu,
+  being a member action and the one typed route to the team help; the boot refuses team
+  mode when the forum reports the bot as not an admin (above); a wrongly typed
+  `allowedTools` is one line, and a list of blanks is a list of none; a refused seed
+  request is set aside under `refused/`, not deleted, since it is valid and a later run
+  without the profile can still serve it by hand, and one that cannot be moved stays where
+  it is, said once per process (Codex hook: an archival failure must not lose it; the
+  first form deleted it to be said once). Accepted, recorded: a tool call longer
+  than the stuck bound is cut (the twenty-second's trade-off: the operator sets the bound
+  above the slowest tool; a hook bump that tells a slow tool from a hung process is a
+  follow-up); the profile file is kept at mode 600 on every boot, as `.env` is on main and
+  the README says; the transcriber's environment loses the two secrets the daemon knows by
+  name, as a child session loses the bot token on main, since an allowlist would cut the
+  operator's own environment (model caches, CUDA) from under a transcriber. Follow-up, not
+  a defect: the refusal asked twice per message (`refuseNow` in the bot, `openFor` in the
+  manager) and its three wrappers fold into one once `sendToTopic` returns the refusal to
+  its caller.
 - **The membership lookup runs on the update loop.** grammY handles updates one at a time,
   and `admit()` asks the forum before a message is queued, so a cache miss costs every
   topic that lookup (bounded at five seconds, deduplicated per sender). Moving it into the
