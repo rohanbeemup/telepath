@@ -596,6 +596,19 @@ describe('a profile budget', () => {
     const notices = h.said.filter(([topic, text]) => topic === 'b' && /budget/i.test(text)).length
     expect(await h.tm.sendToTopic('b', 'continue', { takeover: false, quiet: true })).toBe(false)
     expect(h.said.filter(([topic, text]) => topic === 'b' && /budget/i.test(text)).length).toBe(notices)
+    // a topic whose budget was spent by the time a rate limit resets is not told "resuming" and then
+    // left hanging: the nudge decides, and an undelivered one says why
+    const priced = harness({ resumeBufferMs: 0, budgetUsd: 1 })
+    priced.bind('3')
+    await priced.tm.sendToTopic('3', 'x')
+    const s3 = priced.backend.last()
+    s3.emit({ type: 'rate_limit_event', rate_limit_info: { status: 'rejected', resetsAt: Date.now() + 20 } })
+    s3.emit({ ...result('s3'), total_cost_usd: 1 }) // the limited turn's result lands the topic on its cap
+    await priced.tick()
+    await new Promise(r => setTimeout(r, 80))
+    expect(priced.said.some(([t, text]) => t === '3' && text.startsWith('▶️'))).toBe(false)
+    expect(priced.said.some(([t, text]) => t === '3' && /not resumed.*budget/i.test(text))).toBe(true)
+    expect(s3.sent.some(m => m.includes('has reset'))).toBe(false)
     // a stretch that failed for another reason still spent what it reports
     h.bind('d')
     await h.tm.sendToTopic('d', 'hello')
@@ -667,5 +680,15 @@ describe('bindings from before the profile', () => {
     plain.bind('p', { sessionId: 'any-session' })
     await plain.tm.sendToTopic('p', 'hello')
     expect(plain.backend.opens[0].resume).toBe('any-session')
+    // with a budget, the dropped transcript's baseline goes with it: the fresh session's first
+    // result is this turn alone and counts whole, not as an increment over the old total
+    const priced = harness({ profileSessions: true, budgetUsd: 10 })
+    priced.bind('paid', { sessionId: 'full-session-2' })
+    Object.assign(priced.store.registry['paid'], { spentUsd: 0.4, reportedUsd: 0.4 })
+    await priced.tm.sendToTopic('paid', 'hello')
+    priced.backend.last().emit({ ...result('fresh-2'), total_cost_usd: 1 })
+    await priced.tick()
+    expect(priced.store.registry['paid'].spentUsd).toBeCloseTo(1.4) // not 1.0: the old total is no baseline
+    expect(priced.store.registry['paid'].reportedUsd).toBeCloseTo(1)
   })
 })

@@ -70,7 +70,7 @@ type Pending = { resolve: (r: PermissionResult) => void; topicId: string; messag
 type AskBtn = { topicId: string; multi: boolean; selected: Set<number>; options: { label: string; description?: string }[]; messageId: number; resolve: (v: string | string[]) => void }
 const FREE_TEXT = Symbol('free-text')
 /** A profile session has no file tool, so an inbound file has nowhere to go and the host path stays out of the chat. */
-const TEXT_ONLY = '📎 This assistant reads text only: type your question. Voice notes are transcribed.'
+const TEXT_ONLY = '📎 This assistant reads text only: type your question.'
 const PROFILE_OWNS = '🔒 This install runs a profile: the model, effort and approvals are set there.'
 const PROFILE_FRESH = '🔒 Not under a profile: every topic starts fresh.'
 /** grammy types its optional signal with the abort-controller polyfill; the platform's AbortSignal is what runs. */
@@ -116,10 +116,18 @@ export class TelegramBot {
     this.topics = topics
   }
 
-  /** Telegram's answer to an edit that changes nothing: a success, not a failure. */
-  private isNotModified(e: unknown): boolean {
-    const any = e as { description?: string; message?: string }
-    return /not modified/i.test(String(any?.description ?? any?.message ?? e))
+  /** A Bot API error, read one way everywhere: its code, its text, and a 429's retry_after. */
+  private describeError(e: unknown): { code?: number; text: string; retryAfter?: number } {
+    const any = e as { error_code?: number; description?: string; parameters?: { retry_after?: number }; message?: string }
+    return { code: any?.error_code, text: String(any?.description ?? any?.message ?? e), retryAfter: any?.parameters?.retry_after }
+  }
+
+  /** What a failed edit means: one that changes nothing is a success, and a message the user deleted is gone. */
+  private editOutcome(e: unknown): 'not_modified' | 'gone' | 'other' {
+    const d = this.describeError(e)
+    if (/not modified/i.test(d.text)) return 'not_modified'
+    if (d.code === 400 && /message (to edit )?not found|can't be edited|MESSAGE_ID_INVALID/i.test(d.text)) return 'gone'
+    return 'other'
   }
 
   /**
@@ -129,10 +137,6 @@ export class TelegramBot {
    */
   private statusTransport(): StatusTransport {
     const chat = this.d.cfg.forumChatId
-    const describe = (e: unknown): { code?: number; text: string; retryAfter?: number } => {
-      const any = e as { error_code?: number; description?: string; parameters?: { retry_after?: number }; message?: string }
-      return { code: any?.error_code, text: String(any?.description ?? any?.message ?? e), retryAfter: any?.parameters?.retry_after }
-    }
     return {
       create: async (topicId, text, kind) => {
         try {
@@ -156,14 +160,15 @@ export class TelegramBot {
           this.d.metrics.inc('status_edits')
           return { ok: true }
         } catch (e) {
-          if (this.isNotModified(e)) return { ok: true }
-          const d = describe(e)
+          const outcome = this.editOutcome(e)
+          if (outcome === 'not_modified') return { ok: true }
+          if (outcome === 'gone') return { ok: false, gone: true }
+          const d = this.describeError(e)
           if (d.code === 429) {
             this.d.metrics.inc('status_edit_429')
             this.d.log.warn('status.edit_rate_limited', { topic: topicId, retryAfter: d.retryAfter })
             return { ok: false, retryAfterMs: (d.retryAfter ?? 5) * 1000 }
           }
-          if (d.code === 400 && /message (to edit )?not found|can't be edited|MESSAGE_ID_INVALID/i.test(d.text)) return { ok: false, gone: true }
           this.d.log.warn('status.edit_failed', { topic: topicId, error: d.text })
           return { ok: false }
         }
@@ -506,7 +511,7 @@ export class TelegramBot {
       }
       await this.say(topicId, `🎙️ ${shared.audioFile ? 'Audio file' : 'Forwarded voice note'}, passed on as content: ${words}`)
       if (!this.d.store.registry[topicId] && this.d.cfg.teamMode && !(await this.bindFreshProfileTopic(ctx, topicId))) return
-      if (!(await this.topics.sendToTopic(topicId, turn))) await this.say(topicId, 'No session bound to this topic. Use /new (or /attach) first.')
+      if (!(await this.topics.sendToTopic(topicId, turn))) await this.say(topicId, this.noSessionHint())
     } catch (e) {
       await this.say(topicId, `🎙️ Voice note not transcribed: ${e instanceof Error ? e.message : String(e)}`)
     }
@@ -545,7 +550,7 @@ export class TelegramBot {
   /** One guard for every inbound media kind: a profile session has no file tool, and the host path stays out of the chat. */
   private async mediaRefusedUnderProfile(topicId: string): Promise<boolean> {
     if (!this.d.profile) return false
-    await this.say(topicId, TEXT_ONLY)
+    await this.say(topicId, this.d.cfg.transcribeCmd ? `${TEXT_ONLY} Voice notes are transcribed.` : TEXT_ONLY)
     return true
   }
 
@@ -611,7 +616,8 @@ export class TelegramBot {
 
   /**
    * ⚙️ from a notice: refresh the pinned panel itself, never the notice the button sat
-   * on, and never a re-post (a re-post re-pins, and a pin notifies the whole forum).
+   * on, and re-post only a panel that is gone (a re-post re-pins, and a pin notifies the
+   * whole forum, so a 429 or a network error on the edit is logged and left).
    */
   private async refreshPinnedControls(topicId: string, b: Binding): Promise<void> {
     if (b.controlMsgId) {
@@ -621,7 +627,13 @@ export class TelegramBot {
         })
         return
       } catch (e) {
-        if (this.isNotModified(e)) return
+        const outcome = this.editOutcome(e)
+        if (outcome === 'not_modified') return
+        if (outcome !== 'gone') {
+          this.d.log.warn('controls.refresh_failed', { topic: topicId, error: this.describeError(e).text })
+          return
+        }
+        // Deleted by hand: posting again is the only way to have a panel at all.
       }
     }
     await this.postPinnedControls(topicId)
@@ -664,14 +676,13 @@ export class TelegramBot {
     if (uid && membershipRequired(this.access, uid)) this.quota.refund(uid)
   }
 
-  /** A fresh topic a member typed or spoke into: bound to the profile, within the allowance, once. */
+  /**
+   * A fresh topic a member typed or spoke into: bound to the profile, within the allowance.
+   * Every caller reads the registry just before, under the topic's own ordering (one update
+   * at a time, handlers queued per topic), so the topic is still unbound here.
+   */
   private async bindFreshProfileTopic(ctx: Context, topicId: string): Promise<boolean> {
     if (!(await this.reserveTopic(ctx, topicId))) return false
-    if (this.d.store.registry[topicId]) {
-      // Bound meanwhile (a 🆕 tap and a transcribed voice note can both get here): one topic, one binding, one charge.
-      this.refundTopic(ctx)
-      return true
-    }
     this.bindProfileTopic(topicId, this.topicTitleOf(ctx) ?? this.defaultTitle(ctx))
     await this.postPinnedControls(topicId)
     return true
@@ -1178,6 +1189,12 @@ export class TelegramBot {
     if (!allowedAction(this.access, fromId, typed.kind)) return refuse()
 
     let b = this.d.store.registry[topicId]
+    if (!b && this.d.cfg.teamMode) {
+      // A fresh topic a member typed into is bound first, whatever the line says, so `feed on`
+      // or `wrap` as a first line meets the topic any other first line would have created.
+      if (!(await this.bindFreshProfileTopic(ctx, topicId))) return
+      b = this.d.store.registry[topicId]
+    }
     if (typed.kind === 'wrap') return this.offerWrapUp(topicId)
     if (typed.kind === 'use' || typed.kind === 'effort' || typed.kind === 'feed') {
       if (!b) return void this.say(topicId, 'No session bound here.')
@@ -1205,14 +1222,15 @@ export class TelegramBot {
       return void this.say(topicId, typed.on ? '🔎 Activity feed ON — one line per tool call.' : '🔎 Activity feed OFF.')
     }
 
-    if (!b) {
-      if (!this.d.cfg.teamMode) return void this.send(topicId, 'This topic has no Claude session yet.', new InlineKeyboard().text('🆕 Start a session here', 'm:newhere'))
-      if (!(await this.bindFreshProfileTopic(ctx, topicId))) return
-      b = this.d.store.registry[topicId]
-    }
+    if (!b) return void this.send(topicId, 'This topic has no Claude session yet.', new InlineKeyboard().text('🆕 Start a session here', 'm:newhere'))
     this.status.bump(topicId) // the user's own message now sits below the status
     await this.typing(topicId)
-    if (!(await this.topics.sendToTopic(topicId, typed.text))) await this.say(topicId, 'No session bound to this topic. Use /new (or /attach) first.')
+    if (!(await this.topics.sendToTopic(topicId, typed.text))) await this.say(topicId, this.noSessionHint())
+  }
+
+  /** Under a profile every topic starts fresh, so /attach is not on offer. */
+  private noSessionHint(): string {
+    return this.d.profile ? 'No session bound to this topic. Use /new first.' : 'No session bound to this topic. Use /new (or /attach) first.'
   }
 
   // ── wiring ───────────────────────────────────────────────────────────────
@@ -1221,13 +1239,33 @@ export class TelegramBot {
     return admitted(this.access, { fromId: this.senderId(ctx), chatId: ctx.chat ? String(ctx.chat.id) : undefined, anonymous: !!ctx.message?.sender_chat })
   }
 
+  /** Topics where a post made as the group has been answered with the reason once. */
+  private readonly anonymousNoticed = new Set<string>()
+
+  /**
+   * A post made as the group (an admin with "Remain anonymous" on) carries no sender to
+   * verify, so it gets no answer, while the same admin's taps, which carry their account,
+   * work: said once per topic, so the admin learns why their typed lines go unanswered.
+   * Not in General, where a linked channel's posts land the same way, and only in the forum.
+   */
+  private async noticeAnonymous(ctx: Context): Promise<void> {
+    const topicId = this.topicIdOf(ctx)
+    if (!ctx.message?.sender_chat || !topicId || !ctx.chat || String(ctx.chat.id) !== this.access.forumChatId) return
+    if (this.anonymousNoticed.has(topicId)) return
+    this.anonymousNoticed.add(topicId)
+    await this.say(topicId, '🎭 Posts made as the group get no answer: Telegram hides who wrote them. Turn off "Remain anonymous" to chat here.')
+  }
+
   /**
    * The chat gate, then in team mode the forum's own member list for everyone but the
    * configured admins. A lookup that failed is a no, said once per grace so a Telegram
    * blip reads as a blip and not as a dead bot.
    */
   private async admit(ctx: Context): Promise<boolean> {
-    if (!this.allowed(ctx)) return false
+    if (!this.allowed(ctx)) {
+      await this.noticeAnonymous(ctx)
+      return false
+    }
     const uid = this.senderId(ctx)
     if (!membershipRequired(this.access, uid)) return true
     if (!uid) return false

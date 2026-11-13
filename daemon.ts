@@ -266,18 +266,11 @@ try {
     }
   }
   // The published menu reads the one command table (src/commands.ts), like the gate and the
-  // handler. In team mode members see new and menu; status, an admin's, is published to the
-  // forum's administrators only, so no member's menu offers a command that refuses them.
+  // handler. In team mode everyone sees new and menu, and /status, an admin's, is in no menu:
+  // Telegram's administrators are not ADMIN_USER_IDS, so a scope for them would offer some a
+  // command that refuses them and hide it from others. Admins have it from the README.
   const publish = (names: string[]) => names.map(command => ({ command, description: COMMANDS[command] }))
-  if (cfg.teamMode) {
-    await bot.bot.api.setMyCommands(publish(['new', 'menu']))
-    await bot.bot.api.setMyCommands(publish(['new', 'menu', 'status']), { scope: { type: 'chat_administrators', chat_id: Number(cfg.forumChatId) } }).catch(e => log.warn('commands.admin_scope_failed', { error: e }))
-  } else {
-    await bot.bot.api.setMyCommands(publish(['menu', 'status']))
-    // A team-mode run published a set to the forum's administrators, which shadows the default
-    // one for them for as long as it exists: clear it, so leaving team mode leaves no menu behind.
-    await bot.bot.api.deleteMyCommands({ scope: { type: 'chat_administrators', chat_id: Number(cfg.forumChatId) } }).catch(e => log.warn('commands.admin_scope_clear_failed', { error: e }))
-  }
+  await bot.bot.api.setMyCommands(publish(cfg.teamMode ? ['new', 'menu'] : ['menu', 'status']))
   log.info('telepath.up', {
     version: VERSION,
     sdk: SDK_VERSION,

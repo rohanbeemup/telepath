@@ -210,6 +210,8 @@ export class TopicManager {
       if (b.sessionId) this.d.log.info('session.resume_dropped', { topic: topicId, sessionId: b.sessionId, why: 'binding predates the profile' })
       b.sessionId = undefined
       b.profile = true // the profile's from now on: the fresh session it opens is resumed like any other
+      // The old transcript's total is no baseline for the fresh one, which starts at zero.
+      if (this.d.budgetUsd !== undefined) b.reportedUsd = 0
       this.d.store.saveRegistry()
       resume = undefined
     }
@@ -342,8 +344,7 @@ export class TopicManager {
         this.resumeTimers.delete(topicId)
         if (!this.d.store.registry[topicId]) return
         this.d.metrics.inc('rate_limit_resumes')
-        void this.d.say(topicId, '▶️ Rate limit reset — resuming automatically.')
-        void this.sendToTopic(topicId, CONTINUE_AFTER_LIMIT, { takeover: false, quiet: true })
+        void this.resumeWith(topicId, CONTINUE_AFTER_LIMIT, '▶️ Rate limit reset — resuming automatically.')
       }, delay),
     )
     const dt = new Date(at)
@@ -359,8 +360,23 @@ export class TopicManager {
     this.userTookOver(topicId) // clears the reset nudge; the rotation supersedes it
     this.closeLive(topicId, `account rotated ${before ?? '?'} -> ${now}`)
     this.d.metrics.inc('rotations_resumed')
-    await this.d.say(topicId, `🔁 Account rotated to ${now} — continuing now.`)
-    await this.sendToTopic(topicId, CONTINUE_AFTER_ROTATION, { takeover: false, quiet: true })
+    await this.resumeWith(topicId, CONTINUE_AFTER_ROTATION, `🔁 Account rotated to ${now} — continuing now.`)
+  }
+
+  /**
+   * A continuation of the bot's own (a quiet nudge), announced once it is in, so a topic
+   * that cannot take it is not told "resuming" and then left hanging. A closed topic never
+   * gets here (closing takes the topic over, which cancels both continuations); a budget
+   * spent meanwhile can, and is said instead.
+   */
+  private async resumeWith(topicId: string, nudge: string, announce: string): Promise<void> {
+    if (await this.sendToTopic(topicId, nudge, { takeover: false, quiet: true })) {
+      await this.d.say(topicId, announce)
+      return
+    }
+    const b = this.d.store.registry[topicId]
+    const left = b ? this.remainingBudget(b) : undefined
+    if (left !== undefined && left <= 0) await this.d.say(topicId, '💸 Not resumed: this topic has used its budget. Open a new topic for the next question.')
   }
 
   private async pump(l: Live): Promise<void> {
