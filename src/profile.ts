@@ -109,6 +109,9 @@ export function parseProfile(raw: unknown, src: ProfileSource): Profile {
       // A command with a path in it resolves against the profile's directory, like cwd and the
       // prompt file; a bare name is the child's PATH to find.
       else if (/[\\/]/.test(s.command)) s.command = resolve(src.dir, s.command)
+      // The same for an argument that is explicitly relative (`./server.py`, `../bin/x`): a URL, a
+      // scoped package name or a `--flag=./x` has a slash too and is handed through as typed.
+      if (Array.isArray(s.args)) s.args = s.args.map(a => (typeof a === 'string' && /^\.\.?[\\/]/.test(a) ? resolve(src.dir, a) : a))
       s.type = 'stdio'
     } else {
       problems.push(`mcpServers.${name}: type must be http, sse or stdio; got ${JSON.stringify(s.type)}`)

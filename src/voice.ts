@@ -30,7 +30,11 @@ export async function transcribe(path: string, cmd: string | undefined, timeoutM
     // children (python, ffmpeg) would otherwise outlive every kill of the script and pile up.
     const group = process.platform !== 'win32'
     const [exe, ...args] = splitCommand(cmd)
-    const child = spawn(exe, [...args, path], { stdio: ['ignore', 'pipe', 'pipe'], detached: group, windowsHide: true })
+    // The transcriber hears audio anyone in the forum sent; it gets none of the bot's secrets.
+    const env = { ...process.env }
+    delete env.TELEGRAM_BOT_TOKEN
+    delete env.ANTHROPIC_API_KEY
+    const child = spawn(exe, [...args, path], { stdio: ['ignore', 'pipe', 'pipe'], detached: group, windowsHide: true, env })
     const stop = () => {
       try {
         if (group && child.pid) process.kill(-child.pid, 'SIGKILL')

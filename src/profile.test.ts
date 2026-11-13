@@ -150,6 +150,12 @@ describe('a profile is refused when', () => {
     expect(local.type).toBe('stdio')
     const bare = parseProfile(raw({ mcpServers: { local: { command: 'kb-server' } }, allowedTools: ['mcp__local__search'] }), source()).mcpServers.local as { command?: string }
     expect(bare.command).toBe('kb-server')
+    // and an argument that is explicitly relative, while a flag, a URL, a scoped package name or `--flag=./x` stays as typed
+    const withArgs = parseProfile(
+      raw({ mcpServers: { local: { command: 'npx', args: ['-y', '@scope/server', './server.py', '../bin/x', 'https://kb.example.com/mcp', '--config=./c.json'] } }, allowedTools: ['mcp__local__search'] }),
+      source(),
+    ).mcpServers.local as { args?: string[] }
+    expect(withArgs.args).toEqual(['-y', '@scope/server', join(DIR, 'server.py'), join(DIR, '..', 'bin', 'x'), 'https://kb.example.com/mcp', '--config=./c.json'])
   })
 
   test('an allowed tool must name a declared MCP server or a kept built-in tool', () => {

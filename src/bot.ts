@@ -253,14 +253,12 @@ export class TelegramBot {
         return
       } catch {}
     } else if (q && this.d.cfg.teamMode) {
-      if (keyboard) {
-        // Callback data against a message whose keyboard does not hold it (forged, or a stale
-        // client): a fresh message per such tap would be a flood a member can cause.
-        this.d.metrics.inc('forged_taps')
-        return
-      }
-      // No keyboard to check (an inaccessible message): the fresh post goes out on the reply
-      // rule, so an unverifiable tap is bounded like any other reply (hook).
+      // Not the tapped message's own button: forged, a stale client whose message was already
+      // repainted, or a message with no keyboard to check. The outcome still goes out, since the
+      // action it reports (a topic created, an allowance spent) has happened, but as a fresh
+      // message on the reply rule, so a crafted tap is bounded and a real one is answered
+      // (twentieth and twenty-first reviews, sixth security read).
+      if (keyboard) this.d.metrics.inc('forged_taps')
       if (this.muted(topicId, 'paint', String(q.from.id))) return
     }
     await this.send(topicId, text, kb)
@@ -685,8 +683,10 @@ export class TelegramBot {
       })
       b.controlMsgId = sent.message_id
       this.d.store.saveRegistry()
-      // Pin non-silently: the event is what makes mobile Telegram show the per-topic pin bar.
-      await this.bot.api.pinChatMessage(this.d.cfg.forumChatId, sent.message_id).catch(e => this.d.log.warn('pin.failed', { topic: topicId, error: e }))
+      // For one user, pinned non-silently: the event is what makes mobile Telegram show the
+      // per-topic pin bar. In a shared forum, silently: a member's twenty topics a day would
+      // otherwise be twenty pushes to every member (twenty-first review).
+      await this.bot.api.pinChatMessage(this.d.cfg.forumChatId, sent.message_id, { disable_notification: this.d.cfg.teamMode }).catch(e => this.d.log.warn('pin.failed', { topic: topicId, error: e }))
     } catch (e) {
       this.d.log.error('controls.post_failed', { topic: topicId, error: e })
     }
@@ -788,9 +788,26 @@ export class TelegramBot {
    * Every caller reads the registry just before, under the topic's own ordering (one update
    * at a time, handlers queued per topic), so the topic is still unbound here.
    */
+  /**
+   * A member's own creation allowance, ten a minute, asked after the day's (which is cheaper
+   * and refuses first) and given back with it when the creation fails: a refused creation is
+   * refunded from the day, so the day alone does not bound the attempts (fourth security read);
+   * a topic made by hand in Telegram costs the same pin and counts the same (sixth). Admins
+   * are exempt, as from the day's.
+   */
+  private async reserveCreation(ctx: Context, where: string | undefined): Promise<boolean> {
+    const sender = this.senderId(ctx)
+    if (!this.d.cfg.teamMode || !sender || !membershipRequired(this.access, sender)) return true
+    if (this.creations.allow(sender)) return true
+    this.refundTopic(ctx)
+    await this.notice(where, 'create', '⏳ Too many new topics in a minute. Try again shortly.', sender)
+    return false
+  }
+
   private async bindFreshProfileTopic(ctx: Context, topicId: string): Promise<boolean> {
     if (this.removed.has(topicId)) return false // deleted by an admin while this message waited: gone, or going
     if (!(await this.reserveTopic(ctx, topicId))) return false
+    if (!(await this.reserveCreation(ctx, topicId))) return false
     this.bindProfileTopic(topicId, this.topicTitleOf(ctx) ?? this.defaultTitle(ctx))
     await this.postPinnedControls(topicId)
     return true
@@ -838,11 +855,8 @@ export class TelegramBot {
     // while creation fails: a member's own creation allowance does (fourth security read), apart
     // from the reply allowance so that ten replies do not cost a topic; admins are exempt, as from
     // the daily allowance.
-    const sender = this.senderId(ctx)
-    if (this.d.cfg.teamMode && sender && membershipRequired(this.access, sender) && !this.creations.allow(sender)) {
-      return this.notice(intoTopic, 'create', '⏳ Too many new topics in a minute. Try again shortly.', sender)
-    }
     if (!(await this.reserveTopic(ctx, intoTopic))) return
+    if (!(await this.reserveCreation(ctx, intoTopic))) return
     const topicId = await this.createTopic(title)
     if (!topicId) {
       this.refundTopic(ctx) // only an opening that happened counts
@@ -1049,6 +1063,7 @@ export class TelegramBot {
     if (data === 'm:cancel') {
       this.wizard.delete(uid)
       await ack('Cancelled')
+      if (this.muted(topicId, 'menu', this.senderId(ctx))) return
       return this.showMainMenu(topicId)
     }
     if (data === 'm:ctl') {
@@ -1347,7 +1362,7 @@ export class TelegramBot {
           if (this.muted(topicId, 'help', fromId)) return
           return void this.say(topicId, this.d.cfg.teamMode ? teamHelp() : help(this.d.cfg.reposDir))
         default:
-          return this.showMainMenu(topicId, true)
+          return // every known command has a case above; KNOWN_COMMANDS gated the rest before the switch
       }
     }
 
@@ -1440,6 +1455,9 @@ export class TelegramBot {
    */
   replyAllowed(topicId: string | undefined, kind: string, senderId?: string): boolean {
     if (!this.d.cfg.teamMode) return true // the throttles are a shared forum's: one user's notices are all answered
+    // An admin is configured, not throttled, as with the daily allowance: a member's slot must
+    // not mute the admin's own action a moment later (twenty-first review).
+    if (senderId !== undefined && !membershipRequired(this.access, senderId)) return true
     // Both asked before either is charged: a member past their allowance must not use up the
     // topic's one slot for that kind and silence a colleague's notice (sixteenth review), and a
     // reply the topic's slot mutes must not cost the member an allowance they will need for the
@@ -1469,7 +1487,7 @@ export class TelegramBot {
     if (!this.d.cfg.teamMode || !ctx.message?.sender_chat || !topicId || !ctx.chat || String(ctx.chat.id) !== this.access.forumChatId) return
     if (this.anonymousNoticed.has(topicId)) return
     this.anonymousNoticed.add(topicId)
-    await this.say(topicId, '🎭 Posts made as the group or as a channel get no answer: Telegram hides who wrote them. Post as yourself to chat here ("Remain anonymous" off, "Send as" yourself).')
+    await this.notice(topicId, 'anon', '🎭 Posts made as the group or as a channel get no answer: Telegram hides who wrote them. Post as yourself to chat here ("Remain anonymous" off, "Send as" yourself).')
   }
 
   /**
