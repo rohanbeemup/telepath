@@ -20,15 +20,42 @@ export function parseTranscript(out: string): string {
   return words
 }
 
-/** Transcribe one audio file. Async, so a slow transcription holds up nothing else. */
-export async function transcribe(path: string, cmd: string | undefined, timeoutMs = 180_000): Promise<string> {
-  if (!cmd) throw new VoiceError("voice notes need TRANSCRIBE_CMD in telepath's .env (a command that prints the words of the audio file it is given)")
+export const NO_TRANSCRIBER = "voice notes need TRANSCRIBE_CMD in telepath's .env (a command that prints the words of the audio file it is given)"
+
+/**
+ * Names .env may hold that a transcriber needs and that carry no secret: kept even when `scrub`
+ * names them (a unit whose EnvironmentFile is the same .env names every one of them). Anything
+ * else .env holds goes; a transcriber that needs a key of its own takes it on its command line.
+ */
+const TRANSCRIBER_KEEPS = new Set([
+  'PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'LANG', 'LANGUAGE', 'LC_ALL', 'LC_CTYPE', 'TZ', 'TMPDIR', 'TEMP', 'TMP',
+  'XDG_CACHE_HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_RUNTIME_DIR',
+  // what a Python or CUDA transcriber (a whisper script) needs, none of it a secret (thirty-fourth review)
+  'PYTHONPATH', 'PYTHONIOENCODING', 'PYTHONUNBUFFERED', 'VIRTUAL_ENV', 'LD_LIBRARY_PATH', 'CUDA_HOME', 'CUDA_VISIBLE_DEVICES',
+  'NVIDIA_VISIBLE_DEVICES', 'OMP_NUM_THREADS', 'HF_HOME', 'TRANSFORMERS_CACHE', 'TORCH_HOME',
+])
+
+/**
+ * Transcribe one audio file. Async, so a slow transcription holds up nothing else. `scrub` is
+ * every key .env names: none of them reaches the transcriber, the harmless names above excepted.
+ */
+export async function transcribe(path: string, cmd: string | undefined, timeoutMs = 180_000, scrub: Iterable<string> = []): Promise<string> {
+  if (!cmd) throw new VoiceError(NO_TRANSCRIBER)
   const out = await new Promise<string>((resolve, reject) => {
     // Its own process group, so a timeout ends everything it started: a wrapper script's own
     // children (python, ffmpeg) would otherwise outlive every kill of the script and pile up.
     const group = process.platform !== 'win32'
     const [exe, ...args] = splitCommand(cmd)
-    const child = spawn(exe, [...args, path], { stdio: ['ignore', 'pipe', 'pipe'], detached: group, windowsHide: true })
+    // The transcriber hears audio anyone in the forum sent; it gets nothing .env holds (every key
+    // handed in as `scrub`, so the rule is the file and not a list that rots; thirty-first review),
+    // whether or not the shell had set it too (the security read on the thirty-second: "the shell
+    // had it" must not exempt a secret), nor the two secrets named here whatever loaded them. The
+    // shell's own variables stay, and so do the harmless names a transcriber needs.
+    const env = { ...process.env }
+    delete env.TELEGRAM_BOT_TOKEN
+    delete env.ANTHROPIC_API_KEY
+    for (const k of scrub) if (!TRANSCRIBER_KEEPS.has(k)) delete env[k]
+    const child = spawn(exe, [...args, path], { stdio: ['ignore', 'pipe', 'pipe'], detached: group, windowsHide: true, env })
     const stop = () => {
       try {
         if (group && child.pid) process.kill(-child.pid, 'SIGKILL')

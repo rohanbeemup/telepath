@@ -1,6 +1,7 @@
 import { test, expect, describe } from 'bun:test'
 import { TopicManager, outboxContract, type LiveSession, type OpenOptions, type SessionBackend, type Rotator } from './topics'
 import { Mailbox } from './mailbox'
+import { Throttle } from './throttle'
 import { Store } from './state'
 import { buildCatalog } from './models'
 import { Logger, Metrics } from './log'
@@ -61,7 +62,7 @@ function fakeRotator(over: Partial<Rotator> = {}): Rotator & { handedOff: unknow
 
 type FakeRotator = ReturnType<typeof fakeRotator>
 
-function harness(over: { maxLive?: number; idleMinutes?: number; rotator?: FakeRotator; now?: () => number; resumeBufferMs?: number } = {}) {
+function harness(over: { maxLive?: number; idleMinutes?: number; rotator?: FakeRotator; now?: () => number; resumeBufferMs?: number; primeContract?: boolean; budgetUsd?: number; profileSessions?: boolean; shared?: boolean; stuckTurnMs?: number; transcriptExists?: (id: string) => boolean | undefined; profileModel?: string; profileEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max'; profileName?: string } = {}) {
   const store = new Store('/nowhere', {}, { defaultModel: 'claude-opus-5', defaultCwd: '/w' }, { defaultModel: 'claude-opus-5', defaultCwd: '/w' })
   // never touch disk in these tests
   store.saveRegistry = () => {}
@@ -71,6 +72,7 @@ function harness(over: { maxLive?: number; idleMinutes?: number; rotator?: FakeR
   const events: [string, Event][] = []
   const rotator = over.rotator ?? fakeRotator()
   const extras = { canUseTool: (async () => ({ behavior: 'allow' })) as any, hooks: {} }
+  const refusals = new Throttle(60_000, over.now)
   const tm = new TopicManager({
     store,
     catalog,
@@ -87,6 +89,17 @@ function harness(over: { maxLive?: number; idleMinutes?: number; rotator?: FakeR
     metrics: new Metrics(),
     now: over.now,
     resumeBufferMs: over.resumeBufferMs,
+    primeContract: over.primeContract,
+    budgetUsd: over.budgetUsd,
+    profileSessions: over.profileSessions,
+    shared: over.shared,
+    stuckTurnMs: over.stuckTurnMs,
+    // the bot's rule, stood in for by its own kind of throttle: one notice a minute per topic and kind
+    replyMuted: (t, k) => !refusals.allow(`${t}:${k}`),
+    transcriptExists: over.transcriptExists,
+    profileModel: over.profileModel,
+    profileEffort: over.profileEffort,
+    profileName: over.profileName,
   })
   const bind = (topicId: string, b: Partial<{ model: string; effort: 'low' | 'high' | 'max'; sessionId: string; auto: boolean }> = {}) => {
     store.registry[topicId] = { cwd: '/w', model: b.model ?? 'claude-opus-5', effort: b.effort, sessionId: b.sessionId, title: 't' + topicId, lastActive: 0, auto: b.auto }
@@ -126,6 +139,132 @@ describe('TopicManager', () => {
     expect(h.tm.isLive('c')).toBe(true)
     expect(h.backend.sessions[0].closed).toBe(true)
     expect(h.said.find(([topic, text]) => topic === 'a' && text.includes('Paused'))).toBeTruthy()
+  })
+
+  test('in a shared forum a running turn is paused for another topic only once it is stuck; until then the newcomer waits', async () => {
+    let t = 1000
+    const h = harness({ maxLive: 2, now: () => t, shared: true, stuckTurnMs: 10 * 60_000, idleMinutes: 60 })
+    h.bind('busy')
+    h.bind('idle')
+    h.bind('next')
+    await h.tm.sendToTopic('busy', 'think hard') // running: no result yet, and the least recently active
+    const busySession = h.backend.last()
+    t += 10
+    await h.tm.sendToTopic('idle', 'quick one')
+    h.backend.last().emit(result('s-idle'))
+    await h.tick()
+    t += 10
+    // the idle session is the one paused, not the older one still running
+    expect(await h.tm.sendToTopic('next', 'me too')).toBe(true)
+    expect(h.tm.isLive('busy')).toBe(true)
+    expect(h.tm.isLive('idle')).toBe(false)
+    expect(h.tm.isLive('next')).toBe(true)
+    expect(h.said.find(([topic, text]) => topic === 'idle' && text.includes('Paused'))).toBeTruthy()
+    // every slot running: the newcomer is told to wait, nobody's turn is killed, a quiet nudge reports undelivered
+    h.bind('late')
+    expect(await h.tm.sendToTopic('late', 'and me')).toBe(true)
+    expect(h.tm.isLive('late')).toBe(false)
+    expect(h.tm.isLive('busy')).toBe(true)
+    expect(h.tm.isLive('next')).toBe(true)
+    expect(h.said.find(([topic, text]) => topic === 'late' && /slot/i.test(text))).toBeTruthy()
+    expect(h.said.find(([topic, text]) => topic === 'busy' && text.includes('Paused'))).toBeFalsy()
+    expect(await h.tm.sendToTopic('late', 'continue', { takeover: false, quiet: true })).toBe(false)
+    expect(h.backend.opens.length).toBe(3)
+    // stuck means silent: ten minutes on, the turn still producing output is kept and the silent one is
+    // paused for the newcomer, so hung tools do not hold the forum and a long turn is not killed
+    t += 10 * 60_000
+    busySession.emit({ type: 'keepalive' }) // output, whatever its kind, is activity
+    await h.tick()
+    await h.tm.sendToTopic('next', 'hello?') // a member's message into the silent topic does not keep its slot
+    expect(await h.tm.sendToTopic('late', 'and me')).toBe(true)
+    expect(h.tm.isLive('late')).toBe(true)
+    expect(h.tm.isLive('busy')).toBe(true)
+    expect(h.tm.isLive('next')).toBe(false)
+    expect(h.said.find(([topic, text]) => topic === 'next' && text.includes('Paused'))).toBeTruthy()
+    // and idle eviction ends a stuck turn too, so a hung process does not wait for cap pressure
+    t += 10 * 60_000
+    h.backend.last().emit({ type: 'keepalive' }) // late is producing
+    await h.tick()
+    h.tm.evictIdle()
+    expect(h.tm.isLive('busy')).toBe(false) // silent for ten minutes
+    expect(h.tm.isLive('late')).toBe(true)
+    expect(h.said.find(([topic, text]) => topic === 'busy' && text.includes('Paused'))).toBeTruthy()
+    // a new turn into a session idle for a long time is not stuck at its start: its silence counts from the send
+    h.backend.last().emit(result('s-late'))
+    await h.tick()
+    t += 10 * 60_000
+    await h.tm.sendToTopic('late', 'one more')
+    h.tm.evictIdle()
+    expect(h.tm.isLive('late')).toBe(true)
+    // a turn parked on a rate limit with a resume scheduled is waiting, not hung: not evicted meanwhile
+    h.bind('parked')
+    await h.tm.sendToTopic('parked', 'x')
+    await h.tm.sendToTopic('parked', 'follow-up one') // sent into the running turn: with the session, folded in when it can
+    await h.tm.sendToTopic('parked', 'follow-up two')
+    h.backend.last().emit({ type: 'rate_limit_event', rate_limit_info: { status: 'rejected', resetsAt: Math.floor((t + 3_600_000) / 1000) } })
+    await h.tick()
+    t += 10 * 60_000
+    h.tm.evictIdle()
+    expect(h.tm.isLive('parked')).toBe(true)
+    // but it is pausable for a newcomer: it holds no API call, and its resume opens a fresh stretch
+    h.bind('filler')
+    await h.tm.sendToTopic('filler', 'x') // the other slot: a turn running now
+    h.bind('newer')
+    expect(await h.tm.sendToTopic('newer', 'x')).toBe(true)
+    expect(h.tm.isLive('newer')).toBe(true)
+    expect(h.tm.isLive('filler')).toBe(true)
+    expect(h.tm.isLive('parked')).toBe(false)
+    // and its scheduled resume went with it: the notice said a message resumes it, not a timer
+    expect(h.tm.scheduledResume('parked')).toBe(false)
+    // the messages sent while it waited died with the process: the notice names them, rather than
+    // "your context is kept" alone (thirty-third review)
+    expect(h.said.find(([topic, text]) => topic === 'parked' && /2 messages[^.]*did not reach/.test(text))).toBeTruthy()
+    expect(h.said.find(([topic, text]) => topic === 'parked' && /Send a message here to resume/.test(text))).toBeFalsy()
+    // a stuck turn goes before an idle colleague, whatever its topic's last message: members typing
+    // "hello?" into a hung topic refresh its activity, which must not keep the hung process while a
+    // colleague's warm, idle session is paused instead (thirty-fourth review)
+    let u = 1000
+    const order = harness({ maxLive: 2, now: () => u, shared: true, stuckTurnMs: 10 * 60_000, idleMinutes: 60 })
+    order.bind('hung')
+    await order.tm.sendToTopic('hung', 'x') // running, never answers
+    u += 10
+    order.bind('warm')
+    await order.tm.sendToTopic('warm', 'quick one')
+    order.backend.last().emit(result('s-warm'))
+    await order.tick()
+    u += 10 * 60_000 // hung is stuck now; warm is idle
+    await order.tm.sendToTopic('hung', 'hello?') // the hung topic's activity is the freshest
+    u += 10
+    order.bind('third')
+    expect(await order.tm.sendToTopic('third', 'x')).toBe(true)
+    expect(order.tm.isLive('hung')).toBe(false)
+    expect(order.tm.isLive('warm')).toBe(true)
+    expect(order.tm.isLive('third')).toBe(true)
+    // for one user the timer stays: the rate-limit notice promised a continuation at the reset, so the cap's
+    // pause leaves it to reopen the topic then, as main did (twenty-ninth review: the cancellation was unconditional)
+    const solo = harness({ maxLive: 2, now: () => t })
+    solo.bind('sp')
+    await solo.tm.sendToTopic('sp', 'x')
+    solo.backend.last().emit({ type: 'rate_limit_event', rate_limit_info: { status: 'rejected', resetsAt: Math.floor((t + 3_600_000) / 1000) } })
+    await solo.tick()
+    expect(solo.tm.scheduledResume('sp')).toBe(true)
+    t += 10
+    solo.bind('s2')
+    await solo.tm.sendToTopic('s2', 'x')
+    t += 10
+    solo.bind('s3')
+    await solo.tm.sendToTopic('s3', 'x')
+    expect(solo.tm.isLive('sp')).toBe(false)
+    expect(solo.tm.scheduledResume('sp')).toBe(true)
+    // where the forum is one person's, the longest-idle session is paused for the new topic, running or not, as before
+    const own = harness({ maxLive: 1 })
+    own.bind('p')
+    own.bind('q')
+    await own.tm.sendToTopic('p', 'long task')
+    expect(await own.tm.sendToTopic('q', 'switching')).toBe(true)
+    expect(own.tm.isLive('q')).toBe(true)
+    expect(own.tm.isLive('p')).toBe(false)
+    expect(own.said.find(([topic, text]) => topic === 'p' && text.includes('Paused'))).toBeTruthy()
   })
 
   test('evicts idle sessions and leaves a session mid-turn alone', async () => {
@@ -478,5 +617,348 @@ describe('outboxContract', () => {
     expect(c.toLowerCase()).toContain('video')
     expect(c.toLowerCase()).toContain('audio')
     expect(c.toLowerCase()).toContain('document')
+  })
+})
+
+describe('profile sessions', () => {
+  test("a profile session's first message carries no outbox contract", async () => {
+    const h = harness({ primeContract: false })
+    h.bind('p')
+    await h.tm.sendToTopic('p', 'what is the refund policy?')
+    await h.tm.sendToTopic('p', 'and for subscriptions?')
+    expect(h.backend.last().sent).toEqual(['what is the refund policy?', 'and for subscriptions?'])
+    // the default is unchanged: a session with file tools is told where to put files
+    const d = harness()
+    d.bind('q')
+    await d.tm.sendToTopic('q', 'hello')
+    expect(d.backend.last().sent[0]).toContain(outboxContract('/out/q'))
+  })
+})
+
+describe('a profile budget', () => {
+  test("a topic that has spent the profile's budget stays closed across idle stretches", async () => {
+    let t = 0
+    const h = harness({ idleMinutes: 1, now: () => t, budgetUsd: 1 })
+    h.bind('b')
+    await h.tm.sendToTopic('b', 'first question')
+    h.backend.last().emit({ ...result('sb'), total_cost_usd: 0.6 })
+    await h.tick()
+    expect(h.store.registry['b'].spentUsd).toBeCloseTo(0.6)
+    // idle eviction, then a resume: the SDK's own cap would start over here
+    t = 5 * 60_000
+    h.tm.evictIdle()
+    expect(h.tm.isLive('b')).toBe(false)
+    await h.tm.sendToTopic('b', 'second question')
+    expect(h.backend.opens.length).toBe(2)
+    // the new stretch runs on what is left, not the full cap
+    expect(h.backend.opens[0].budgetUsd).toBeCloseTo(1)
+    expect(h.backend.opens[1].budgetUsd).toBeCloseTo(0.4)
+    // a resumed stretch's results carry the earlier stretches (the SDK's transcript-saved total):
+    // the latest total is the spend, never a sum across stretches
+    h.backend.last().emit({ ...result('sb'), total_cost_usd: 0.9 })
+    await h.tick()
+    expect(h.store.registry['b'].spentUsd).toBeCloseTo(0.9)
+    h.backend.last().emit({ ...result('sb'), total_cost_usd: 1.1 })
+    await h.tick()
+    expect(h.store.registry['b'].spentUsd).toBeCloseTo(1.1)
+    // at or over the budget: a notice, no session
+    await h.tm.sendToTopic('b', 'third question')
+    expect(h.backend.opens.length).toBe(2)
+    expect(h.said.find(([topic, text]) => topic === 'b' && /budget/i.test(text))).toBeTruthy()
+    // a stretch the SDK ended for its budget counts as spent, whatever it reported
+    h.bind('c')
+    await h.tm.sendToTopic('c', 'hello')
+    h.backend.last().emit({ type: 'result', subtype: 'error_max_budget_usd', is_error: true, session_id: 'sc' })
+    await h.tick()
+    expect(h.store.registry['c'].spentUsd).toBeGreaterThanOrEqual(1)
+    const opensBefore = h.backend.opens.length
+    await h.tm.sendToTopic('c', 'again')
+    expect(h.backend.opens.length).toBe(opensBefore)
+    // a stretch whose transcript saved no total (a crash mid-turn) restarts its count at zero: its
+    // first total is below what is recorded, so it is this stretch's own count, and later results
+    // add their increment over the stretch's last total
+    h.bind('e')
+    await h.tm.sendToTopic('e', 'q1')
+    h.backend.last().emit({ ...result('se'), total_cost_usd: 0.6 })
+    await h.tick()
+    h.tm.closeLive('e', 'crashed in test')
+    await h.tm.sendToTopic('e', 'q2')
+    h.backend.last().emit({ ...result('se'), total_cost_usd: 0.05 })
+    await h.tick()
+    expect(h.store.registry['e'].spentUsd).toBeCloseTo(0.65)
+    h.backend.last().emit({ ...result('se'), total_cost_usd: 0.2 })
+    await h.tick()
+    expect(h.store.registry['e'].spentUsd).toBeCloseTo(0.8)
+    // a zeroed result (a crash or startup-error result) is no information: it moves nothing, and the
+    // next real total is not added in full on top of the record
+    h.bind('g')
+    await h.tm.sendToTopic('g', 'q1')
+    h.backend.last().emit({ ...result('sg'), total_cost_usd: 0.5 })
+    await h.tick()
+    h.tm.closeLive('g', 'evicted in test')
+    await h.tm.sendToTopic('g', 'q2')
+    h.backend.last().emit({ type: 'result', subtype: 'error_during_execution', is_error: true, session_id: 'sg', total_cost_usd: 0 })
+    await h.tick()
+    expect(h.store.registry['g'].spentUsd).toBeCloseTo(0.5)
+    h.backend.last().emit({ ...result('sg'), total_cost_usd: 0.7 })
+    await h.tick()
+    expect(h.store.registry['g'].spentUsd).toBeCloseTo(0.7)
+    // after a lost-transcript stretch, the transcript's totals run from that stretch's own count: a later
+    // carried stretch is charged its increment over the last reported total, not its history again
+    h.bind('k')
+    await h.tm.sendToTopic('k', 'q1')
+    h.backend.last().emit({ ...result('sk'), total_cost_usd: 0.4 })
+    await h.tick()
+    h.tm.closeLive('k', 'killed mid-turn in test') // its transcript saved no total
+    await h.tm.sendToTopic('k', 'q2')
+    h.backend.last().emit({ ...result('sk'), total_cost_usd: 0.3 }) // restarted at zero
+    await h.tick()
+    expect(h.store.registry['k'].spentUsd).toBeCloseTo(0.7)
+    h.tm.closeLive('k', 'evicted in test')
+    await h.tm.sendToTopic('k', 'q3')
+    h.backend.last().emit({ ...result('sk'), total_cost_usd: 0.35 }) // carried from 0.3: one cheap turn
+    await h.tick()
+    expect(h.store.registry['k'].spentUsd).toBeCloseTo(0.75)
+    // a binding recorded before the transcript's total was kept (spentUsd, no reportedUsd) takes its
+    // record as the baseline for its first result, so a carried total does not add its history again
+    h.bind('m')
+    h.store.registry['m'].spentUsd = 0.4
+    await h.tm.sendToTopic('m', 'q1')
+    h.backend.last().emit({ ...result('sm'), total_cost_usd: 0.45 }) // carried: one cheap turn on top of the recorded history
+    await h.tick()
+    expect(h.store.registry['m'].spentUsd).toBeCloseTo(0.45)
+    expect(h.store.registry['m'].reportedUsd).toBeCloseTo(0.45)
+    // a second refused message within the minute is counted, not answered: a member's flood is not the bot's
+    const before = h.said.filter(([topic, text]) => topic === 'b' && /budget/i.test(text)).length
+    expect(before).toBeGreaterThan(0)
+    expect(await h.tm.sendToTopic('b', 'again')).toBe(true)
+    expect(h.said.filter(([topic, text]) => topic === 'b' && /budget/i.test(text)).length).toBe(before)
+    // a nudge into an exhausted topic posts nothing and reports undelivered
+    const notices = h.said.filter(([topic, text]) => topic === 'b' && /budget/i.test(text)).length
+    expect(await h.tm.sendToTopic('b', 'continue', { takeover: false, quiet: true })).toBe(false)
+    expect(h.said.filter(([topic, text]) => topic === 'b' && /budget/i.test(text)).length).toBe(notices)
+    // a topic whose budget was spent by the time a rate limit resets is not told "resuming" and then
+    // left hanging: the nudge decides, and an undelivered one says why
+    const priced = harness({ resumeBufferMs: 0, budgetUsd: 1 })
+    priced.bind('3')
+    await priced.tm.sendToTopic('3', 'x')
+    const s3 = priced.backend.last()
+    s3.emit({ type: 'rate_limit_event', rate_limit_info: { status: 'rejected', resetsAt: Date.now() + 20 } })
+    s3.emit({ ...result('s3'), total_cost_usd: 1 }) // the limited turn's result lands the topic on its cap
+    await priced.tick()
+    await new Promise(r => setTimeout(r, 80))
+    expect(priced.said.some(([t, text]) => t === '3' && text.startsWith('▶️'))).toBe(false)
+    expect(priced.said.some(([t, text]) => t === '3' && /not resumed.*budget/i.test(text))).toBe(true)
+    expect(s3.sent.some(m => m.includes('has reset'))).toBe(false)
+    // a stretch that failed for another reason still spent what it reports
+    h.bind('d')
+    await h.tm.sendToTopic('d', 'hello')
+    h.backend.last().emit({ type: 'result', subtype: 'error_max_turns', is_error: true, session_id: 'sd', total_cost_usd: 0.7 })
+    await h.tick()
+    expect(h.store.registry['d'].spentUsd).toBeCloseTo(0.7)
+    // a failed turn leaves the stretch live; the next stretch, after an eviction, gets what is left
+    h.tm.closeLive('d', 'evicted in test')
+    await h.tm.sendToTopic('d', 'more')
+    expect(h.backend.opens[h.backend.opens.length - 1].budgetUsd).toBeCloseTo(0.3)
+    // a topic without a budget is never refused
+    const free = harness()
+    free.bind('f')
+    await free.tm.sendToTopic('f', 'x')
+    free.backend.last().emit({ ...result('sf'), total_cost_usd: 99 })
+    await free.tick()
+    await free.tm.sendToTopic('f', 'y')
+    expect(free.said.find(([topic, text]) => topic === 'f' && /budget/i.test(text))).toBeFalsy()
+    expect(free.store.registry['f'].spentUsd).toBeUndefined() // nothing tracked, nothing written
+  })
+})
+
+describe('an admin-closed topic', () => {
+  test('a topic an admin closed opens no session until an admin reopens it', async () => {
+    const h = harness({ shared: true })
+    h.bind('z')
+    await h.tm.sendToTopic('z', 'before the close')
+    expect(h.backend.opens.length).toBe(1)
+    // 💾 Close & keep: the binding is marked closed and the live session ends
+    h.store.registry['z'].closed = true
+    h.tm.closeLive('z', 'closed & kept by an admin')
+    expect(await h.tm.sendToTopic('z', 'a member types anyway')).toBe(true)
+    expect(h.backend.opens.length).toBe(1)
+    expect(h.tm.ensureLive('z')).toBeUndefined()
+    expect(h.said.find(([topic, text]) => topic === 'z' && /closed/i.test(text))).toBeTruthy()
+    // outside a shared forum a flag a team-mode run left behind is cleared at boot, so the kept topic
+    // resumes on its next message and a later switch to team mode cannot lock a topic in use
+    const single = harness()
+    single.bind('y')
+    single.store.registry['y'].closed = true
+    single.tm.adoptAll()
+    expect(single.store.registry['y'].closed).toBeFalsy()
+    expect(await single.tm.sendToTopic('y', 'back again')).toBe(true)
+    expect(single.backend.opens.length).toBe(1)
+    expect(single.said.find(([topic, text]) => topic === 'y' && /closed/i.test(text))).toBeFalsy()
+    // a nudge into a closed topic posts nothing and reports undelivered
+    const closedNotices = h.said.filter(([topic, text]) => topic === 'z' && /closed/i.test(text)).length
+    expect(await h.tm.sendToTopic('z', 'continue', { takeover: false, quiet: true })).toBe(false)
+    expect(h.said.filter(([topic, text]) => topic === 'z' && /closed/i.test(text)).length).toBe(closedNotices)
+    // ♻️ Reopen (admins only, in the bot): the flag is cleared and the topic lives again
+    h.store.registry['z'].closed = false
+    await h.tm.sendToTopic('z', 'after the reopen')
+    expect(h.backend.opens.length).toBe(2)
+  })
+})
+
+describe('bindings from before the profile', () => {
+  test('under a profile, a binding made before the profile opens a fresh session, not its old transcript', async () => {
+    const h = harness({ profileSessions: true })
+    // a binding the single-user install made, with a full session's transcript behind it
+    h.bind('old', { sessionId: 'full-session-1', auto: true, model: 'claude-x-disabled-since', effort: 'max' })
+    h.store.registry['old'].handoff = { at: 1, text: 'Resume: push branch fix/x from /home/op/repo, then run the deploy' }
+    await h.tm.sendToTopic('old', 'hello')
+    expect(h.backend.opens[0].resume).toBeUndefined()
+    expect(h.store.registry['old'].sessionId).toBeUndefined()
+    // its model and effort were never checked against the profile or the enabled catalog: the install's
+    // defaults take their place, as for a fresh binding (thirty-first review)
+    expect(h.store.registry['old'].model).toBe('claude-opus-5')
+    expect(h.store.registry['old'].effort).toBeUndefined()
+    expect(h.backend.opens[0].model).toBe('claude-opus-5')
+    // where the profile pins a model and an effort, the adopted binding takes those, as a fresh profile
+    // topic does (thirty-third review: the defaults alone disagreed with what a fresh topic records)
+    const pinned = harness({ profileSessions: true, profileModel: 'claude-fable-5-1', profileEffort: 'high' })
+    pinned.bind('o2', { sessionId: 'full-session-2', model: 'claude-x-disabled-since' })
+    await pinned.tm.sendToTopic('o2', 'hello')
+    expect(pinned.store.registry['o2'].model).toBe('claude-fable-5-1')
+    expect(pinned.store.registry['o2'].effort).toBe('high')
+    // a binding made under another profile is adopted too: its transcript holds that profile's prompt and
+    // tool results, and its spend was read against that profile's cap (thirty-fourth review: a boolean
+    // told a helpdesk topic from a sales one not at all); one made under this profile resumes
+    const named = harness({ profileSessions: true, profileName: 'sales' })
+    named.bind('swap', { sessionId: 'helpdesk-1' })
+    named.store.registry['swap'].profile = true
+    named.store.registry['swap'].profileName = 'helpdesk'
+    named.bind('same', { sessionId: 'sales-1' })
+    named.store.registry['same'].profile = true
+    named.store.registry['same'].profileName = 'sales'
+    await named.tm.sendToTopic('swap', 'hello')
+    await named.tm.sendToTopic('same', 'hello')
+    expect(named.backend.opens.map(o => o.resume)).toEqual([undefined, 'sales-1'])
+    expect(named.store.registry['swap'].sessionId).toBeUndefined()
+    expect(named.store.registry['swap'].profileName).toBe('sales')
+    expect(named.store.registry['same'].sessionId).toBe('sales-1')
+    // its hand-off and approval mode go with it: neither is the profile topic's to resume
+    expect(h.store.registry['old'].handoff).toBeUndefined()
+    expect(h.store.registry['old'].auto).toBe(false)
+    // and the same adoption runs over the whole registry at boot, so no reader sees the old values first
+    const boot = harness({ profileSessions: true, budgetUsd: 2 })
+    boot.bind('kept', { sessionId: 'full-session-3', auto: true })
+    boot.store.registry['kept'].handoff = { at: 1, text: 'Resume: the operator\'s next command' }
+    boot.store.registry['kept'].spentUsd = 0.3
+    boot.tm.adoptAll()
+    expect(boot.store.registry['kept']).toMatchObject({ profile: true, auto: false, reportedUsd: 0 })
+    expect(boot.store.registry['kept'].sessionId).toBeUndefined()
+    expect(boot.store.registry['kept'].handoff).toBeUndefined()
+    // and the other way: a binding made under a profile does not resume its transcript under the full toolset
+    const back = harness()
+    back.bind('shared', { sessionId: 'forum-session-1', auto: true })
+    back.store.registry['shared'].profile = true
+    back.store.registry['shared'].handoff = { at: 1, text: 'Resume: whatever a member left here' }
+    back.tm.adoptAll()
+    expect(back.store.registry['shared']).toMatchObject({ profile: false, auto: false })
+    expect(back.store.registry['shared'].sessionId).toBeUndefined()
+    expect(back.store.registry['shared'].handoff).toBeUndefined()
+    await back.tm.sendToTopic('shared', 'hello')
+    expect(back.backend.opens[0].resume).toBeUndefined()
+    // and it is the profile's from now on: the fresh session it opened is resumed by the next stretch
+    expect(h.store.registry['old'].profile).toBe(true)
+    h.backend.last().emit(result('fresh-1'))
+    await h.tick()
+    h.tm.closeLive('old', 'evicted in test')
+    await h.tm.sendToTopic('old', 'again')
+    expect(h.backend.opens[1].resume).toBe('fresh-1')
+    // a binding made under the profile resumes its own session
+    h.bind('new', { sessionId: 'profile-session-1' })
+    h.store.registry['new'].profile = true
+    await h.tm.sendToTopic('new', 'hello')
+    expect(h.backend.opens[2].resume).toBe('profile-session-1')
+    // without the flag (no profile) a binding resumes as before
+    const plain = harness()
+    plain.bind('p', { sessionId: 'any-session' })
+    await plain.tm.sendToTopic('p', 'hello')
+    expect(plain.backend.opens[0].resume).toBe('any-session')
+    // with a budget, the dropped transcript's baseline goes with it: the fresh session's first
+    // result is this turn alone and counts whole, not as an increment over the old total
+    const priced = harness({ profileSessions: true, budgetUsd: 10 })
+    priced.bind('paid', { sessionId: 'full-session-2' })
+    Object.assign(priced.store.registry['paid'], { spentUsd: 0.4, reportedUsd: 0.4 })
+    await priced.tm.sendToTopic('paid', 'hello')
+    priced.backend.last().emit({ ...result('fresh-2'), total_cost_usd: 1 })
+    await priced.tick()
+    expect(priced.store.registry['paid'].spentUsd).toBeCloseTo(1.4) // not 1.0: the old total is no baseline
+    expect(priced.store.registry['paid'].reportedUsd).toBeCloseTo(1)
+    // a stream error under a profile is said without its detail: a spawn or transcript error names host paths
+    const failing = {
+      sent: [] as string[],
+      send() {},
+      close() {},
+      stream: () => ({
+        async *[Symbol.asyncIterator]() {
+          throw new Error('spawn /home/op/.bun/install/cache/cli.js ENOENT')
+        },
+      }),
+    }
+    const broken = harness({ profileSessions: true, budgetUsd: 2, transcriptExists: id => (id === 'unknown-1' ? undefined : id !== 'gone-1') })
+    broken.backend.open = opts => {
+      broken.backend.opens.push(opts)
+      if (opts.resume) return failing as unknown as LiveSession
+      const s = new FakeSession() // a fresh open records what it is sent
+      broken.backend.sessions.push(s)
+      return s
+    }
+    broken.bind('err', { sessionId: 'gone-1' })
+    broken.store.registry['err'].profile = true
+    await broken.tm.sendToTopic('err', 'hello')
+    await broken.tick()
+    // a failure before any result on a resume whose transcript is gone from disk drops the session id, said
+    // on its own kind and without a path: the next message opens fresh rather than failing on every message
+    const gone = broken.said.find(([topic, text]) => topic === 'err' && /could not be resumed/i.test(text))
+    expect(gone).toBeTruthy()
+    expect(gone![1]).not.toMatch(/ENOENT|\/home\//)
+    expect(broken.store.registry['err'].sessionId).toBeUndefined()
+    await broken.tm.sendToTopic('err', 'again')
+    await broken.tick()
+    expect(broken.backend.opens.map(o => o.resume)).toEqual(['gone-1', undefined])
+    // the fresh session is a new transcript: it is told where deliverables go again, as the lost one
+    // was (twenty-seventh review: the priming survived the drop, so the replacement never heard)
+    expect(broken.backend.last().sent).toEqual([expect.stringMatching(/^<telepath>[\s\S]*again$/)])
+    // while a failure on a transcript still on disk is a blip, confirmed, never inferred: the ordinary
+    // error, without its detail, and the transcript kept
+    broken.bind('kept', { sessionId: 'alive-1' })
+    broken.store.registry['kept'].profile = true
+    await broken.tm.sendToTopic('kept', 'hello')
+    await broken.tick()
+    const blip = broken.said.find(([topic, text]) => topic === 'kept' && /session error/i.test(text))
+    expect(blip).toBeTruthy()
+    expect(blip![1]).not.toMatch(/ENOENT|\/home\//)
+    expect(broken.store.registry['kept'].sessionId).toBe('alive-1')
+    // and a directory that could not be read is unknown, not gone: the transcript is kept too
+    broken.bind('unread', { sessionId: 'unknown-1' })
+    broken.store.registry['unread'].profile = true
+    await broken.tm.sendToTopic('unread', 'hello')
+    await broken.tick()
+    expect(broken.store.registry['unread'].sessionId).toBe('unknown-1')
+    // a failure with no transcript to drop is an ordinary error, said without its detail under a profile
+    const fresh = harness({ profileSessions: true })
+    fresh.backend.open = () => failing as unknown as LiveSession
+    fresh.bind('e2')
+    await fresh.tm.sendToTopic('e2', 'hello')
+    await fresh.tick()
+    const generic = fresh.said.find(([topic, text]) => topic === 'e2' && /session error/i.test(text))
+    expect(generic).toBeTruthy()
+    expect(generic![1]).not.toMatch(/ENOENT|\/home\//)
+    // and with its detail where the forum is one person's, as before
+    const own = harness()
+    own.backend.open = () => failing as unknown as LiveSession
+    own.bind('err')
+    await own.tm.sendToTopic('err', 'hello')
+    await own.tick()
+    expect(own.said.find(([topic, text]) => topic === 'err' && /ENOENT/.test(text))).toBeTruthy()
   })
 })

@@ -10,17 +10,21 @@
  * This file is the bootstrap only: config → log → state → preflight → backend →
  * topics → bot. Behaviour lives in src/ and is tested there.
  *
- * Auth: subscription (inherits the user's `claude login`; no API key).
+ * Auth: the Claude Code child's own — the user's `claude login`, or an ANTHROPIC_API_KEY
+ * in .env, which reaches the child like the rest of the daemon's environment.
  * State: <state-dir>/.env, registry.json, prefs.json, outbox/, inbox/, health.json —
  * <state-dir> defaults to this file's directory (override TG_CLAUDE_STATE_DIR).
  */
-import { chmodSync, readFileSync, writeFileSync } from 'fs'
-import { join } from 'path'
+import { chmodSync, readFileSync, statSync, writeFileSync } from 'fs'
+import { dirname, join } from 'path'
+import { API_CONSTANTS } from 'grammy'
 import { TelegramBot } from './src/bot'
+import { COMMANDS } from './src/commands'
 import { ConfigError, mergeEnvFile, parseConfig, parseEnvFile, type Config } from './src/config'
-import { Files } from './src/files'
+import { Files, transcriptExists } from './src/files'
 import { ErrorRing, Logger, Metrics } from './src/log'
 import { bundledClaudePath, checkClaudeVersion, MIN_CLAUDE_VERSION, readClaudeVersion } from './src/preflight'
+import { parseProfile, ProfileError, profileModelProblem, teamProfileProblems, type Profile } from './src/profile'
 import { handOffToRotator, rotatorActive, rotatorEnabled, waitForRotation } from './src/rotator'
 import { drainSeedRequests } from './src/seed'
 import { SdkBackend } from './src/session'
@@ -34,9 +38,17 @@ const STARTED = Date.now()
 // ── config ─────────────────────────────────────────────────────────────────
 const stateDir = process.env.TG_CLAUDE_STATE_DIR || import.meta.dir
 const envFile = join(stateDir, '.env')
+// The keys .env names: none of them reaches the transcriber, whatever they are (thirty-first
+// review), whether or not the shell had set them too: a unit whose EnvironmentFile is the same .env
+// presets every key, so "the shell had it" must not exempt a secret (the security read on the
+// thirty-second). The harmless names a transcriber needs (PATH, HOME, the locale, temp and cache
+// directories) are exempt in transcribe() itself.
+let envFileKeys: string[] = []
 try {
   chmodSync(envFile, 0o600) // it holds the bot token (a no-op on NTFS)
-  mergeEnvFile(process.env, parseEnvFile(readFileSync(envFile, 'utf8')))
+  const fromFile = parseEnvFile(readFileSync(envFile, 'utf8'))
+  mergeEnvFile(process.env, fromFile)
+  envFileKeys = Object.keys(fromFile)
 } catch {}
 
 let cfg: Config
@@ -85,28 +97,80 @@ const versionVerdict = checkClaudeVersion(claudeVersionRaw, MIN_CLAUDE_VERSION)
 if (!versionVerdict.ok) log.warn('preflight.claude_version', { message: versionVerdict.message, binary: claudeBin ?? '(sdk default)' })
 else log.info('preflight.claude_version', { message: versionVerdict.message, binary: claudeBin ?? '(sdk default)' })
 
+// ── session profile ─────────────────────────────────────────────────────────
+// The locked shape every session runs with (required in team mode). It may hold a bearer
+// header for its MCP servers, so it is kept private like .env; a profile that does not
+// parse stops the boot with every problem listed, never a bot with fewer limits than asked.
+let profile: Profile | undefined
+if (cfg.profileFile) {
+  try {
+    chmodSync(cfg.profileFile, 0o600)
+  } catch {}
+  try {
+    profile = parseProfile(JSON.parse(readFileSync(cfg.profileFile, 'utf8')), {
+      dir: dirname(cfg.profileFile),
+      readFile: p => readFileSync(p, 'utf8'),
+      isDirectory: p => {
+        try {
+          return statSync(p).isDirectory()
+        } catch {
+          return false
+        }
+      },
+    })
+  } catch (e) {
+    process.stderr.write((e instanceof ProfileError ? e.message : `session profile ${cfg.profileFile}: ${e instanceof Error ? e.message : String(e)}`) + '\n')
+    process.exit(2)
+  }
+  // A model name goes to the SDK as given: a typo would boot clean and end every turn in an error.
+  const modelProblem = profileModelProblem(profile, cfg.catalog.enabled.map(k => cfg.catalog.ids[k])) // enabled ones: a disabled model is the operator's choice too
+  if (modelProblem) {
+    process.stderr.write(`session profile ${cfg.profileFile}:\n  - ${modelProblem}\n`)
+    process.exit(2)
+  }
+  if (cfg.teamMode) {
+    const problems = teamProfileProblems(profile)
+    if (problems.length) {
+      process.stderr.write(`session profile ${cfg.profileFile}, in team mode:\n  - ${problems.join('\n  - ')}\n`)
+      process.exit(2)
+    }
+  }
+}
+
 // ── wiring ──────────────────────────────────────────────────────────────────
-const backend = new SdkBackend({ settingSources: ['user', 'project', 'local'], pathToClaudeCodeExecutable: cfg.claudeBinary, log })
+const backend = new SdkBackend({ settingSources: ['user', 'project', 'local'], pathToClaudeCodeExecutable: cfg.claudeBinary, log, profile })
 
 const CHILD_ENV: Record<string, string | undefined> = { ...process.env }
 
 function statusText(): string {
   const up = Math.round((Date.now() - STARTED) / 60000)
   const snap = metrics.snapshot()
+  const head =
+    `📊 telepath ${VERSION} · SDK ${SDK_VERSION} · ${versionVerdict.message}\n` +
+    `up ${up} min · ${topics.live.size}/${cfg.maxLiveSessions} live · ${Object.keys(store.registry).length} topics bound · idle ${cfg.idleMinutes}m\n`
+  // Team mode: the forum reads this, so no admin ids, no topic titles, no error strings
+  // (those stay in the journal and health.json); counts only.
+  if (cfg.teamMode) {
+    return (
+      head +
+      `team mode · ${profile ? `profile ${profile.name} (${profile.allowedTools.length} tools)` : 'no profile'} · ${cfg.teamTopicsPerDay} topics per member per day\n` +
+      `turns ${snap.turns ?? 0} · errors ${snap.turn_errors ?? 0} (details in the journal)`
+    )
+  }
   const liveList = [...topics.live.values()].map(l => `• ${store.registry[l.topicId]?.title ?? l.topicId} — ${l.model}${isBusy(l) ? ` (running${l.queued ? `, ${l.queued} queued` : ''})` : ''}`)
   const errors = ring.list().slice(-5).map(e => `• ${new Date(e.at).toISOString().slice(11, 19)} ${e.ev}${e.message ? `: ${e.message.slice(0, 120)}` : ''}`)
   const counters = Object.entries(snap).map(([k, v]) => `${k}=${v}`).join('  ')
   return (
-    `📊 telepath ${VERSION} · SDK ${SDK_VERSION} · ${versionVerdict.message}\n` +
-    `up ${up} min · ${topics.live.size}/${cfg.maxLiveSessions} live · ${Object.keys(store.registry).length} topics bound · idle ${cfg.idleMinutes}m\n` +
-    `default ${store.prefs.defaultModel} @ ${store.prefs.defaultEffort ?? 'default'} · models ${cfg.catalog.enabled.join(',')} · rotator ${rotatorEnabled() ? 'on' : 'off'}\n\n` +
+    head +
+    `default ${store.prefs.defaultModel} @ ${store.prefs.defaultEffort ?? 'default'} · models ${cfg.catalog.enabled.join(',')} · rotator ${rotatorEnabled() ? 'on' : 'off'}\n` +
+    `${profile ? `profile ${profile.name} (${profile.allowedTools.length} tools)` : 'no profile'}\n\n` +
     (liveList.length ? `Live:\n${liveList.join('\n')}\n\n` : '') +
     (counters ? `Counters: ${counters}\n\n` : '') +
     (errors.length ? `Recent errors:\n${errors.join('\n')}` : 'No errors recorded.')
   )
 }
 
-const bot = new TelegramBot({ cfg, store, files, log, metrics, statusText })
+const bot = new TelegramBot({ cfg, store, files, log, metrics, statusText, profile, envFileKeys })
 
 const topics = new TopicManager({
   store,
@@ -122,17 +186,26 @@ const topics = new TopicManager({
   rotator: { enabled: rotatorEnabled, active: rotatorActive, handOff: handOffToRotator, waitForRotation: b => waitForRotation(b) },
   log,
   metrics,
+  primeContract: !profile,
+  budgetUsd: profile?.maxBudgetUsd,
+  profileSessions: !!profile, shared: cfg.teamMode, stuckTurnMs: cfg.stuckTurnMinutes * 60_000, replyMuted: (t, k, s) => bot.muted(t, k, s), transcriptExists,
+  profileModel: profile?.model, profileEffort: profile?.effort, profileName: profile?.name,
 })
 bot.attachTopics(topics)
+// Bindings from the other side of the profile line become this side's in one pass, so no reader
+// sees their old session, hand-off or approval mode, and outside team mode every `closed` flag a
+// team-mode run left is cleared; the manager adopts any binding added since on its first open.
+topics.adoptAll()
 
 // ── periodic work ───────────────────────────────────────────────────────────
 setInterval(() => topics.evictIdle(), 60_000).unref()
 // A todo-queue run drops a seed-request per finished item; bind each to its session so it
 // can be continued by typing in the topic. Binding only (the topic already exists); paint controls.
+// Under a profile the requests are refused and consumed: the profile owns every session.
 const seedDir = join(stateDir, 'seed-requests')
 setInterval(() => {
   try {
-    for (const id of drainSeedRequests(seedDir, store, Date.now, log)) {
+    for (const id of drainSeedRequests(seedDir, store, Date.now, log, !!profile)) {
       metrics.inc('seed_bindings')
       void bot.postPinnedControls(id)
     }
@@ -188,16 +261,58 @@ process.on('SIGTERM', () => shutdown('SIGTERM'))
 // ── boot ────────────────────────────────────────────────────────────────────
 try {
   const me = await bot.bot.api.getMe()
-  await bot.bot.api.setMyCommands([
-    { command: 'menu', description: 'Open the menu — everything is buttons' },
-    { command: 'status', description: 'Live sessions, counters, versions' },
-  ])
+  if (cfg.teamMode) {
+    // chat_member updates reach admins only; without them a removed member keeps access until the TTL,
+    // and topics are created with Manage Topics. Refused, not warned (twenty-eighth review): the forum
+    // would run with fewer limits than asked, as with a profile problem, and the fix is one Telegram
+    // setting. A lookup that fails is a precondition not read, refused too (thirty-first review): a
+    // boot that went on would run with exactly the two gaps the check exists to refuse. Retried in
+    // process first (thirty-fifth review): a transient failure that exits at once would exhaust the
+    // service's start limit and leave the bot down until a person resets it.
+    try {
+      const self = await (async () => {
+        for (let attempt = 1; ; attempt++) {
+          try {
+            return await bot.bot.api.getChatMember(cfg.forumChatId, me.id)
+          } catch (e) {
+            if (attempt >= 6) throw e
+            log.warn('preflight.bot_membership_retry', { attempt, error: e instanceof Error ? e.message : String(e) })
+            await new Promise(r => setTimeout(r, 10_000))
+          }
+        }
+      })()
+      if (self.status !== 'administrator' && self.status !== 'creator') {
+        process.stderr.write(`team mode: the bot is "${self.status}" in ${cfg.forumChatId}, not an admin. Make it an admin of the forum with Manage Topics: topics are created with it, and chat_member updates, which end a removed member's cached access early, reach admin bots only.\n`)
+        process.exit(2)
+      }
+      // An admin without the right the check is named for creates no topic: every /new would fail at
+      // runtime, ten times a minute per member (twenty-ninth review). The payload carries the right,
+      // and may leave it out when it is not granted, so absent is a no (Codex hook).
+      if (self.status === 'administrator' && !self.can_manage_topics) {
+        process.stderr.write(`team mode: the bot is an admin of ${cfg.forumChatId} without Manage Topics, so it can create no topic. Give it that right in the forum's admin settings.\n`)
+        process.exit(2)
+      }
+    } catch (e) {
+      process.stderr.write(`team mode: could not read the bot's membership of ${cfg.forumChatId} in six tries over a minute (${e instanceof Error ? e.message : String(e)}); the admin check is not skipped. Start again once Telegram answers.\n`)
+      process.exit(2)
+    }
+  }
+  // The published menu reads the one command table (src/commands.ts), like the gate and the
+  // handler. In team mode everyone sees new, menu and help (the member actions with a typed form),
+  // and /status, an admin's, is in no menu: Telegram's administrators are not ADMIN_USER_IDS, so a
+  // scope for them would offer some a command that refuses them and hide it from others. Admins
+  // have it from the README.
+  const publish = (names: string[]) => names.map(command => ({ command, description: COMMANDS[command] }))
+  await bot.bot.api.setMyCommands(publish(cfg.teamMode ? ['new', 'menu', 'help'] : ['menu', 'status']))
   log.info('telepath.up', {
     version: VERSION,
     sdk: SDK_VERSION,
     bot: me.username,
     chat: cfg.forumChatId,
     user: cfg.allowedUserId,
+    teamMode: cfg.teamMode,
+    admins: cfg.adminUserIds,
+    profile: profile ? { name: profile.name, servers: Object.keys(profile.mcpServers), allowedTools: profile.allowedTools.length, tools: profile.tools.length } : null,
     defaultModel: store.prefs.defaultModel,
     defaultEffort: store.prefs.defaultEffort ?? 'default',
     models: cfg.catalog.enabled.join(','),
@@ -210,4 +325,5 @@ try {
   process.exit(3)
 }
 writeHealth()
-bot.bot.start({ onStart: i => log.info('telegram.polling', { as: i.username }) })
+// chat_member updates are off by default; team mode's membership cache is cleared by them.
+bot.bot.start({ allowed_updates: [...API_CONSTANTS.DEFAULT_UPDATE_TYPES, 'chat_member'], onStart: i => log.info('telegram.polling', { as: i.username }) })

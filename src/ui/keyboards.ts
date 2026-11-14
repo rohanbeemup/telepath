@@ -9,12 +9,20 @@ import { feedOn, type Binding, type Prefs } from '../state'
 
 export const PAGE_SIZE = 10
 
-export function mainMenuKb(): InlineKeyboard {
-  return new InlineKeyboard()
-    .text('🆕 New session', 'm:new').text('⚡ Quick new', 'm:quick').row()
-    .text('📋 My sessions', 'm:list').text('▶️ Resume last', 'm:resume').row()
-    .text('⚙️ Settings', 'm:settings').text('📊 Status', 'm:status').row()
-    .text('❓ Help', 'm:help')
+/**
+ * Team mode: members get the screens that change nothing on the host; the rest is the
+ * admins'. A profile (always on in team mode, optional otherwise) owns the model, the
+ * effort and the absent approvals, so their buttons go.
+ */
+export type KbMode = { team?: boolean; profile?: boolean; /** The keyboard is an admin's reply: the admin-only buttons stay. */ admin?: boolean }
+
+export function mainMenuKb(mode: KbMode = {}): InlineKeyboard {
+  // Status is the admins' (typed /status): the operator's view of the box, reduced in team mode.
+  if (mode.team) return new InlineKeyboard().text('🆕 New topic', 'm:new').row().text('❓ Help', 'm:help')
+  const kb = new InlineKeyboard().text('🆕 New session', 'm:new').text('⚡ Quick new', 'm:quick').row()
+  // Under a profile every topic starts fresh, so the list of old sessions and the resume are not offered: a tap would only be refused.
+  if (!mode.profile) kb.text('📋 My sessions', 'm:list').text('▶️ Resume last', 'm:resume').row()
+  return kb.text('⚙️ Settings', 'm:settings').text('📊 Status', 'm:status').row().text('❓ Help', 'm:help')
 }
 
 export const backKb = (): InlineKeyboard => new InlineKeyboard().text('⬅️ Back', 'm:menu')
@@ -55,19 +63,38 @@ export function settingsText(c: Catalog, prefs: Prefs, defaultCwd: string): stri
   )
 }
 
-export function topicControlsKb(c: Catalog, b: Binding): InlineKeyboard {
+export function topicControlsKb(c: Catalog, b: Binding, mode: KbMode = {}): InlineKeyboard {
   const kb = new InlineKeyboard()
-  for (const k of c.enabled) kb.text(`${MODEL_MENU[k].short}${b.model === c.ids[k] ? ' ✓' : ''}`, `m:tm:${k}`)
-  kb.row()
-  if (supportsEffort(c, b.model)) effortRows(kb, b.effort, 'te')
-  kb.text(b.auto ? '⚡ Auto: ON → switch to approvals' : '🔐 Approvals: ON → switch to auto', 'm:ta').row()
+  if (mode.team && b.closed) {
+    // Closed by an admin: the panel stays pinned in this state, so the way to reopen is where the
+    // refusal says it is, and a later refresh of the panel keeps it (seventeenth review).
+    kb.text('♻️ Reopen', 'm:treopen').row()
+    kb.text('🗑 Delete', 'm:tdelete').text('🧹 Delete & remove all', 'm:twipe')
+    return kb
+  }
+  if (!mode.team && !mode.profile) {
+    // The profile owns the model, the effort and the (absent) approvals.
+    for (const k of c.enabled) kb.text(`${MODEL_MENU[k].short}${b.model === c.ids[k] ? ' ✓' : ''}`, `m:tm:${k}`)
+    kb.row()
+    if (supportsEffort(c, b.model)) effortRows(kb, b.effort, 'te')
+    kb.text(b.auto ? '⚡ Auto: ON → switch to approvals' : '🔐 Approvals: ON → switch to auto', 'm:ta').row()
+  }
   kb.text(feedOn(b) ? '🔎 Activity feed: ON → hide tool calls' : '🔎 Activity feed: OFF → show tool calls', 'm:tf').row()
   kb.text('💾 Close & keep', 'm:tclose').text('🗑 Close & delete', 'm:tdelete').row()
   kb.text('🧹 Close, delete & remove all', 'm:twipe')
   return kb
 }
 
-export function topicControlsText(c: Catalog, b: Binding, note?: string): string {
+export function topicControlsText(c: Catalog, b: Binding, note?: string, mode: KbMode = {}): string {
+  if (mode.team && b.closed) {
+    return `⚙️ "${b.title}"\n🔒 Closed by an admin: no session opens here until an admin reopens it.${note ? `\n${note}` : ''}`
+  }
+  if (mode.team) {
+    return `⚙️ "${b.title}"\n🔎 feed ${feedOn(b) ? 'on' : 'off'} · closing, deleting and wiping a topic is for admins\n\n💬 Just type your question below.${note ? `\n${note}` : ''}`
+  }
+  if (mode.profile) {
+    return `⚙️ "${b.title}"\nProfile session · 🔎 feed ${feedOn(b) ? 'on' : 'off'}\n\n💬 Just type your request below.${note ? `\n${note}` : ''}`
+  }
   const effort = supportsEffort(c, b.model) ? ` · 🎚 ${b.effort ?? 'default'}` : ''
   return (
     `⚙️ "${b.title}"\n` +
@@ -150,11 +177,12 @@ export const statusLiveKb = (): InlineKeyboard => new InlineKeyboard().text('⏹
  * already with the session (the CLI folds them into the running or the next turn), so
  * nothing can be taken back; the confirmation says so instead of offering it.
  */
-export function wrapConfirmKb(): InlineKeyboard {
-  return new InlineKeyboard()
-    .text('⏹ Hand off at the next step (recommended)', 'm:tw:now').row()
-    .text('⏳ Finish this turn first, then hand off', 'm:tw:turn').row()
-    .text('↩️ Cancel', 'm:ctl')
+export function wrapConfirmKb(mode: KbMode = {}): InlineKeyboard {
+  const kb = new InlineKeyboard()
+  // Stopping at the next step interrupts a colleague's turn: an admin's in a shared forum, so not offered to
+  // members, and kept on an admin's confirmation, where the gate admits the tap (twenty-seventh review).
+  if (!mode.team || mode.admin) kb.text('⏹ Hand off at the next step (recommended)', 'm:tw:now').row()
+  return kb.text('⏳ Finish this turn first, then hand off', 'm:tw:turn').row().text('↩️ Cancel', 'm:ctl')
 }
 
 export function wrapConfirmText(queued: number): string {

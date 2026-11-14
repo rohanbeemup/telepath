@@ -15,7 +15,7 @@ export type Event =
   /** A hard rejection, once per turn. */
   | { kind: 'rateLimitHit'; resetsAt?: number }
   | { kind: 'turnEnd'; costUsd?: number; durationMs?: number; afterRateLimit: boolean }
-  | { kind: 'turnError'; subtype: string; errors: string[]; afterRateLimit: boolean }
+  | { kind: 'turnError'; subtype: string; errors: string[]; afterRateLimit: boolean; costUsd?: number }
   | { kind: 'task'; status: 'started' | 'completed' | 'failed' | 'stopped'; description: string; background: boolean }
   | { kind: 'denied'; tool: string; message: string }
   | { kind: 'assistantError'; error: string }
@@ -89,7 +89,8 @@ export function interpret(msg: any, st: PumpState): Event[] {
         out.push({ kind: 'turnEnd', costUsd: msg.total_cost_usd, durationMs: msg.duration_ms, afterRateLimit })
       } else {
         const errors = Array.isArray(msg.errors) ? msg.errors.map(String) : typeof msg.result === 'string' && msg.result ? [msg.result] : []
-        out.push({ kind: 'turnError', subtype: String(msg.subtype ?? 'error'), errors, afterRateLimit })
+        // A failed turn spent money too; the budget accounting reads it.
+        out.push({ kind: 'turnError', subtype: String(msg.subtype ?? 'error'), errors, afterRateLimit, ...(typeof msg.total_cost_usd === 'number' ? { costUsd: msg.total_cost_usd } : {}) })
       }
       return out
     }

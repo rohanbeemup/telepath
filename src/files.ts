@@ -2,7 +2,7 @@
  * Files both ways: the per-topic outbox a session drops deliverables into, the inbox
  * Telegram uploads land in, and transcript removal for the full wipe.
  */
-import { existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'fs'
+import { existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync, writeFileSync, type Dirent } from 'fs'
 import { homedir } from 'os'
 import { basename, join } from 'path'
 
@@ -75,10 +75,22 @@ export class Files {
     writeFileSync(path, data)
     return path
   }
+
+  /** An inbox file nothing will read again (audio, once heard). */
+  removeInbox(path: string): void {
+    try {
+      rmSync(path, { force: true })
+    } catch {}
+  }
 }
 
-/** Delete a session's transcript from ~/.claude/projects (makes it unresumable). */
-export function deleteTranscript(sessionId: string, projectsDir = join(homedir(), '.claude', 'projects')): string[] {
+/** Where the CLI keeps transcripts: under CLAUDE_CONFIG_DIR when the environment sets one (the child honours it), else ~/.claude. */
+export function projectsRoot(env: NodeJS.ProcessEnv = process.env): string {
+  return join(env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude'), 'projects')
+}
+
+/** Delete a session's transcript from the projects directory (makes it unresumable). */
+export function deleteTranscript(sessionId: string, projectsDir = projectsRoot()): string[] {
   const removed: string[] = []
   let projects: string[]
   try {
@@ -96,6 +108,33 @@ export function deleteTranscript(sessionId: string, projectsDir = join(homedir()
     } catch {}
   }
   return removed
+}
+
+/**
+ * Whether a session's transcript is still on disk, in any project under ~/.claude/projects:
+ * what makes a resume possible at all. Undefined when the directory cannot be read: unknown
+ * is not gone (a permission or a passing filesystem failure must not cost a transcript).
+ */
+export function transcriptExists(sessionId: string, projectsDir = projectsRoot()): boolean | undefined {
+  let entries: Dirent[]
+  try {
+    entries = readdirSync(projectsDir, { withFileTypes: true })
+  } catch {
+    return undefined
+  }
+  let unknown = false
+  for (const entry of entries) {
+    if (entry.isFile()) continue // a stray file beside the projects (a .DS_Store) is no place to look
+    try {
+      statSync(join(projectsDir, entry.name, `${sessionId}.jsonl`)) // through a symlink, when the project is one
+      return true
+    } catch (e) {
+      const code = (e as { code?: string }).code
+      // "No such file" and "not a directory" (a link to a file) are a no; a permission in the way is a project not looked at.
+      if (code !== 'ENOENT' && code !== 'ENOTDIR') unknown = true
+    }
+  }
+  return unknown ? undefined : false
 }
 
 /** Candidate working dirs: the default first, then every project under reposDir (git repos first, newest first), then home. */

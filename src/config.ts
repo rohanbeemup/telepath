@@ -4,7 +4,7 @@
  * install is fixed in one edit rather than one restart per missing key.
  */
 import { homedir } from 'os'
-import { dirname, join } from 'path'
+import { dirname, isAbsolute, join } from 'path'
 import { buildCatalog, parseEffort, type Catalog, type Effort } from './models'
 
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error'
@@ -14,6 +14,16 @@ export type Config = {
   telegramToken: string
   allowedUserId: string
   forumChatId: string
+  /** Every member of the forum may talk; admins keep the destructive and configuring actions. */
+  teamMode: boolean
+  /** The allowed user, then ADMIN_USER_IDS; never empty. */
+  adminUserIds: string[]
+  /** A locked session profile (profile.ts); required in team mode. */
+  profileFile?: string
+  /** Team mode: topics one member may open per day. */
+  teamTopicsPerDay: number
+  /** Minutes a running turn may produce nothing in a shared forum before it may be paused for a new topic. */
+  stuckTurnMinutes: number
   defaultCwd: string
   reposDir: string
   catalog: Catalog
@@ -71,6 +81,21 @@ export function parseConfig(env: Record<string, string | undefined>, stateDir: s
   const allowedUserId = req('ALLOWED_USER_ID')
   const forumChatId = req('FORUM_CHAT_ID')
 
+  const teamMode = ['1', 'true', 'on', 'yes'].includes((env.TEAM_MODE || '').trim().toLowerCase())
+  const adminUserIds = [allowedUserId, ...(env.ADMIN_USER_IDS || '').split(',')].map(s => s.trim()).filter((s, i, all) => s !== '' && all.indexOf(s) === i)
+  for (const id of adminUserIds.slice(1)) {
+    if (!/^\d+$/.test(id)) problems.push(`ADMIN_USER_IDS: "${id}" is not a numeric Telegram user id (comma-separated ids, from @userinfobot)`)
+  }
+  // Outside team mode only the allowed user is admitted at all, so further admins would boot
+  // clean and get silence (twenty-second review).
+  if (!teamMode && adminUserIds.length > 1) problems.push('ADMIN_USER_IDS beyond ALLOWED_USER_ID needs TEAM_MODE=1: outside team mode only the allowed user is admitted, so the others would be dead configuration')
+  const profileFile = env.PROFILE_FILE ? (isAbsolute(env.PROFILE_FILE) ? env.PROFILE_FILE : join(stateDir, env.PROFILE_FILE)) : undefined
+  if (teamMode && !profileFile) problems.push('TEAM_MODE requires PROFILE_FILE: a locked session profile is what makes a shared forum safe (README, Team mode)')
+  const teamTopicsPerDay = num('TEAM_TOPICS_PER_DAY', 20)
+  // In a shared forum, a running turn that produced nothing for this long may be paused for a
+  // new topic; set it above the longest tool call the profile allows.
+  const stuckTurnMinutes = num('STUCK_TURN_MINUTES', 10)
+
   const defaultCwd = env.DEFAULT_CWD || homedir()
   const reposDir = env.REPOS_DIR || dirname(defaultCwd)
 
@@ -107,6 +132,11 @@ export function parseConfig(env: Record<string, string | undefined>, stateDir: s
     telegramToken,
     allowedUserId,
     forumChatId,
+    teamMode,
+    adminUserIds,
+    profileFile,
+    teamTopicsPerDay,
+    stuckTurnMinutes,
     defaultCwd,
     reposDir,
     catalog,

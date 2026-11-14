@@ -1,0 +1,622 @@
+---
+feature: a forum group shares one bot, every member chats in open topics, each topic runs a locked session profile (one MCP server set, no built-in tools, no prompts), and only admins can close, delete, wipe or reconfigure
+suite:
+  - src/config.test.ts
+  - src/access.test.ts
+  - src/profile.test.ts
+  - src/team.test.ts
+  - src/commands.test.ts
+  - src/topics.test.ts
+  - src/throttle.test.ts
+  - src/files.test.ts
+  - src/ui/keyboards.test.ts
+  - src/seed.test.ts
+  - src/voice.test.ts
+gate: bun test
+---
+
+# Team mode: a group of people, one locked profile
+
+## Premise
+
+The request: open a telepath install to a Telegram group, so that any member can start a
+topic and chat, while the sessions behind the topics can reach one set of MCP tools and
+nothing else. What was checked, against the code at `ca72e9f`:
+
+- **True: the install is single-user by one function.** `TelegramBot.allowed()`
+  (`src/bot.ts`) admits an update only when `ctx.from.id` equals `ALLOWED_USER_ID` and
+  the chat is `FORUM_CHAT_ID`; every handler in `wire()` calls it, and nothing else keys
+  on the user id (`daemon.ts` only logs it). Widening it is one decision in one place.
+- **True: every session is a full Claude Code session.** `SdkBackend.open()`
+  (`src/session.ts`) sets `permissionMode: 'default'` and the daemon passes
+  `settingSources: ['user', 'project', 'local']`; no `tools`, `mcpServers` or
+  `allowedTools` are set, so a session has every built-in tool plus whatever the
+  machine's settings and MCP config add. In a group that is a member running `Bash` on
+  the host after one tap on Allow, by any other member.
+- **True: the approval gate would deny the very tools a profile allows.** The
+  `PreToolUse` hook (`src/gate.ts`) answers `permissionDecision: 'ask'` for every tool
+  outside `AUTO_ALLOW`, which includes every `mcp__*` tool. Under `permissionMode:
+  'dontAsk'` an `ask` is a denial, so a profile session must not install that hook; its
+  job (forcing prompts past settings allow rules) does not exist when no settings are
+  read and nothing may prompt.
+- **False, and corrected: "`dontAsk` plus `allowedTools` is an exclusive allowlist".**
+  `dontAsk` denies only a tool that would have prompted, and Claude Code auto-approves its
+  read-only built-ins (`Read`, `Glob`, `Grep`, …), so a profile that kept `Read` in
+  `tools` without listing it in `allowedTools` would still run it (found by the Codex
+  pre-commit review, 12 Nov 2026). The profile therefore installs a hook of its own in
+  place of the approval gate: `{}` for a listed tool, `deny` for every other name, so the
+  allowlist holds whatever the CLI auto-approves now or later; and a kept built-in that is
+  not allowed is refused at parse time, since the model would see a tool it can never use.
+- **True: the SDK carries every option the profile needs.** `sdk.d.ts` of the bundled
+  `@anthropic-ai/claude-agent-sdk@0.3.278` declares `tools`, `mcpServers`,
+  `strictMcpConfig`, `allowedTools`, `permissionMode` with `'dontAsk'`,
+  `settingSources`, `systemPrompt` (a string is a custom prompt that replaces Claude
+  Code's), `cwd`, `model`, `effort`, `maxTurns` and `maxBudgetUsd`.
+- **True: the typed and tapped paths let a user choose the working directory and switch
+  approvals off.** `parseNew()` honours `cwd=` and `auto`; the wizard
+  (`src/ui/wizard.ts`) ends in a folder, model, effort and approvals choice. In a group
+  these are a member's choices about the host, so team mode must not route through
+  either: a topic binds to the profile, full stop.
+- **False, and corrected: "telepath needs a `claude login`".** Nothing checks for a
+  login (`src/preflight.ts` reads only the binary's version). The child's environment is
+  the daemon's (`CHILD_ENV` in `daemon.ts`, minus the bot token in
+  `TopicManager.ensureLive`), so an `ANTHROPIC_API_KEY` in `.env` reaches the Claude
+  Code child. That the child prefers it over a stored login is a Ring 2 check on a box
+  with no login at all, not a unit test.
+- **False, and corrected: "Telegram delivers a group's messages from its members only."**
+  True of a private group; a public supergroup can let anyone post without joining
+  (`join_to_send_messages` off), so a chat-id check alone would answer an outsider with
+  the profile's tools (Codex pre-commit finding, 12 Nov 2026). Team mode therefore asks the
+  forum itself whether the sender is a member (`getChatMember`), keeps the answer for a
+  short while, and fails closed when the lookup fails. The bot, an admin with Manage
+  Topics, receives every message regardless of privacy mode; that part stands.
+
+- **False, and corrected twice: "a resumed Claude Code process reports its own cost, not
+  the topic's."** The second review asked whether `total_cost_usd` restarts per `query()`
+  or carries a resumed session's history. A CLI probe (one Haiku turn 0.0041, then three
+  resumed one-word turns at 0.0075, 0.0079, 0.0082) was first read as "flat, so per
+  process". The fifth review pointed at the SDK's own text (`sdk.d.ts`, `total_cost_usd`):
+  "a resumed or forked session continues from the total its transcript saved (so the
+  first result already carries the earlier turns; `maxBudgetUsd` counts only the spend
+  since this query() call started)". The probe agrees once read right: each resumed turn
+  added three to four tenths of a cent on top of the carried total, as a cached one-word
+  turn does. So a result's total **is** the topic's running total, the latest result is the
+  spend (never a sum across stretches), and the remaining budget handed to a stretch stays
+  right, since the SDK's own cap counts only that stretch.
+  **One bound, stated rather than closed (seventh round, Codex; narrowed in the ninth):**
+  a stretch whose transcript saved no total restarts its counter, and when such a
+  stretch's first turn costs at least the last total the transcript reported it reads as a
+  carried total, so the record falls short by that last total: at most one cap, once per
+  lost transcript, and only for a transcript this bot did not see complete a turn. (The
+  seventh round read the restart against the record instead, which charged every stretch
+  after a lost one its history a second time.) The SDK's usage query would make this exact
+  and is marked experimental ("do not rely on it yet"), so it is not used.
+  **A stretch paused before its first result reports no spend** (second security read).
+  With stuck meaning silent, the only running turn a shared forum ever pauses is one that
+  produced nothing for ten minutes. The third security read noted that a long single
+  answer is silent too when the pump sees an assistant message only once it is complete,
+  and bills on disconnect; so profile sessions stream their deltas
+  (`includePartialMessages`), every delta counts as output, and silent now means no
+  tokens flowing: a hung process, or a tool the server is slow on, neither of which
+  spends. The unrecorded part is at most what such a turn spent before it went silent,
+  once per hang. It is not charged as the stretch's cap: that would close a topic for a
+  tool's hang. The fifteenth round's claim that the remainder handed to a resumed stretch
+  trips against the transcript's cumulative total is refuted by the same typings:
+  `maxBudgetUsd` counts the current `query()` only. The twenty-sixth read made the claim
+  again from the `maxBudgetUsd` comment alone ("maximum budget in USD for the query"), which
+  does not say either way; the `total_cost_usd` text in the same file does, and the Ring 2
+  run below includes a resumed stretch so the box shows it rather than the typings.
+- **No prompt can occur under a profile today**: `tools` cannot hold `AskUserQuestion`,
+  `dontAsk` never prompts, and no `canUseTool` is passed. The tap policy for Allow/Deny and
+  question buttons (second round) was removed in the fifth round as unreachable and put
+  back in the sixth on the security review's objection: it is defense in depth for a path
+  a later change could reopen without noticing, and a pure rule with its mutants costs
+  little to keep. The single-user tap handling is as it was.
+- **Telegram answers 400 for an id the chat has never seen**, not `status: left`, and
+  posts by an anonymous admin or a linked channel carry a proxy `from` (with
+  `sender_chat` set) that no member list contains (sixth round). So a 400 is a no, not a
+  blip, and a post with `sender_chat` is refused outright with its own notice.
+
+Nothing in this change names a company, a product or a particular MCP server: the repo
+is public, and the profile is the install's own file.
+
+## Cases
+
+Every row is one test. The case name is **verbatim** the string the test is registered
+under, because `scripts/audit/test_plan_check.py` compares the two sets in both
+directions and a paraphrase reads as a missing test.
+
+| Case | Asserts | Mutant it kills |
+|---|---|---|
+| `team mode is off unless TEAM_MODE says so` | `teamMode` is false when `TEAM_MODE` is absent, `0` or `false`, and true for `1`, `true`, `on` | Default on: every existing single-user install opens its forum to anyone added to it |
+| `admins are the allowed user plus ADMIN_USER_IDS` | `adminUserIds` holds `ALLOWED_USER_ID` and each id in `ADMIN_USER_IDS`, trimmed, deduplicated, each a numeric Telegram id, or a config problem that names the offending entry; further admins without `TEAM_MODE` are a config problem naming it, since outside team mode only the allowed user is admitted and they would boot clean into silence (twenty-second review) | `ADMIN_USER_IDS` replaces the allowed user, and the installing user loses admin on their own bot; entries unchecked, so a space instead of a comma yields one admin id that matches nobody and the second admin is a plain member with no word at boot (review, 13 Nov); further admins accepted outside team mode, dead configuration that boots clean (twenty-second review) |
+| `outside team mode only the allowed user in the forum is admitted` | with `teamMode` false, `admitted()` is true only for the allowed user id in the forum chat | The chat-only check of team mode applied to single-user installs |
+| `in team mode every message in the forum chat is admitted` | with `teamMode` true, `admitted()` (the chat gate; membership is the row below) passes any user id in the forum chat | The user-id comparison kept, so members other than the owner are silently dropped (`rejected_updates`) |
+| `in team mode a sender is admitted only when the forum reports them as a member` | `Membership.check()` is `member` for `creator`, `administrator`, `member`, and `restricted` with `is_member` and not muted (`can_send_messages` not false); `no` for `left`, `kicked`, `restricted` without membership or muted, and a status it has never seen | The chat id trusted on its own: a public forum that lets non-members post would hand the assistant and its tools to anyone (Codex finding); an unknown status read as membership; a muted member admitted, so Telegram drops their messages but their taps still open topics and spend budget (ninth review) |
+| `a membership answer is cached, a failure only briefly, and a change the forum reports clears it` | a second check within the TTL calls the lookup once; after the TTL it calls again; a negative answer is re-checked after a short grace rather than the full TTL; a lookup that throws answers `unknown` (`isMember` false), is kept for the grace only (bounded API load: a non-member or an API error costs one call per grace, not one per message), then asked again; `check()` tells `unknown` from `no`, so the bot can say "could not verify you, try again in a moment" instead of dropping the message in silence (review, 13 Nov); `forget(id)` drops the entry so the next check asks the forum (wired to `chat_member` updates, so a kicked member loses access at once rather than at the TTL; security review). An admin from the config is admitted without asking the forum (`membershipRequired()`), so an API blip never locks the admins out. Concurrent checks of one id share one lookup; expired entries are swept once the cache passes its size, and when nothing has expired the entry expiring soonest goes (a stranger's grace before a member's TTL, whoever arrived first), so neither a flood of strangers nor a forum larger than the cache grows memory without bound (review, 13 Nov; eleventh review); a lookup that throws before returning a promise is a failed lookup like any other (unknown, kept for the grace). A lookup Telegram answers with 400 "user not found" (or `PARTICIPANT_ID_INVALID`, `USER_ID_INVALID`) is a no, not an unknown; any other failure, a 400 about the chat included (chat not found, member list inaccessible: a misconfiguration, not a stranger), is unknown; `noticeDue(id)` is true once per fresh unknown, so the bot's "could not verify" notice rides the same grace as the verdict, with no second timer; a lookup writes its answer only while it is still the pending one for its id (a per-lookup token; `forget` clears the pending one), so neither a lookup orphaned by a removal nor one overtaken by a second removal can cache a stale yes (ninth review and the security review: a per-id counter deleted by the orphan let the second removal go unseen) | No cache: one API round trip per message, forever; a thrown lookup cached as a rejection for the TTL, so one API hiccup locks a member out for ten minutes; a thrown lookup not cached at all, so a non-member posting fifty messages costs fifty serial calls ahead of everyone's (Claude review finding); a negative cached for the full TTL, so a member added just now is ignored for ten minutes; `forget` ignored, so a kicked member keeps access for the TTL; `unknown` reported as `no`, so a blip reads as a kicked member; admins put through the lookup, so a blip locks out the only people who could fix it; no in-flight dedupe, so a burst from one unknown sender is one call per message; no sweep, so every stranger's id stays until restart; a 400 read as a blip, so every outsider in a public forum gets a "could not verify" notice and the counters read as an outage; every 400 read as a no, so a stale `FORUM_CHAT_ID` or a bot removed from the forum refuses every member in silence while the exempt admins see it working (review, 13 Nov); a notice on every message of the grace, or never; a pending lookup's stale yes written over a `forget`, so a removed member chats on for ten minutes; a cap that only ever drops expired entries, so a forum larger than the cache grows it without bound (eighth review); the per-id counter the orphan deleted, so a second removal during the replacement lookup went unseen; a token that asks "is any lookup pending for this id" rather than "is it this one", so an orphan's late yes overwrites its replacement's no and drops it from the map (ninth review); the first-inserted key evicted, so a long-standing member pays a lookup on the update loop each time a stranger arrives (eleventh review) |
+| `members may chat, open topics, wrap up and toggle the feed` | `allowedAction()` admits, for a non-admin in team mode: chat text, `/new`, `/help`, `/menu`, `feed on/off`, `wrap up`, and the taps `m:menu`, `m:new`, `m:newhere`, `m:help`, `m:ctl`, `m:cancel`, `m:noop`, `m:tf`, `m:twrap`, `m:tw:turn`, `m:tres`. Not `/status` or `m:status`: the status screen lists recent errors, the admin ids and every topic's title (security review, 12 Nov 2026). Not `m:treopen`: reopening undoes an admin's close (review, 13 Nov). Not `m:tw:now`: wrapping up "now" interrupts a colleague's step, which the cap never does for a member, while "after this turn" is any member's (twenty-fourth review) | A member allowlist missing wrap-up or the feed, so members cannot stop a runaway turn in a shared topic; the status screen left in, so every member reads the box's errors and the admin list; reopen left in, so a member undoes an admin's close with one tap; "wrap up now" left in, so any member cuts any colleague's turn with one tap |
+| `with a profile, the model, effort and approval actions are locked whoever taps them` | `profileLocked()` names exactly `m:tm:*`, `m:te:*`, `m:ta` and `/auto`; the bot consults it at the tap gate and the slash gate, beside `allowedAction()`, so a locked action answers "Set in the profile" for admins too. Its sibling `profileFreshOnly()` names the actions that would bind an old transcript, or list the host's transcripts to pick one from (`/attach`, `m:resume`, `m:sess:*`, `/list`, `m:list`), consulted at the same two gates and answered "every topic starts fresh", so a new resume-like entry point is covered by the set rather than by an if-branch its author must remember (eighth review). Typed `use …` and `effort …` are not on it: under a profile they configure nothing, so the bot rewrites them to chat before any gate (a member answering "effort high" to a question is answering the question; review, 13 Nov), and no typed kind is consulted against the lock | A check per call site, so the next entry point that changes the binding escapes (review finding); `/auto` missing from the list; `use` or `effort` on it, so a member's reply is refused as "Admins only"; `/attach` missing from the fresh-only set, so an old transcript is bound under a profile after all; `/list` missing from it, so an admin reaches a dead list whose every pick is refused, painted from the host's transcript titles into a forum any member reads (twelfth review) |
+| `a slash command keeps its name when Telegram appends the bot's handle` | given this bot's username, `parseTyped('/new@telepath_bot pricing')` is the slash command `new` with args `pricing`, case-insensitively; a command addressed to another bot (`/new@other_bot`), or any suffixed command when the username is unknown, is `foreign` and the bot ignores it | The suffix kept, so a command tapped from the group's command menu reads `new@telepath_bot`: members are refused as "Admins only" and admins fall to the main menu (review finding); any handle accepted, so another bot's `/new@other_bot` opens a topic here (Codex finding) |
+| `a member may open only so many topics a day` | `TopicQuota.take(uid)` admits a member's first N topic openings of a calendar day and refuses the next; the count is per member and starts over on the next day, on the box's local clock, the same clock the default title shows (ninth review: a UTC day told a member "come back tomorrow" past local midnight); an opening is reserved with `take` before Telegram is asked and given back with `refund(uid)` when Telegram refuses, so a failed creation is not charged and two openings in flight cannot both pass the cap (a check-then-act `peek` would, Codex finding); `refund` never goes below zero; a reservation taken before midnight and refunded after is refunded against nothing and shortens nothing, since the counter starts over with the day (fifteenth review's claim, refuted); the configured admins and single-user installs are exempt by the one rule the membership gate uses (`membershipRequired()`), not a second copy of it | No cap: a member who taps 🆕 ten times gets ten budgets (review finding); one count shared by every member, so one member locks the others out; a count that never resets; a refund that does nothing, so twenty failed creations lock a member out for the day; admins charged, though the docs call it a member limit (review, 13 Nov) |
+| `the per-member topic cap defaults to twenty a day and must be positive` | `TEAM_TOPICS_PER_DAY` is read into `teamTopicsPerDay`, twenty when unset, and a zero or negative value is a config problem | Default zero, so nobody can open a topic; a non-positive value accepted, so the cap is either off or nonsense |
+| `the stuck-turn bound defaults to ten minutes and must be positive` | `STUCK_TURN_MINUTES` is read into `stuckTurnMinutes`, ten when unset, and a zero or negative value is a config problem; the daemon hands it to the manager as `stuckTurnMs` (fourteenth review: a profile with a slow tool must be able to raise it, since silence cannot tell a hung process from a tool still working) | A fixed ten minutes, so a twelve-minute tool is cut mid-turn on every install; a non-positive value accepted, so every running turn is stuck at once |
+| `a topic that has spent the profile's budget stays closed across idle stretches` | with `budgetUsd` set, the binding's `spentUsd` follows every result, successful or failed, by its increment over the last total the transcript reported (`reportedUsd`): a total at or above that last total continues it (within a stretch, and across a resume whose transcript saved its total, per the SDK), a total below it means the transcript restarted and counts whole (a crash or a kill mid-turn saved none), so a stretch after a lost one is not charged twice (ninth review: comparing against the record instead charged every later stretch's history again); a binding recorded before the reported total was kept (`spentUsd`, no `reportedUsd`) takes its record as the baseline for its first result (Codex hook, ninth round); a rate-limit or rotation continuation into a topic whose budget was spent meanwhile is not announced as resuming: the nudge decides, and the topic is told its budget is used (tenth review); a refused message is counted every time and answered at most once a minute per topic, so a member's flood of refused messages is not the bot's flood and, under Telegram's 429 retries on the bot's replies, not a stall of every topic (second security read); a result reporting a total of zero (a crash or startup-error result, which the SDK says may carry zeroed values) is no information and moves nothing; never a sum of stretch totals, never a max that misses a restarted stretch; kept across evictions and resumes; every stretch opens with the remaining budget (the cap minus what is spent), never the full cap; a message into a topic at or over the budget is answered with a notice and opens no session, and a nudge (the rate-limit or rotation continuation, sent `quiet`) into such a topic posts nothing and reports undelivered; a stretch ending in `error_max_budget_usd` counts as the budget spent; without a budget nothing is tracked or written | Spend not carried across stretches: the SDK's `maxBudgetUsd` is per `query()`, so every idle timeout hands the topic a fresh budget (Claude review finding); stretch totals summed, so every resume double-counts the earlier stretches and a topic is refused at half its cap (the formula the plan first had; fifth review); a max of totals, so a stretch whose transcript saved no total restarts at zero and its whole spend goes unrecorded (seventh review); the restart read against the record rather than the transcript's last total, so every stretch after a lost one is charged its history twice and the topic is refused at three quarters of its spend (ninth review); the record ignored as the baseline of a binding from before `reportedUsd` existed, so its first carried result adds its history again (Codex hook, ninth round); the record preferred over the transcript's total once both exist, the ninth-review defect by another route; the continuation announced before its nudge, so an exhausted topic reads "resuming" and then nothing (tenth review); an undelivered nudge left unexplained, the same hang by another route; a notice per refused message, so one member's flood of lines into a spent topic is the bot's flood (second security read); a zeroed result taken as the stretch's last total, so the next real total is added in full and the topic is refused at double its spend (eighth review); a nudge that says "closed" or "budget" to a topic nobody wrote in (eighth review); a resumed stretch opened with the full cap, so a topic at $9.99 of $10 spends another $10 before the check bites (Codex finding); a failed turn's spend dropped, so repeated failing stretches exceed the cap (Codex finding); the refusal only while a session is live; spend tracked and the registry rewritten on every turn of an install with no budget (review finding) |
+| `in a shared forum a running turn is paused for another topic only once it is stuck; until then the newcomer waits` | with `shared` set, at the live-session cap `ensureLive()` pauses the longest-idle session for a new topic and never one mid-turn; when every slot is held by a running turn, `openRefusal()` is `busy`, so `sendToTopic()` tells the newcomer to send again in a moment and opens nothing, a `quiet` nudge reports undelivered, and nobody's turn is killed; a turn silent (no output, no message) for `stuckTurnMs` (default ten minutes) is stuck and pausable after all, longest-silent first, so hung tools cannot hold every slot for good, while output counts as activity, so a long turn still producing is never paused (thirteenth review and the second security read: measured from the send, an eleven-minute working turn was killed for a newcomer), and silence is measured from the session's last stream message alone, so a member typing "hello?" into a hung topic does not keep its slot (fourteenth review), while a new turn's silence counts from its send, so a session idle past the bound is not stuck before its first output (Codex hook), and a turn parked on a rate limit with a resume scheduled is waiting, not hung, so it is not evicted and then told "resuming" by the resume (nineteenth review), yet it is pausable for a newcomer, since it holds no API call and its resume opens a fresh stretch, so parked turns cannot hold every slot for hours (twenty-third review); the bound is `STUCK_TURN_MINUTES`, to be set above the longest tool call the profile allows, since silence cannot tell a hung process from a slow tool; `evictIdle()` ends a stuck turn in a shared forum too, so a hung process does not wait for cap pressure; without `shared` the longest-idle session is paused for the new topic, running or not, as on main (twelfth review: the refusal was every mode's, and a turn that never ended pinned its slot forever); a paused parked topic's scheduled continuation is cancelled in a shared forum only, where the pause notice says a message resumes it, while for one user the timer stays and reopens the topic at the reset, as main did and the rate-limit notice promised (twenty-ninth review: the twenty-fourth's cancellation was unconditional); when the paused topic was waiting on a rate limit with messages folded into its turn before the limit hit (a member's later message is a takeover, which clears the timer, so this is the one way the two coincide), the notice names those messages as undelivered and asks for them again, rather than saying only that the context is kept, which is true of the transcript and not of them (thirty-third review); the victim is a stuck turn before an idle colleague, longest silent first, and only then the longest idle by activity, since a member's lines into a hung topic refresh its activity (thirty-fourth review) | The victim chosen by `lastActive` alone, so a member opening `MAX_LIVE_SESSIONS` fresh topics kills a colleague's running turn, repeatedly (security review); the busy rule missing, so the cap is exceeded when nothing can be paused; no stuck bound, so three hung turns close the forum until an admin finds them; the shared rule applied to a single user, whose own message is dropped instead of pausing their own session (twelfth review); stuck measured from the send, so a turn still producing is paused (thirteenth review); silence measured from any activity, so members' messages keep a hung turn's slot (fourteenth review); the output clock left at the last turn's end, so a session idle past the bound is killed at the start of its next turn (Codex hook); a parked turn evicted as stuck, so its scheduled resume later announces work the eviction called lost (nineteenth review); a parked turn unpausable, so three rate-limited topics hold the forum until their reset (twenty-third review); a stuck turn kept by idle eviction, so a hung process lives until the cap is hit; the continuation cancelled outside a shared forum too, so a single user's parked topic never resumes at the reset it was promised (M178, twenty-ninth review); the generic notice on a paused wait with folded messages, so a member is told the context is kept while two of their messages died with the process (M187, thirty-third review); the victim by activity alone among the pausable, so members typing into a hung topic keep its process while a colleague's warm session is paused (M189, thirty-fourth review) |
+| `a transcript is looked for on disk, and not looking is not a no` | `transcriptExists()` is true when the session's `.jsonl` is in any project under the projects directory, false when every project was looked at and none has it, and undefined when the directory, or any project directory in it, could not be looked at (a permission); a stray file beside the projects (a `.DS_Store`) is no place to look and changes nothing (twenty-fourth review: one such file made every answer unknown), while a project reached through a symlink is a project (Codex hook: a `Dirent` does not call a link a directory): the manager drops a session id only on the definite no, so a transcript that is there, or that could not be looked for, is kept (Codex hook, three times) | A read error read as absent, so a failed resume on a permission blip drops a transcript that is there; "found" lost when another project could not be looked at; a stray file counted as a project that could not be looked into, so every answer is unknown and a gone transcript is never dropped (twenty-fourth review); a symlinked project skipped, so its transcripts read as gone and a resume blip drops them (Codex hook) |
+| `a refusal is said at most once a minute per key` | `Throttle.allow(key)` is true `limit` times (default one) per key per window and false after, until the window turns; `peek(key)` asks the same without recording, so the bot's two throttles are both asked before either is charged (a muted reply costs no allowance, and a member past theirs takes no topic slot); keys are independent; once the map is large, entries past their window are swept, at most once a window, so a flood of keys cannot grow it without bound and a large map is not walked on every call (twentieth review). The bot's one rule for replies a member can trigger at will ("Admins only", the quota, the text-only, voice and wrap-up notices, the help text, the menus, feed flips, error notices, and the manager's refusals of a spent, closed or full topic and its "paused" notice, which reach it through `replyMuted` in the manager's deps, the bot's own `muted()`, required so the rule and its counter have one implementation) is one throttle keyed by topic and kind and one keyed by sender at ten a minute, since the key space of topics is a member's to grow (third security read); outside team mode the rule answers everything, since the throttles are a shared forum's and one user's notices must all be answered (seventeenth review) | The window ignored, so every refused message is answered; the key ignored, so one member's flood mutes every topic's notices; the limit ignored, so a sender's allowance is one or unbounded; no sweep, so a flood of topic ids grows the map for the process's life; `peek` recording, so asking twice mutes; the sweep on every call once large, so a busy forum walks the whole map per message (twentieth review) |
+| `under a profile, a binding made before the profile opens a fresh session, not its old transcript` | with `profileSessions` set, `ensureLive()` resumes a binding's session only when the binding was made under the profile (`profile: true`); any other binding opens with no `resume`, its old session id is dropped from the registry, and the binding becomes the profile's from then on, so the fresh session it opens is resumed by later stretches like any profile topic's; with a budget, the dropped transcript's baseline goes with it (`reportedUsd` reset to zero), so the fresh session's first result counts whole (tenth review); a stream error under a profile is said without its detail, which the log keeps, since a spawn or transcript error names host paths, and with it where the forum is one person's, as before (twelfth review); a stretch that fails before any result on a resume whose transcript is gone from disk (`transcriptExists` in the deps, from `files.ts`; confirmed, never inferred from the failure) drops the session id (and the baseline), so a topic the CLI's own cleanup emptied opens fresh on the next message, said on its own kind, rather than failing on every message for good (seventh security read), while a failure on a transcript still on disk, or one the daemon could not look for (a read error is unknown, not gone), is a blip that keeps it (Codex hook, three times: neither one failure nor two prove the transcript unusable, and neither does an unreadable directory); a dropped session id takes the topic's priming with it, so the fresh session is told where deliverables go, as the lost one was (twenty-seventh review); the old session's hand-off and approval mode go with its id, since ▶️ Resume would otherwise feed the operator's repo path, branch and next command to the profile session (third security read); the adoption is one function, run over the whole registry at boot (`adoptAll()`) and on first open for a binding added since, so no reader sees the old values first (twentieth review: ▶️ Resume read the hand-off before the lazy gate ran), and it works both ways: a binding made under a profile drops its session, hand-off and approval mode when the profile is gone, so a forum's transcript, with whatever a member left in it, never resumes under the operator's full toolset (twenty-second review); the adopted binding takes the profile's model and effort where the profile pins them (`profileModel`, `profileEffort` in the deps), as a fresh profile topic does, and the install's defaults otherwise, since its own were never checked against the profile or the enabled catalog (thirty-first review; thirty-third: the defaults alone disagreed with what `bindProfileTopic` records); the binding records the profile's name (`profileName`, from the deps), and one made under another profile is adopted like one made under none, since its transcript holds that profile's prompt and tool results and its spend was read against that profile's cap, while one made under this profile resumes (thirty-fourth review); the spend stays through every adoption, being the topic's whichever cap was current when it was made (the `paid` scenario: a record of 0.4 and a fresh stretch's 1.0 read 1.4), so a lowered cap closes a topic over it, by design (thirty-fifth review: a spend drop on adoption was written and reverted when this scenario refused it) | Resume regardless of who made the binding, so switching an install to team mode republishes every earlier session through its topic (review, 13 Nov); the session id kept, so the next stretch resumes it after all; the binding never marked, so every restart drops the fresh session again and the topic loses its thread each time (Codex finding); the dead baseline kept, so the fresh session's first result is charged short by the old transcript's total (tenth review); the raw stream error posted under a profile, naming the host's paths to the forum (twelfth review); the session id kept after a failed resume, so a topic whose transcript is gone is a permanent error generator, one message per member line (seventh security read); the session id dropped on a failure alone, so a blip while resuming a transcript still on disk discards the topic's context (Codex hook); an unreadable directory read as gone, the same loss by another route; never dropped, the first defect by another route; the priming kept across the drop, so the replacement session is never told where deliverables go and its files reach no outbox (twenty-seventh review); the hand-off kept, so a member's ▶️ Resume replays the operator's last single-user instruction into the forum (third security read); no boot pass, so a reader before the first open sees the old values (twentieth review); one-way adoption, so a forum's transcript resumes under the full toolset once the profile is removed (twenty-second review); the old model and effort kept, so a model disabled since errors every turn under a profile without one, unexplained to the forum (M183, thirty-first review); the install's default taken where the profile pins a model, so the binding, the live map and the status screen name a model the session never runs (M188, thirty-third review); the profile told by a boolean, so a swap of `PROFILE_FILE` resumes every topic's transcript, its old prompt and tool results, under the new profile (M190, thirty-fourth review); the spend dropped on adoption, so a record of spend is forgotten and the topic's first result counts short of its history (the tenth's defect by another route; the `paid` scenario killed it as written in the thirty-fifth round) |
+| `outside team mode no action is admin-gated` | with `teamMode` false, `allowedAction()` admits every action for the admitted user, whatever the admin list holds (the two lists are independent concerns) | Gating applied to single-user installs: the one user is refused by their own bot. The admin-list clause is what makes this row kill it: the config always lists the allowed user as an admin, so a test with that config would pass through `isAdmin` and never notice |
+| `a profile session runs with no built-in tools and only the profile's MCP servers` | `profileOptions()` yields `tools` equal to the profile's list (`[]` when empty), `mcpServers` equal to the profile's, `strictMcpConfig: true`, and `includePartialMessages: true`, so the pump sees every delta and a shared forum's "stuck" means no tokens flowing (third security read: an assistant message arrives only once complete, so a long answer looked silent and bills on disconnect) | `tools` left undefined, so every built-in tool is available; `strictMcpConfig` off, so the machine's own MCP servers merge in; deltas not streamed, so a ten-minute answer is killed as stuck and its spend never recorded |
+| `a profile session auto-allows exactly the profile's tools and never prompts` | `allowedTools` equals the profile's `allowedTools` and `permissionMode` is `'dontAsk'` | `permissionMode: 'default'`: a prompt appears in an open group, and anyone can tap Allow |
+| `a profile session reads no settings files and its only hook denies every tool outside the allowlist` | `settingSources` is `[]`; `hooks.PreToolUse` holds one matcher whose callback answers `{}` for a listed tool and a `deny` decision for `Read`, `Bash` and an MCP tool of an undeclared server | The daemon's setting sources inherited; the approval gate kept (its `ask` denies the allowed tools under `dontAsk`); no hook at all, so a kept read-only built-in, which never prompts, runs though unlisted |
+| `a profile session uses the profile's prompt, cwd, model, effort and caps, not the binding's` | `systemPrompt` is the profile's text as a plain string, `cwd`, `model`, `effort`, `maxTurns` and `maxBudgetUsd` come from the profile; the binding's `cwd` and `model` are ignored, and `resume` and `env` pass through; when the topic manager passes the stretch's remaining budget, that is the stretch's `maxBudgetUsd` | The binding's cwd used (a member's topic runs in whatever folder the binding carries); the prompt appended to Claude Code's preset instead of replacing it; the remaining budget ignored in favour of the profile's full cap |
+| `a profile's prompt file and cwd resolve against the profile's directory, absolute paths as given` | `systemPromptFile` and `cwd` are resolved against the profile file's directory; an absolute path is used as it is | Resolved against the process working directory, so the service unit's cwd decides whether the bot has a prompt; `join` instead of `resolve`, so an absolute prompt path is mangled into a sub-path and a relative cwd is checked against the daemon's directory but handed to the child unresolved (Claude review finding) |
+| `/new in team mode takes the rest of the line as the title and ignores cwd= and auto` | `parseTeamNew()` returns the joined words as the title, never a cwd or an auto flag, an empty title falls back to the member's name and the time, and the title is capped at 120 characters (Telegram's topic-name limit) where it is parsed, counted in UTF-16 units, the unit Telegram's limits are counted in, so a title of emoji cannot run to twice the limit (thirtieth review: a count of code points did, and 120 emoji were 240 units), with a trailing half of an emoji dropped rather than sent as the lone surrogate Telegram refuses (twenty-fifth review), so the binding, the panel and the confirmation carry the same title the topic got | `parseNew()` reused: a member sets the working directory or switches approvals off from a chat message; no cap, so a pasted log as a title leaves the topic with no pinned panel (the panel message exceeds 4096; review, 13 Nov); the cap counted in code points, so 120 emoji are 240 units and the creation fails on a title the clip was meant to make safe (M179, thirtieth review); the cut left as it fell, so a title ends in a lone high surrogate (M180) |
+| `a profile session's first message carries no outbox contract` | with `primeContract: false`, the first `send` into a session is the user's text alone | The contract always prepended, telling a session with no file tools to save files into a directory |
+| `the team main menu offers only a new topic and help` | `mainMenuKb({ team: true })` has exactly those two buttons (status is the admins', typed); under a profile alone the menu drops the old sessions and the resume, which the gate would refuse (twenty-fourth review); the default menu is unchanged | The full menu in team mode: settings, the session list and the status screen reachable by every member; the session list offered under a profile, every tap on it refused |
+| `the team topic panel has no model, effort or auto buttons` | `topicControlsKb(catalog, b, { team: true })` and `topicControlsKb(catalog, b, { profile: true })` carry the feed toggle and the close, delete and wipe actions only; the panel text names neither model nor approvals; the default panel is unchanged; a closed binding's panel in team mode is the closed state (♻️ Reopen, delete, wipe; "Closed by an admin"), so the pinned panel is where the refusal says to reopen and a refresh keeps the button, while outside team mode the flag changes nothing on the panel (seventeenth review); the wrap-up confirmation in team mode offers a member "finish this turn first" and cancel only, since "at the next step" interrupts a colleague's turn and is an admin's (eighth security read), and keeps "at the next step" on an admin's, since the gate reserves that tap for admins and a button nobody can reach makes the help text a lie (twenty-seventh review) | The full panel in team mode: a tap switches the shared profile's model. The full panel in a single-user profile install: buttons that change what the panel shows and nothing the session does (Codex finding, 12 Nov 2026). The open panel painted over a closed topic's, so the only Reopen button vanishes on the next ⚙️ (seventeenth review); "at the next step" offered to members, every tap on it refused as "Admins only"; dropped for admins too, so in team mode "at the next step" is reachable by no one while the help promises it to admins (twenty-seventh review) |
+The seed-request suite (`src/seed.test.ts`, the todo queue's seam into the registry) predates
+this plan and was named by none; the twenty-sixth review added a case to it, so the six it
+had on main are listed here as they are, and the gate sees the suite from now on.
+
+| `binds a well-formed request as an attended session and deletes the file` | the binding carries the request's session id, cwd, model and title, `auto: false` (the continued run asks before tools) and `lastActive` from the clock; the file is consumed and the registry saved once | `auto: true`, so the continued run runs tools unasked; the file left, so the topic is rebound every five seconds |
+| `a malformed or incomplete file is skipped and deleted, never looping, and does not stop a good one` | a file that is not JSON, or lacks one of the five fields, binds nothing, is deleted, and the next file is still drained | a bad file left in place and warned about every five seconds for the process's life; the loop ended at the first bad file |
+| `a missing directory returns empty and does not throw` | no directory yet is nothing to do | the readdir error thrown, so the daemon's timer logs a failure every five seconds until the first run |
+| `is idempotent: a second drain finds nothing and does not save again` | a second drain of the emptied directory binds nothing and writes nothing | the registry saved on every drain, a write every five seconds |
+| `the last request for a topic wins (files drained in filename order)` | two requests for one topic, drained in filename order, leave the later file's session bound | files drained in readdir order, so an older request can overwrite a newer |
+| `does not save when nothing was bound` | a drain that consumed only bad files writes nothing | the registry saved unconditionally |
+
+### Negative cases
+
+The rows above say what must happen. These say what must **not**: the refusals and the
+caps a wrong implementation would happily allow.
+
+| Case | Must not happen | Mutant it kills |
+|---|---|---|
+| `team mode refuses to start without PROFILE_FILE` | `parseConfig()` with `TEAM_MODE=1` and no `PROFILE_FILE` throws `ConfigError` naming `PROFILE_FILE` | The requirement dropped: a group gets full Claude Code sessions on the host |
+| `in team mode a message from any other chat is rejected` | a DM to the bot or a message in another group is not admitted, whoever sent it, admins included; nor is a post with a `sender_chat` (an anonymous admin posting as the group, a linked channel), whose `from` is a proxy id no member list holds | The chat check dropped with the user check, so anyone who finds the bot gets a session; a proxy sender put through the member lookup, so an anonymous admin is refused every thirty seconds with a notice that names the wrong cause (review, 13 Nov) |
+| `everything else is admins only in team mode, unknown actions included` | for a non-admin, `allowedAction()` refuses `m:tw:now`, `m:tclose`, `m:treopen`, `m:tdelete`, `m:tdelyes`, `m:twipe`, `m:twipeyes`, `m:tm:*`, `m:te:*`, `m:ta`, `m:settings`, `m:sdm:*`, `m:list`, `m:sess:*`, `m:resume`, `m:quick`, `m:status`, `/status`, `/attach`, `/auto`, `use`, `effort`, and an action name that does not exist yet | A denylist instead of an allowlist: the next button ships open to every member |
+| `a prompt tap is honoured only from its own topic, and an approval only by an admin in team mode` | `promptTapAllowed()`: outside team mode every tap passes as before; in team mode a clarifying-question option counts only when tapped in the topic that asked, and an Allow/Deny only when tapped there by an admin. Defense in depth: no profile session prompts today (premise) | A `qa:` or `p:` token honoured from any topic (a member answers or approves another topic's prompt by replaying its token, Claude review finding); an approval by a member |
+| `a topic an admin closed opens no session until an admin reopens it` | with `closed` set on the binding (💾 Close & keep) and `shared` (team mode) on the manager, `sendToTopic()` answers with a notice and opens nothing, a `quiet` send (a nudge) posts nothing and reports undelivered, `ensureLive()` returns undefined, and clearing `closed` (♻️ Reopen, admins only) restores both; outside a shared forum the bot never writes the flag and `adoptAll()` clears at boot any a team-mode run left behind, so the reader honours it without a mode check, a single user's kept topic resumes on its next message as before, and a flag from an earlier run cannot lock a topic in use (eleventh review; twelfth; seventeenth: in team mode the pinned panel shows the closed state with ♻️ Reopen and stays pinned, so a later refresh keeps the button and "reopen it from the pinned panel" is true; twenty-second: one boot pass in place of a mode-conditional reader and a lazy clear) | The close only ends the live session, so any member's message or ▶️ Resume reopens it (review finding); the notice given but a session opened anyway; the flag kept at boot outside a shared forum, so a kept topic answers "an admin closed this" to its only user (review, 13 Nov; ninth review); the flag ignored even when set; the flag left set outside a shared forum, so turning team mode on locks every topic its user ever kept (twelfth review); a nudge that posts the refusal into a closed topic (eighth review) |
+| `a profile names its MCP servers, a non-empty prompt and an existing cwd, or is refused` | `parseProfile()` reports every problem at once: no `mcpServers`, a server entry without a `type` of `http`, `sse` or `stdio` (a command with no type is a stdio server, the SDK's own default, so a profile copied from a working `.mcp.json` boots, and a command or an argument that is explicitly relative (`./x`, `../x`) resolves against the profile's directory like `cwd`, an absolute one is used as given, while a bare name, a flag, a URL, a scoped package name or `--flag=./x` stays as typed, since each has a slash too; nineteenth to twenty-first reviews, Codex hook), a `command` with a path that is neither absolute nor explicitly relative (`~/x`, `bin/x`: nothing expands a `~`, and a path meant for the child's cwd would land under the profile; twenty-seventh review), an `http`/`sse` server without a `url` or a `stdio` one without a `command`, an empty prompt, a `cwd` that is not a directory | An empty prompt accepted (a bare Claude Code answering a group); a missing cwd accepted (the session runs in the daemon's directory); server entries passed through unread, so a typo in `url` boots clean and every topic fails to connect its only server (review, 13 Nov); any command with a slash resolved against the profile's directory, so `~/.venv/bin/python` becomes `<profile>/~/.venv/bin/python`, boots clean and fails every topic's first turn with an error the forum is not shown (twenty-seventh review); an explicitly relative command left as typed, so it is looked for in the child's cwd rather than beside the profile |
+| `an allowed tool must name a declared MCP server or a kept built-in tool` | `allowedTools` entries are `mcp__<server>__<tool>` with `<server>` in `mcpServers`, or a name in `tools`; anything else is refused. The converse holds too: every name in `tools` is in `allowedTools`, or the profile is refused. `AskUserQuestion` is refused in `tools` outright: a profile session never prompts (`dontAsk` denies it, and an allowlisted tool is auto-approved before the question could be rendered), so the model would get an empty answer (review, 13 Nov). A pattern (`*`) in `allowedTools` is refused: the hook matches exact names, so a pattern would be accepted at boot and allow nothing at the first call (security review). An empty or absent `allowedTools` is refused too: with none, every call in every topic is denied while the boot looks fine (fourteenth review) | Any name accepted: a typo in the allowlist means a bot that denies every call and nobody knows why. A kept-but-unlisted built-in accepted: the model is shown a tool the hook denies on every call. `AskUserQuestion` accepted: question-less turns that look like a silent model. A pattern accepted: a bot that denies every call from its first tool use. An empty list accepted: the same bot, from a `[]` or a misspelt key |
+| `a profile's model must be one of the catalog's ids` | `profileModelProblem()` names a model that is not one of the ids it is given, and nothing for a known one or none set (the binding's default applies); the daemon hands it the install's enabled model ids (`ENABLED_MODELS` over `OPUS_MODEL` and friends), so a model the operator disabled is refused too (twentieth review), and refuses to boot on it, since a model name goes to the SDK as given and a typo would otherwise boot clean and end every topic's turns in an error said without its detail (sixteenth review) | Any string accepted: every member topic dead until the operator reads the journal; none set refused, so a profile that leaves the model to the install cannot boot |
+| `team mode refuses a profile without a budget` | `teamProfileProblems()` names `maxBudgetUsd` when the profile has none, `tools` when it keeps any built-in (every built-in reaches the host or the network from the box: a shell, the files with the `.env` among them, the web), and nothing otherwise; the daemon refuses to boot on it in team mode, as it does without a profile | No check: a shared forum runs with unbounded spend per topic while the docs promise a cap (review finding); a built-in kept in team mode, so every member has a shell or the host's files (eleventh review) |
+| `under a profile every request is refused and set aside, none bound, nothing saved` | with the daemon's `profile` flag, `drainSeedRequests()` binds no request, saves nothing, moves every file under `refused/` beside the others, under a name not already there (never deleted, never overwritten: the request is valid, and a later run without the profile can still serve it by hand; twenty-eighth review, Codex hook), so a second drain finds nothing, and logs `seed.refused` with the topic, the session id and where the file went, never `seed.bound`: the profile owns every session's options, so `adopt()` would drop the run on the topic's first message anyway, and in a shared forum the run's transcript would sit bound to a member-visible topic until then (twenty-sixth review: the one path that still wrote a binding past the profile line) | The flag misread (`profile === undefined`), so the run is bound and silently dropped on first use (M165); the refused file left in place, so it is refused again every drain (M166); the refusal logged as `seed.bound`, so the operator reads a binding that never happened (M167); the refused file deleted, so a valid request is lost to a later run without the profile (M172, twenty-eighth review); a later request with a name already set aside moved over it, so archiving one deletes the other (M177, Codex hook) |
+| `the transcriber runs without anything .env holds` | `transcribe()` spawns the transcriber with the daemon's environment minus `TELEGRAM_BOT_TOKEN`, `ANTHROPIC_API_KEY` and every key `.env` names (handed in by the bot, which the daemon gives the file's keys), whether or not the shell had set them too, since a unit whose `EnvironmentFile` is the same `.env` presets every key and "the shell had it" must not exempt a secret (the security read on the thirty-second: the thirty-second's rule kept the keys the merge loaded, which that unit makes none); the harmless names a transcriber needs (PATH, HOME, the locale, temp and cache directories, and the Python and CUDA names a whisper script needs, `PYTHONPATH`, `VIRTUAL_ENV`, `LD_LIBRARY_PATH`, `CUDA_VISIBLE_DEVICES` and their kin; thirty-fourth review) stay even when `.env` names them, and the shell's own variables stay; a transcriber that needs a key of its own takes it on its command line (README); the suite file is `voice-notes.md`'s, this row the one case this plan adds (thirty-first review: the two named secrets were a floor, and a `CLAUDE_CODE_OAUTH_TOKEN` or a bearer kept in `.env` reached a process that chews member-sent audio, against the comment's claim) | The named two scrubbed and nothing else, so every other secret in `.env` reaches the transcriber (M181); the whole environment dropped, so a transcriber that needs the operator's PATH or caches cannot run (M182); no harmless names exempt, so a `PATH=` line in a file that doubles as the unit's `EnvironmentFile` takes the transcriber's PATH and no voice note transcribes (M186, thirty-second review); the keep-list without the Python and CUDA names, so such a unit strips `LD_LIBRARY_PATH` and a whisper script loads no library (M191, thirty-fourth review) |
+| `under a profile a request that cannot be set aside stays where it is, said once` | when `refused/` cannot be made or the file cannot be moved there, the request stays in the directory, nothing is bound, and it is logged `seed.refused` once per process, not on every drain (the names said are kept in memory, so a restart says it again once) | The request deleted when it cannot be moved, so an archival failure loses a valid request (M175, Codex hook, twenty-eighth round); said on every drain, a warning every five seconds for as long as it stays (M176) |
+
+## Out of scope
+
+- **A per-member daily topic cap.** The first group is two people; the live-session cap,
+  idle eviction and the per-session budget bound the spend. Added when the group widens,
+  as a row in this plan.
+- **Per-member identities or tiers.** One profile is one principal; every topic sees the
+  same. A profile per member is a different feature.
+- **Direct messages to the bot.** Rejected by design: the forum group is the access list.
+- **Voice notes, media, the rotator relay and the status message**: unchanged, and
+  covered by their own plans.
+- **A topic's title from Telegram's topic-created service message.** Cosmetic; `/new
+  <title>` and the member-plus-time fallback name topics for now.
+- **The bot's own wiring in `src/bot.ts`** (which handler calls which pure function)
+  stays untested here, as the rest of that file is; the decisions it calls are the rows
+  above, and the manual run below exercises the wiring. After the first review (12 Nov
+  2026) that wiring also holds: in team mode plain text in General gets no menu (members
+  talk there too); with a profile, a photo, file or video is answered with a notice and
+  not forwarded (the session has no file tool, and the host path stays out of the chat);
+  typed `use`, `effort` and `/auto` and the matching taps answer that the profile owns
+  them; a pending free-text answer is delivered before the admin gate runs; the forum's
+  `chat_member` updates clear the membership cache. After the second round (13 Nov): a
+  forwarded voice note in a fresh team topic binds the topic like typed text does and a
+  failed send is said; the membership lookup is capped at five seconds (an `AbortSignal`
+  on the API call), so one slow API answer cannot hold every topic's updates; ♻️ Reopen
+  reports when no session could open; the boot refuses team mode when the forum reports the
+  bot as not an admin (a warning at first; the twenty-eighth review made it the refusal a
+  profile problem gets, since the forum would otherwise run with fewer limits than asked),
+  because `chat_member` updates reach admins only and topics are created with Manage Topics,
+  while a lookup that fails is unknown, not a no, and only warns. After the third round (13 Nov): a
+  topic binds without spawning a session (the first message opens it, so ten taps on 🆕
+  cost ten topics and no processes); ⚙️ Controls refreshes the pinned panel itself (an edit
+  of the pinned message, never a re-post, never the notice the button sat on), and 🆕 in a
+  bound topic only acks; one `createProfileTopic` helper serves `/new`, 🆕 and ⚡; one
+  `remainingBudget` helper serves `ensureLive` and `sendToTopic`. After the fourth round:
+  an unknown slash command (`/start`, `/foo`) shows the menu in a topic and is ignored in
+  General, instead of "Admins only"; a turn that ends for its budget says so at once, and
+  the "switch model" hint is left off under a profile. After the fifth round: typed
+  `/menu` refreshes the pinned panel the way ⚙️ does, never a re-pin. After the sixth
+  round: a topic created from typed or spoken text is confirmed with a fresh message, never
+  by painting over the menu another member may be looking at (the voice path runs outside
+  the update loop); 🆕 in a fresh topic queues behind that topic's transcription and binds
+  once; `/status` in team mode answers in General only (it lists every topic); under a
+  profile, attaching or resuming an old transcript into a new topic is refused, since its
+  saved total would be read as this topic's spend; the command set lives in one table
+  (`commands.ts`) that the gate, the switch and the published menu all read.
+- **Attaching an old session under a profile.** Refused rather than accounted for: the
+  transcript may hold tool results from a full session, and its saved cost is not this
+  topic's. Every profile topic starts fresh, bindings from before the profile included
+  (the row above). After the seventh round: in team mode the status screen is the reduced
+  one (counts, uptime, profile name; no admin ids, no topic titles, no error strings, which
+  stay in the journal and `health.json`), and `/status` is published to the forum's
+  administrators only; ⚙️ and `/menu` share one `controlsOrMenu` path. After the eighth
+  round: the reduced screen is safe anywhere, so the in-topic refusal went; the title cap
+  is `TITLE_MAX` in one place; one `mediaRefusedUnderProfile` guard serves the three media
+  handlers; a failed topic creation shows members the hint and logs the error, not
+  Telegram's raw text. After the ninth round: outside team mode the boot clears any
+  `closed` flag team mode left behind, so it does not outlive the mode. After the tenth:
+  `/status` is in no published menu in team mode, since Telegram's administrators are not
+  `ADMIN_USER_IDS` (a scope for them offered some a command that refused them and hid it
+  from others); one `describeError` and one `editOutcome` serve the status transport and
+  the panel refresh, which re-posts (and so re-pins) only a panel that is gone, never on a
+  429 or a network error; a post made as the group is told once per topic why it gets no
+  answer, since the same admin's taps carry their account and work; a fresh team-mode
+  topic is bound before the typed kind is read, so `feed on` or `wrap` as a first line
+  meets the topic any other first line would have created; the text-only notice promises
+  transcription only when `TRANSCRIBE_CMD` is set; the no-session hint offers `/attach`
+  only without a profile; the "bound meanwhile" refund in `bindFreshProfileTopic` went,
+  unreachable under the per-topic ordering every caller runs in. After the eleventh (and
+  the security read): `topicIdOf` reads `is_topic_message`, since a reply in General
+  carries a `message_thread_id` of its own and would otherwise bind and pay for a topic
+  that is not there; the anonymous-post notice is team mode's; media in General gets no
+  reply in team mode; a voice note is downloaded only when `TRANSCRIBE_CMD` is set and
+  fewer than two transcriptions run, the audio is removed once heard, and under a profile
+  a failed note or turn is said without its detail (the transcriber's stderr and the
+  CLI's errors name host paths; the log has them); `/status` is in no published menu;
+  the `closed` boot sweep went with `honourClosed`; the full status screen lost a dead
+  team-mode branch. Accepted, not changed: built-in tool names are passed to the SDK as
+  given (a list of them pinned here rots with every SDK release; team mode keeps none
+  anyway); one small registry write per result keeps the spend record at most one turn
+  behind a crash; the first writer into a topic made by hand in Telegram pays its
+  opening; the pinned panel's pin stays loud, since main observed that a silent pin does
+  not show mobile Telegram's per-topic pin bar. After the thirteenth (and the second
+  security read): the bot's own refusal notices ("Admins only", the quota, the text-only
+  and voice notices, an unknown command's menu in team mode) go through the same
+  once-a-minute-per-topic throttle as the manager's; in team mode a second voice note into
+  a topic whose note is still being transcribed is refused rather than queued, so a run of
+  notes cannot hold the topic and both slots for hours; ♻️ Reopen in team mode clears the
+  flag and opens nothing (a reopened topic costs no process until someone writes in it),
+  and elsewhere names the real refusal instead of guessing "budget spent?"; the three
+  topic-creation failure texts are one, with Telegram's error in the log; the status
+  screen's header is built once for both branches; the rotator's account label stays out
+  of a shared forum ("continuing now"); the rate-limit notice under a profile no longer
+  offers a model switch; the README notes that the MCP config, bearer header included,
+  rides on the session's command line. Not changed: `assistantError` carries the SDK's
+  error enum, not free text, so it stays as it is (the thirteenth round's claim was wrong
+  on the facts, as the second security read confirmed); the membership lookup stays on
+  the update loop, bounded by its five-second abort (recorded trade-off, now with the
+  flood class closed by the throttle). After the fourteenth: a typed `/menu`, an unknown
+  command or plain text in General sends the menu fresh instead of painting it over the
+  last tapped menu, which in a shared forum is another member's screen; `topicTitleOf`
+  reads the bot's message a tap sits on, so a topic bound from 🆕 keeps its name; a
+  forwarded note or audio file into a fresh team-mode topic binds (and pays its opening)
+  before any download; the anonymous-post notice covers "Send as" a channel; the README's
+  pause sentence names the stuck bound it had omitted. After the fifteenth (and the third
+  security read): the bot's replies a member can trigger at will are keyed by topic and
+  kind (one refusal no longer mutes a different one) and by sender (ten a minute), with
+  the help text, the typed menu, the `m:help` tap and the wrap-up "nothing running" reply
+  on the same rule; a forwarded note binds its fresh topic only after the refusals that
+  cost nothing, so a refused note costs no opening; `paint` edits only a message whose
+  own keyboard holds the tapped data, which Telegram sets and a client cannot forge, so
+  forged callback data paints nothing over the pinned panel or a colleague's notice; the
+  rate-limit notice under `shared` names no rotator. Refuted and unchanged: the remainder
+  handed to a resumed stretch (the premise), and a quota reservation straddling midnight,
+  which the day's reset makes moot (the counter starts over, so an unrefunded reservation
+  from yesterday shortens nothing). After the sixteenth (and the hook): the sender's
+  allowance is checked before the topic's slot, so a member past theirs cannot silence a
+  notice for a colleague; every reply a member can trigger carries the sender, the
+  manager's refusals included (`sendToTopic` takes the sender and the manager consults
+  the bot's one rule through `replyAllowed` in its deps, its own throttle only without
+  it); a member's own voice note into a fresh team-mode topic binds before any download,
+  as the forwarded one already did; `attach()` says the one creation-failure text; the
+  notice for a turn ended as stuck says the unfinished turn and what was sent during it
+  are lost, the earlier context kept; the SDK's two budget numbers (`maxBudgetUsd` per
+  query, `total_cost_usd` cumulative) are pinned in a comment at the hand-off, after
+  three rounds read them as one. Refuted again, unchanged: that hand-off. After the
+  seventeenth (and the fourth security read): ▶️ Resume ignores a pre-profile binding's
+  hand-off, which `ensureLive` dropped only after the tap had read it, and carries the
+  sender; the wrap-up confirmation, the `m:tw:*` refusal, feed flips (tap and typed), a
+  forged or stale tap's fallback, topic creation attempts and a broken model's error
+  notices are on the one rule too (the budget notice never muted); outside team mode the
+  rule answers everything; the manager's own throttle went, `replyAllowed` being
+  required; Close & keep writes the flag in team mode only, keeps the panel pinned in its
+  closed state with ♻️ Reopen, and Reopen refreshes it rather than re-pinning; for one
+  user ⚙️ and `/menu` bring the panel to the bottom as on main; the misplaced docblock
+  sits on `teamProfileProblems` again. Accepted, recorded: idle eviction applies the
+  stuck bound as cap pressure does, which the operator sets above the longest tool.
+  After the eighteenth: the "could not verify" notice is on the reply rule; Close & keep
+  writes the flag before anything yields, so a note still being heard cannot open a
+  session in the gap; a topic deleted this process is remembered, so such a note cannot
+  bind it again while Telegram removes it; a second voice note waits for a transcription
+  in that topic, not for anything else queued there; when the panel's edit fails for a
+  429 or the network, the current state goes out as an unpinned copy, so a closed topic
+  is never without its Reopen button; `createTopic` logs its own failure and its four
+  callers only reply; the redundant team-mode prefixes before `replyAllowed` went; the
+  stale comment on the closed flag is corrected. Refuted with the plugin's source:
+  `@grammyjs/auto-retry`'s `pause` rejects on the abort signal, so the five-second cap
+  bounds a 429's wait on the membership lookup too. After the nineteenth: a server
+  entry with a command and no type is a stdio server (the SDK's default and every
+  `.mcp.json`'s shape); the `m:menu` and `m:ctl` taps are on the rule; a typed `/menu` or
+  the controls tap whose panel is already current shows an unpinned copy or says where the
+  panel is, instead of nothing; an inaccessible callback message (too old for Telegram to
+  hand over) is not a forged tap; a member's topic creations have their own ten-a-minute
+  allowance, apart from replies and with admins exempt; the nine muted-reply pairs are one
+  `muted()` helper, the feed tap counted like the rest. Kept: the transcription slot is
+  reserved before the bind (the hook's requirement: no await between the check and the
+  reservation), at the cost of a slot held through a few Telegram calls. The fifth
+  security read confirmed the fourth's two closures and added: the "too large" and "not
+  transcribed" voice replies on the rule; the "paused to free a slot" notice, which lands
+  on a colleague's topic, on the rule too; a stored hand-off capped at one message, since
+  the registry is rewritten whole per result; and a README line to set
+  `ROTATOR_HANDOFF=off` in team mode. Not done: preferring a member's own idle sessions as
+  the cap's victims, since topics have no owner. After the twentieth (and the hook): a
+  single user's running turn paused by cap pressure is told it freed a slot, not that it
+  went silent; a forwarded note into a topic that refuses is not announced as passed on;
+  the two reply throttles are asked before either is charged; the model check reads the
+  enabled ids; the throttle's sweep is amortised; a relative stdio command resolves
+  against the profile's directory; the pre-profile adoption is one function at boot and
+  on first open, and the resume tap's own guard went with it; a tap whose message has no
+  keyboard to check goes out on the reply rule, not freely; the panel's text and keyboard
+  come from one helper. After the twenty-first (and the sixth security read, which
+  confirmed the fifth's closures): a tap that is not the tapped message's own button
+  (forged, a stale client, or no keyboard to check) still reports its outcome, as a fresh
+  message on the reply rule, since the action it reports has happened (a stale client's
+  "Created" was being dropped); `m:cancel` is on the rule through the same path; admins
+  are exempt from the reply rule as from the day's allowance, so a member's slot cannot
+  mute an admin's action; a member's creation allowance is asked after the day's and
+  refunded with it, and covers a topic made by hand in Telegram too; in team mode the
+  panel's pin is silent, so a member's twenty topics are not twenty forum-wide pushes
+  (main's observation about the mobile pin bar concerned the operator's own topics, which
+  keep the loud pin outside team mode); the unreachable `default:` arm of the slash switch
+  is an explicit return; the anonymous-post notice is on the rule; the transcriber child
+  gets none of the bot's secrets. Kept, recorded: the lazy adoption on first open stays
+  beside the boot pass, for a registry edited by hand and for the harness, which binds
+  without the flag; in production every binding is adopted at boot. After the
+  twenty-second: a failed deletion takes the topic back off the tombstone list, so a
+  topic Telegram would not delete is not silently dead; the `denied` notice is on the rule
+  under a profile (a hook denial emits no such frame, per the SDK, so this is a belt); one
+  `reserveOpening` takes both allowances and returns the refund; one `openFor` serves
+  both sends in `sendToTopic`. Accepted, recorded again: a tool call longer than the stuck
+  bound is cut (the operator sets the bound above the slowest tool); the membership lookup
+  on the update loop. After the twenty-third (and the seventh security read, which confirmed
+  the sixth's closures): a failed Telegram deletion keeps the tombstone and tells the admin,
+  since the bot's side of the deletion has happened; a successful one lets the tombstone go
+  ten minutes on, and `removeTopic` clears the anonymous-post record, so neither set grows
+  for the process's life; a typed `/new` in a fresh hand-made topic names and binds that
+  topic; outside team mode any tapped message is edited in place, as on main; the
+  transcription slot is checked and taken with nothing in between, just before the download
+  and after the bind, so no slot is held through the bind's Telegram calls; `openFor`
+  asks the refusal once, before the live session is found (a live topic over its budget is
+  refused, not written into: the first try of this consolidation opened first and lost that),
+  and tells `ensureLive` so the live map is walked once; a README line on removing a
+  leaver from `ADMIN_USER_IDS`. Accepted, recorded: a forum-wide mute (the chat's default
+  permissions) is not read as a mute, so such a member's taps still work; the bot's own
+  answer volume can meet Telegram's per-group limit and its retries wait on the loop, the
+  same class as the lookup, bounded by the sessions' own pace. After the twenty-fourth: a
+  paused parked session's resume timer goes with it, so a timer never reopens a topic the
+  notice said a message would; a bare `/new` in a hand-made topic keeps the topic's own
+  name and a titled one renames it in Telegram; a member writing in a tombstoned topic is
+  told so, on the rule; the pump's stale paragraph is gone; the README's auth claim is
+  scoped to profile sessions; `parseProfile` copies the server entries it resolves and
+  reports a wrongly shaped `allowedTools` once; wrapping up "now" is an admin's in team
+  mode, since it interrupts a colleague's step, which the cap never does for a member.
+  After the twenty-fifth (and the eighth security read, which confirmed the seventh's
+  closure and whose three other items round twenty-four had closed): a plain voice note
+  into a topic that refuses is refused before a slot and a download are spent on it, and
+  a typed line before the status moves and the typing indicator goes out; the transcript
+  lookup reads `CLAUDE_CONFIG_DIR` like the child does; the stuck eviction on the idle
+  path cancels the topic's continuations and puts its notice on the rule, as the cap
+  path does; a feed flip in team mode refreshes the pinned panel, whichever copy carried
+  the tap; the unverifiable tap's toast no longer says "not authorized"; a bare `/new`
+  names the binding without renaming the Telegram topic, since that would let any member
+  rename a colleague's; the default title and the help text come from one place each;
+  Reopen writes only when there is a flag to clear; a topic Telegram would not delete is
+  the admin's to delete by hand, said so. Accepted, recorded: a spoken "/new title" in a
+  fresh hand-made topic pays two openings; such a tombstone lasts the process. After the
+  twenty-sixth (the independent read of `bbdb6c2`): a seed request from the todo queue is
+  refused and consumed under a profile, the one path that still wrote a binding past the
+  profile line (`adopt()` then dropped the run on the topic's first message, and in a shared
+  forum the run's transcript sat bound to a member-visible topic until then); the
+  wizard-expired repaint builds the menu for the mode, the last keyboard call outside
+  `kbMode()`; the seed suite is named by this plan from now on, with its six cases from
+  main. Refuted: the remainder handed to a resumed stretch trips against the cumulative
+  total (the read quoted the `maxBudgetUsd` comment alone; the `total_cost_usd` text in the
+  same file says the cap counts this `query()` only, and Ring 2 now runs the resumed stretch
+  so the box shows it); a voice note charged two refusal notices (the refusal before the
+  download returns on a refusal, so the check after the transcription, there for a budget
+  spent between the two, is the first notice for that message or none). Accepted, recorded:
+  a profile that sets `systemPrompt` to an empty string beside `systemPromptFile` is refused
+  at boot with both keys named, since one is the prompt and the other a leftover. Follow-ups,
+  not defects: the budget notice's three wordings (`refusalNotice`, `resumeWith`, the turn
+  error) become one constant; the voice path's refusal points fold into `sendToTopic`'s own.
+  After the twenty-seventh (the independent read of `d4efda7`): a session id dropped for a
+  gone transcript takes the topic's priming with it, so the replacement session is told
+  where deliverables go (the lost one was; the replacement was not, and its files reached no
+  outbox); an admin's wrap-up confirmation keeps "at the next step", which the gate reserved
+  for admins while the keyboard, built without a sender, offered it to nobody and the help
+  promised it; a stdio `command` is a bare name, an absolute path or `./`/`../` against the
+  profile's directory, and `~/x` or `bin/x` is refused at boot rather than resolved under the
+  profile and failing every topic's first turn with an error the forum is not shown.
+  Refuted: a voice note into a hand-made topic costs an opening the refusal wastes (the
+  opening buys the bound topic, which stays the member's and takes the re-sent note at no
+  second opening; typed text into as many new topics costs the same). Accepted, recorded: a
+  topic that reached its cap on a successful turn keeps its live session until idle eviction
+  or a newcomer pauses it, so no newcomer waits on it and the process lingers at most an idle
+  stretch; a stdio MCP server the profile declares inherits the session's environment, the
+  API key with it, as the session itself does (the README says so, and which child does
+  not); the membership lookup on the update loop, a stranger's "no" cached thirty seconds,
+  as recorded below (the forum is private, so a stranger cannot post; the short cache is
+  deliberate, so a member added a moment ago is admitted even when the join update is
+  missed). After the twenty-eighth (the independent read of `48a355d`): a member's 🆕 tap
+  in team mode gets its receipt as a fresh message, since the tapped menu is a shared
+  screen (painting it into one member's receipt took the menu from everyone, and `/menu`
+  to restore it is one reply a minute per topic); `/help` is in the published team menu,
+  being a member action and the one typed route to the team help; the boot refuses team
+  mode when the forum reports the bot as not an admin (above); a wrongly typed
+  `allowedTools` is one line, and a list of blanks is a list of none; a refused seed
+  request is set aside under `refused/`, not deleted, since it is valid and a later run
+  without the profile can still serve it by hand, and one that cannot be moved stays where
+  it is, said once per process (Codex hook: an archival failure must not lose it; the
+  first form deleted it to be said once). Accepted, recorded: a tool call longer
+  than the stuck bound is cut (the twenty-second's trade-off: the operator sets the bound
+  above the slowest tool; a hook bump that tells a slow tool from a hung process is a
+  follow-up); the profile file is kept at mode 600 on every boot, as `.env` is on main and
+  the README says; the transcriber's environment loses the two secrets the daemon knows by
+  name, as a child session loses the bot token on main, since an allowlist would cut the
+  operator's own environment (model caches, CUDA) from under a transcriber. Follow-up, not
+  a defect: the refusal asked twice per message (`refuseNow` in the bot, `openFor` in the
+  manager) and its three wrappers fold into one once `sendToTopic` returns the refusal to
+  its caller. After the twenty-ninth (the independent read of `1f8b088`): the cap cancels a
+  paused topic's scheduled continuation in a shared forum only, where the notice says a
+  message resumes it; for one user the timer stays and reopens the topic at the reset, as
+  main did and the rate-limit notice promised (the twenty-fourth's cancellation had been
+  unconditional); the boot refuses an admin bot without Manage Topics, the right the check
+  is named for (the payload carries it, and may leave it out when it is not granted, so
+  absent is a no; Codex hook); in team mode the delete and wipe confirmations are
+  their own message with a Cancel that removes it, rather than painted over the pinned
+  panel, which is everyone's (an abandoned confirmation left every member a pinned "Yes,
+  delete"); a muted tap on menu, help or controls is told so in its toast, which sends no
+  message, rather than acknowledged with nothing. Follow-up, with the one above: the live
+  map walked three times per message (`openRefusal` twice, `enforceCap` once) on the
+  sequential update loop. After the thirtieth (the independent read of `0c31521`): the
+  title cap counts UTF-16 units, the unit Telegram's limits are counted in, so a title of
+  emoji cannot run to twice the limit, and a trailing half of an emoji is dropped rather
+  than sent; a feed flip from an unpinned copy of the panel edits that copy too, so its
+  button does not read the old state and flip it back on the next tap; ▶️ Resume asks the
+  topic's refusal before it says "Resuming". Accepted, recorded: the stuck bound (a third
+  time: the operator sets it above the slowest tool; counting an in-flight tool call as
+  output would let a hung tool hold a slot for good, the case the bound exists for); a
+  tombstone from a refused Telegram deletion lasts the process (the twenty-fifth's record);
+  one error notice per topic per minute, whichever of the model error or the turn's end
+  came first, since the second explains nothing the first did not; a seed request that
+  cannot be set aside is retried every drain, silently after the first, so a filesystem
+  fixed later gets it moved without a restart. After the thirty-first (the independent
+  read of `5f8322f`): the transcriber runs without anything `.env` holds (the two named
+  secrets were a floor: a `CLAUDE_CODE_OAUTH_TOKEN` or a bearer kept in `.env` reached a
+  process that chews member-sent audio, against the comment's claim), so the rule is the
+  file, not a list that rots; the team-mode boot refuses when the bot's membership cannot
+  be read, as it refuses a profile problem, since a boot that went on would run with
+  exactly the two gaps the check exists to refuse, and the service restarts it; a binding
+  adopted across the profile line takes the install's default model and effort, since its
+  own were never checked against the profile or the enabled catalog (a model disabled since
+  errored every turn, unexplained to the forum); the Resume tap queues behind a voice note
+  still being transcribed in the topic, as typed text does. Accepted, recorded: the pinned
+  panel is one message for every viewer, so it carries the admins' close, delete and wipe
+  buttons, labelled as theirs, and a member's tap on them is refused (one declaration for
+  the gate and the keyboard is a follow-up); a first line that is itself a reply carries no
+  topic name from Telegram, so such a hand-made topic is bound under the default name, and
+  a titled `/new` renames it; the transcript-gone recovery runs where the stream throws,
+  which is how the CLI reports a missing transcript, and Ring 2 checks it end to end
+  (above). After the thirty-second (the independent read of `b12cc31`): the keys kept from
+  the transcriber were made the ones `.env` loaded, not every key the file names, since a
+  line the shell had already set (a `PATH=` in a file that doubles as the unit's
+  `EnvironmentFile`) is skipped by the merge and must not be stripped from the transcriber
+  (a rule the thirty-third replaced, below: such a unit presets every key, so that rule
+  withheld nothing there); 💾 Close on a panel
+  with no binding behind it (one left pinned by a deletion Telegram refused) answers that
+  there is no session, rather than painting the single-user "closed and saved, Reopen to
+  resume" over it. Refuted: a 429 on the membership lookup holding the loop for the retry
+  window (auto-retry's pause rejects on the abort signal, checked at the twenty-eighth and
+  twenty-ninth reads); a stuck stretch's spend lost and repeatable on demand (the transcript
+  keeps the usage of every assistant message written before the hang, and a resumed stretch's
+  total continues from it, so the next result's increment charges it; only a transcript that
+  saved nothing loses a stretch, once, as recorded; Ring 2 now checks the charge). Accepted,
+  recorded: the child and its stdio servers inherit `.env` (the twenty-eighth's record: the
+  child needs the key); an argument with no path in it is passed as typed, since a bare name
+  may be a package or a flag's value as well as a file, and the profile author writes `./x`
+  for a file beside the profile (the README says so). After the thirty-third (the
+  independent read of `71dca9d`, and the security read of the thirty-second's commit): the
+  transcriber loses every key `.env` names, whether or not the shell had set it too, since a
+  unit whose `EnvironmentFile` is the same `.env` presets every key and the thirty-second's
+  rule then withheld nothing; the harmless names a transcriber needs (PATH, HOME, the
+  locale, temp and cache directories) are exempt, and a transcriber that needs a key of its
+  own takes it on its command line, where it is readable in `/proc/<pid>/cmdline` by other
+  local users, as the MCP config is (the thirty-third's own finding: an API-backed
+  transcriber keyed from `.env` lost its key); `mergeEnvFile` is as on main again; ♻️
+  Reopen on a panel with no binding behind it answers that there is no session in a shared
+  forum, rather than reopening the Telegram topic and painting the pinned panel over; the
+  cap's pause of a topic waiting on a rate limit names the messages sent meanwhile, which
+  died with the process, rather than saying only that the context is kept; the bind receipt
+  is plain text, since the name is the member's and `say()` renders Markdown (a title with
+  a link in it posted that link under the bot's name); a binding adopted into a profile
+  takes the profile's model and effort where the profile pins them, as a fresh profile topic
+  does, and the install's defaults otherwise; the budget notice is one function
+  (`budgetNotice`), used by the refusal, the resume and the turn's end. Refuted, a third
+  time, with the source: a 429 on the membership lookup holding the loop past the 5 s
+  signal (`@grammyjs/auto-retry` `out/mod.js` line 76 awaits `pause(retry_after, signal)`,
+  which rejects on abort at line 15); a voice note into a fresh topic wasting an opening
+  (the twenty-seventh's refutation stands: the opening buys the bound topic). Accepted,
+  recorded: a tap on a clarifying-question or approval prompt whose message Telegram hands
+  over as inaccessible is refused in team mode, where no such prompt can be shown today
+  (the premise: a profile session never prompts), so the rule guards a path a later change
+  would have to reopen. After the thirty-fourth (the independent read of `f97b343`): the
+  cap's victim is a stuck turn before an idle colleague, longest silent first, and only then
+  the longest idle by activity, since members typing "hello?" into a hung topic refresh its
+  activity and kept the hung process while a colleague's warm session was paused; a binding
+  records the name of the profile it was made under, and one made under another profile is
+  adopted like one made under none, since its transcript holds that profile's prompt and tool
+  results and its spend was read against that profile's cap (a boolean told a helpdesk topic
+  from a sales one not at all); the transcriber's keep-list has the Python and CUDA names a
+  whisper script needs (`PYTHONPATH`, `VIRTUAL_ENV`, `LD_LIBRARY_PATH`,
+  `CUDA_VISIBLE_DEVICES` and their kin), none of them a secret; one import of `topics.ts`.
+  Accepted, recorded: the membership lookup on the update loop (the twenty-second's record;
+  a degraded Bot API costs each uncached sender its five seconds there, once per thirty); a
+  seed request that cannot be set aside is retried every drain (the thirtieth's record); the
+  pinned panel's admin buttons shown to every viewer (the thirty-first's record); the refusal
+  asked twice per message (the twenty-eighth's follow-up). After the thirty-fifth (the
+  independent read of `0c9b1c5`): a feed flip edits the tapped copy of the panel only when
+  that copy's own keyboard holds the button, through the same check `paint()` makes, since a
+  forged tap names any message in the forum and the thirtieth's edit would have replaced a
+  colleague's answer with the panel; the boot's membership lookup is retried in process (six
+  tries over a minute) before it refuses, since a transient failure that exited at once would
+  exhaust the service's start limit (five starts in five minutes) and leave the bot down until
+  a person reset it; the controls tap toasts where the panel is when it edited it, not only
+  when it was already current. Refuted: a binding adopted across profiles carrying spend
+  "read against another cap" (the spend is the topic's, whichever cap was current when it was
+  made, the tenth's rule; a drop was written and the `paid` scenario refused it, so a lowered
+  cap closing a topic over it is the rule working); a voice note into a fresh topic wasting
+  an opening (the twenty-seventh's and thirty-third's refutations stand). Accepted, recorded:
+  the membership lookup on the update loop (the twenty-second's record); the refusal asked
+  twice per message (the twenty-eighth's follow-up). Follow-ups, not defects: one walk over
+  the project directories for `transcriptExists` and main's `deleteTranscript`, whose own
+  walk neither skips stray files nor follows a symlinked project; a mode policy object for
+  `bot.ts` in place of its scattered team-mode and profile branches, the shape the
+  thirty-fifth read named as the source of several of these rounds' findings. The
+  thirty-sixth (the independent read of `ffd6d14`) found nits and items already recorded,
+  so the loop ends there, on the bundle's own rule. Recorded from it: a rate limit that
+  carries no reset time (no timer, the rotator's own watch only) cannot be told from a hung
+  process by silence, so after the stuck bound the topic is paused with the notice that
+  names what was lost and asks for it again, and the rotator's watch ends with the process;
+  a topic Telegram would not delete stays tombstoned for the process for admins too (the
+  twenty-fifth's record: the notice says to delete it by hand). Follow-ups, not defects: a
+  typed `/menu` in a bound topic whose pinned panel the refresh edited shows nothing where
+  it was typed (the tap path toasts; the typed path can say where the panel is); the boot's
+  refusal says "over a minute" for six tries ten seconds apart, fifty seconds; one
+  `actionRefusal()` for the three gates applied at the typed and the tapped entry; the
+  registry written whole after every result under a budget (the ninth's record).
+- **The membership lookup runs on the update loop.** grammY handles updates one at a time,
+  and `admit()` asks the forum before a message is queued, so a cache miss costs every
+  topic that lookup (bounded at five seconds, deduplicated per sender). Moving it into the
+  per-topic queue would give up the ordering guarantee the queue is built on; measured
+  lookups are a few hundred milliseconds, so this stays until a run shows otherwise.
+- **Every fresh topic in team mode is a conversation with the assistant.** That is the
+  requested behaviour (members open a topic and ask). The trade-off, raised in review: a
+  topic opened for a human-only thread is bound on its first message and every line is
+  answered and billed. A forum that needs human-only threads keeps them in another group.
+
+## Ring
+
+Ring 1 (`bun test`, `bun run typecheck`) on its own. Ring 2 is a run on a host with a
+second Telegram account in a test forum: the second account chats in a fresh topic and is
+answered; its taps on delete, wipe and model are refused; the activity feed shows only
+`mcp__*` calls; a topic whose budget is spent ends with `error_max_budget_usd`; a topic
+that spent part of its budget, was idle-evicted and resumed, still answers (the remainder
+is the stretch's own cap) and ends only once the remainder is spent; a topic whose
+transcript was removed from disk opens fresh on the next message and says so, however
+the CLI reports the failed resume (thirty-first review: the recovery runs where the
+stream throws; an error result instead would keep the stale id); a stretch cut as stuck
+mid-turn is charged on the next stretch's first result (thirty-second review: the resumed
+total continues from the transcript's saved usage); a tap on the pinned panel reaches its
+topic (thirty-sixth review: `topicIdOf` reads `is_topic_message` on the callback's message,
+which Telegram sets on a bot-posted panel; a client that did not would leave every panel
+tap on "no topic"); a DM to
+the bot gets nothing; and, on a host with no `claude login`, the sessions run on the
+`ANTHROPIC_API_KEY` from `.env`.

@@ -4,13 +4,17 @@
  * interpret via TopicManager); this file is the plumbing between them and the
  * Telegram API, plus the permission prompts a session blocks on.
  */
-import { Bot, InlineKeyboard, InputFile, type Context } from 'grammy'
+import { Bot, InlineKeyboard, InputFile, type Api, type Context } from 'grammy'
 import type { Message } from 'grammy/types'
 import { autoRetry } from '@grammyjs/auto-retry'
 import type { CanUseTool, PermissionResult } from '@anthropic-ai/claude-agent-sdk'
 import { basename } from 'path'
 import type { Config } from './config'
-import { parseTyped } from './commands'
+import { admitted, allowedAction, membershipRequired, profileFreshOnly, profileLocked, promptTapAllowed, Membership, type AccessConfig } from './access'
+import { Throttle } from './throttle'
+import { KNOWN_COMMANDS, parseTyped, type Typed } from './commands'
+import type { Profile } from './profile'
+import { clipTitle, parseTeamNew, TopicQuota, type Member } from './team'
 import { describeTask } from './feed'
 import { TurnStatus, type StatusTransport } from './status'
 import { parseHandoff, resumePrompt } from './handoff'
@@ -21,9 +25,9 @@ import type { Logger, Metrics } from './log'
 import { htmlEsc, htmlToPlain, renderWithDeadline, chunkHtml, chunkPlain } from './markdown'
 import { isEnabledModelKey, modelLabel, parseEffort, supportsEffort, MODEL_MENU, type Effort } from './models'
 import { listSessions } from './session'
-import { transcribe, TopicOrder, voiceTurn, type Heard } from './voice'
+import { transcribe, TopicOrder, voiceTurn, NO_TRANSCRIBER, type Heard } from './voice'
 import { feedOn, type Binding, type Store } from './state'
-import { isBusy, type SessionExtras, type TopicManager } from './topics'
+import { budgetNotice, isBusy, type SessionExtras, type TopicManager } from './topics'
 import {
   approveKb,
   askKeyboard,
@@ -44,6 +48,7 @@ import {
   wizardAutoKb,
   wizardEffortKb,
   wizardModelKb,
+  type KbMode,
 } from './ui/keyboards'
 import { startWizard, wizardStep, type WizardState } from './ui/wizard'
 
@@ -58,11 +63,25 @@ export type BotDeps = {
   metrics: Metrics
   /** Text for the 📊 Status screen; built by the daemon, which owns uptime and versions. */
   statusText: () => string
+  /** The locked session profile, when one is configured (team mode requires it). */
+  profile?: Profile
+  /** The keys the daemon loaded from .env: none of them reaches the transcriber. */
+  envFileKeys?: string[]
 }
 
 type Pending = { resolve: (r: PermissionResult) => void; topicId: string; messageId?: number }
-type AskBtn = { multi: boolean; selected: Set<number>; options: { label: string; description?: string }[]; messageId: number; resolve: (v: string | string[]) => void }
+type AskBtn = { topicId: string; multi: boolean; selected: Set<number>; options: { label: string; description?: string }[]; messageId: number; resolve: (v: string | string[]) => void }
 const FREE_TEXT = Symbol('free-text')
+/** A profile session has no file tool, so an inbound file has nowhere to go and the host path stays out of the chat. */
+const TEXT_ONLY = '📎 This assistant reads text only: type your question.'
+/** Transcriptions at once: one sender's run of audio is otherwise that many transcriber processes and files. */
+const MAX_TRANSCRIBING = 2
+/** One text for every place a topic creation can fail; Telegram's own error goes to the log. */
+const TOPIC_CREATE_FAILED = "Couldn't create the topic. Is the bot an admin of this group with Manage Topics?"
+const PROFILE_OWNS = '🔒 This install runs a profile: the model, effort and approvals are set there.'
+const PROFILE_FRESH = '🔒 Not under a profile: every topic starts fresh.'
+/** grammy types its optional signal with the abort-controller polyfill; the platform's AbortSignal is what runs. */
+type ApiSignal = NonNullable<Parameters<Api['getChatMember']>[2]>
 
 export class TelegramBot {
   readonly bot: Bot
@@ -79,9 +98,19 @@ export class TelegramBot {
   private menuCtx: Context | undefined
   /** One live "working" message per turn; driven by a 1 s tick from the daemon. */
   readonly status: TurnStatus
+  /** Who may talk and who may change a topic (access.ts). */
+  private readonly access: AccessConfig
+  /** Team mode's second gate: the forum's own member list, asked per sender and cached. */
+  private readonly membership: Membership
+  /** Team mode: topics per member per day. */
+  private readonly quota: TopicQuota
 
   constructor(private readonly d: BotDeps) {
     this.bot = new Bot(d.cfg.telegramToken)
+    this.access = { teamMode: d.cfg.teamMode, allowedUserId: d.cfg.allowedUserId, forumChatId: d.cfg.forumChatId, adminUserIds: d.cfg.adminUserIds }
+    // Capped: bot.start() handles updates one at a time, so one slow answer here would hold every topic.
+    this.membership = new Membership(id => this.bot.api.getChatMember(d.cfg.forumChatId, Number(id), AbortSignal.timeout(5_000) as unknown as ApiSignal))
+    this.quota = new TopicQuota(d.cfg.teamTopicsPerDay)
     // Every API call waits out a 429 for exactly the `retry_after` Telegram names (up to
     // 30 s, three attempts) instead of failing, so a burst of answers across topics is
     // delayed rather than lost. The status message has its own budget on top of this.
@@ -94,6 +123,20 @@ export class TelegramBot {
     this.topics = topics
   }
 
+  /** A Bot API error, read one way everywhere: its code, its text, and a 429's retry_after. */
+  private describeError(e: unknown): { code?: number; text: string; retryAfter?: number } {
+    const any = e as { error_code?: number; description?: string; parameters?: { retry_after?: number }; message?: string }
+    return { code: any?.error_code, text: String(any?.description ?? any?.message ?? e), retryAfter: any?.parameters?.retry_after }
+  }
+
+  /** What a failed edit means: one that changes nothing is a success, and a message the user deleted is gone. */
+  private editOutcome(e: unknown): 'not_modified' | 'gone' | 'other' {
+    const d = this.describeError(e)
+    if (/not modified/i.test(d.text)) return 'not_modified'
+    if (d.code === 400 && /message (to edit )?not found|can't be edited|MESSAGE_ID_INVALID/i.test(d.text)) return 'gone'
+    return 'other'
+  }
+
   /**
    * The status message's transport over the Bot API, with Telegram's answers mapped to
    * what TurnStatus needs: a 429 carries `retry_after` (honoured exactly), "message is
@@ -101,10 +144,6 @@ export class TelegramBot {
    */
   private statusTransport(): StatusTransport {
     const chat = this.d.cfg.forumChatId
-    const describe = (e: unknown): { code?: number; text: string; retryAfter?: number } => {
-      const any = e as { error_code?: number; description?: string; parameters?: { retry_after?: number }; message?: string }
-      return { code: any?.error_code, text: String(any?.description ?? any?.message ?? e), retryAfter: any?.parameters?.retry_after }
-    }
     return {
       create: async (topicId, text, kind) => {
         try {
@@ -128,14 +167,15 @@ export class TelegramBot {
           this.d.metrics.inc('status_edits')
           return { ok: true }
         } catch (e) {
-          const d = describe(e)
-          if (/not modified/i.test(d.text)) return { ok: true }
+          const outcome = this.editOutcome(e)
+          if (outcome === 'not_modified') return { ok: true }
+          if (outcome === 'gone') return { ok: false, gone: true }
+          const d = this.describeError(e)
           if (d.code === 429) {
             this.d.metrics.inc('status_edit_429')
             this.d.log.warn('status.edit_rate_limited', { topic: topicId, retryAfter: d.retryAfter })
             return { ok: false, retryAfterMs: (d.retryAfter ?? 5) * 1000 }
           }
-          if (d.code === 400 && /message (to edit )?not found|can't be edited|MESSAGE_ID_INVALID/i.test(d.text)) return { ok: false, gone: true }
           this.d.log.warn('status.edit_failed', { topic: topicId, error: d.text })
           return { ok: false }
         }
@@ -196,13 +236,46 @@ export class TelegramBot {
     }
   }
 
-  /** Repaint the tapped menu message in place when possible, else send fresh. */
+  /**
+   * Repaint the tapped menu message in place when possible, else send fresh. "Tapped" is
+   * checked against the message's own keyboard, which Telegram sets and a client cannot
+   * forge: callback data sent against another message (the pinned panel, a colleague's
+   * notice) paints nothing over it (security read).
+   */
+  /**
+   * Whether the tapped message's own keyboard holds this data. A forged tap (any client can name
+   * any message id) or a stale one names a message that does not; an inaccessible message (too old
+   * for Telegram to hand over) has no keyboard to check, so it reads as not held.
+   */
+  private tappedHolds(ctx: Context, data: string): boolean {
+    const m = ctx.callbackQuery?.message
+    const keyboard = m && 'reply_markup' in m ? m.reply_markup?.inline_keyboard : undefined
+    return !!keyboard?.some(row => row.some(btn => 'callback_data' in btn && btn.callback_data === data))
+  }
+
   private async paint(topicId: string | undefined, text: string, kb?: InlineKeyboard): Promise<void> {
-    if (this.menuCtx?.callbackQuery?.message) {
+    const q = this.menuCtx?.callbackQuery
+    const m = q?.message
+    // An inaccessible message (too old for Telegram to hand over) has no keyboard to check: not
+    // forged, just unknowable, so the result goes out fresh.
+    const keyboard = m && 'reply_markup' in m ? m.reply_markup?.inline_keyboard : undefined
+    // In a shared forum only the tapped message's own button is edited (a forged or stale tap is
+    // not); for one user any tapped message is, as on main, so a quick second tap edits in place
+    // rather than posting a second screen (twenty-third review).
+    const tapped = this.d.cfg.teamMode ? !!this.menuCtx && q?.data !== undefined && this.tappedHolds(this.menuCtx, q.data) : !!m
+    if (tapped) {
       try {
-        await this.menuCtx.editMessageText(text, { reply_markup: kb })
+        await this.menuCtx!.editMessageText(text, { reply_markup: kb })
         return
       } catch {}
+    } else if (q && this.d.cfg.teamMode) {
+      // Not the tapped message's own button: forged, a stale client whose message was already
+      // repainted, or a message with no keyboard to check. The outcome still goes out, since the
+      // action it reports (a topic created, an allowance spent) has happened, but as a fresh
+      // message on the reply rule, so a crafted tap is bounded and a real one is answered
+      // (twentieth and twenty-first reviews, sixth security read).
+      if (keyboard) this.d.metrics.inc('forged_taps')
+      if (this.muted(topicId, 'paint', String(q.from.id))) return
     }
     await this.send(topicId, text, kb)
   }
@@ -225,6 +298,7 @@ export class TelegramBot {
         this.status.addItems(topicId, ev.items)
         return
       case 'sessionId': {
+        if (this.d.cfg.teamMode) return // a group needs no resume line, and the host's paths stay out of the chat
         const cwd = b?.cwd ?? this.d.cfg.defaultCwd
         await this.say(topicId, `🆔 Session id: ${ev.id}\nResume on laptop:\ncd ${cwd} && claude --resume ${ev.id}`)
         return
@@ -253,6 +327,16 @@ export class TelegramBot {
       case 'turnError': {
         await this.flushOutbox(topicId)
         if (ev.afterRateLimit) return // the friendlier rate-limit notice was already shown
+        if (this.d.profile) {
+          // Nothing to switch under a profile; a spent budget is said now, not at the next message.
+          // The CLI's error strings can name host paths: logged for the operator, not posted.
+          if (ev.errors.length) this.d.log.warn('turn.error_detail', { topic: topicId, subtype: ev.subtype, errors: ev.errors })
+          const budget = ev.subtype === 'error_max_budget_usd' ? `\n💸 ${budgetNotice(this.d.profile.maxBudgetUsd)}` : ''
+          // A broken model (a revoked key) would otherwise answer every member message with a notice.
+          if (!budget && !this.replyAllowed(topicId, 'error')) return
+          await this.send(topicId, `⚠️ turn ended: ${ev.subtype}.${budget}`)
+          return
+        }
         const detail = ev.errors.length ? `\n${ev.errors.map(e => e.slice(0, 300)).join('\n')}` : ''
         await this.send(topicId, `⚠️ turn ended: ${ev.subtype}.${detail}\nTap ⚙️ to switch model or adjust this session.`, controlsKb())
         return
@@ -270,11 +354,16 @@ export class TelegramBot {
         return
       }
       case 'denied':
+        // A hook denial emits no such frame (the SDK says so), so under a profile this is unreachable; on the rule anyway.
+        if (this.d.profile && this.muted(topicId, 'error')) return
         await this.send(topicId, `🚫 ${ev.tool} was denied: ${ev.message}`)
         return
       case 'assistantError':
         this.d.metrics.inc('assistant_errors')
-        await this.send(topicId, `⚠️ model error: ${ev.error}. Tap ⚙️ to switch model or adjust this session.`, controlsKb())
+        if (this.d.profile) {
+          if (this.muted(topicId, 'error')) return
+          await this.send(topicId, `⚠️ model error: ${ev.error}.`)
+        } else await this.send(topicId, `⚠️ model error: ${ev.error}. Tap ⚙️ to switch model or adjust this session.`, controlsKb())
         return
       case 'state':
         // The stream ended (close, eviction, crash): a turn that never got its result must
@@ -366,7 +455,7 @@ export class TelegramBot {
       .sendMessage(this.d.cfg.forumChatId, body, { message_thread_id: Number(topicId), reply_markup: askKeyboard(token, options, multi, selected) })
       .then(sent => {
         this.status.bump(topicId)
-        return new Promise<string | string[]>(resolve => this.askBtns.set(token, { multi, selected, options, messageId: sent.message_id, resolve }))
+        return new Promise<string | string[]>(resolve => this.askBtns.set(token, { topicId, multi, selected, options, messageId: sent.message_id, resolve }))
       })
   }
 
@@ -452,15 +541,59 @@ export class TelegramBot {
     this.order.queue(key, fn, e => this.d.log.error('message.failed', { topic: key, error: e }))
   }
 
-  /** A voice note becomes the words in it, then goes the way typed text does. Any failure is said in the topic. */
+  /** Media in General: outside team mode a hint; in team mode nothing, General being the members' own (commands only). */
+  private async generalOnly(hint: string): Promise<void> {
+    if (!this.d.cfg.teamMode) await this.say(undefined, hint)
+  }
+
+  /** Transcriptions running now; at most MAX_TRANSCRIBING, so one sender's run of audio is not that many transcriber processes. */
+  private transcribing = 0
+  /**
+   * Topics with a voice note queued or being heard, marked when the note is queued: in team
+   * mode a second note waits for the first (not for anything else queued there), and a burst
+   * cannot pile up behind a busy queue (eighteenth review, Codex hook).
+   */
+  private readonly pendingVoice = new Set<string>()
+
+  /**
+   * A voice note becomes the words in it, then goes the way typed text does. Any failure is
+   * said in the topic (under a profile without its detail, which can name host paths; the
+   * log has it). Nothing is downloaded that cannot be heard, and the audio is removed once
+   * it has been: nothing reads it afterwards.
+   */
   private async handleVoice(ctx: Context, topicId: string, media: { file_id: string; file_unique_id: string; file_size?: number; file_name?: string }, shared: Omit<Heard, 'words'>): Promise<void> {
     try {
       if (media.file_size && media.file_size > MAX_DOWNLOAD_BYTES) {
-        return await this.say(topicId, `🎙️ Voice note too large (${(media.file_size / 1048576).toFixed(1)} MB): Telegram caps bot downloads at 20 MB.`)
+        return await this.notice(topicId, 'voice', `🎙️ Voice note too large (${(media.file_size / 1048576).toFixed(1)} MB): Telegram caps bot downloads at 20 MB.`, this.senderId(ctx))
       }
-      if (topicId) await this.typing(topicId)
-      const path = this.d.files.saveInbox(media.file_name || `${media.file_unique_id}.ogg`, await this.download(media.file_id))
-      const words = await transcribe(path, this.d.cfg.transcribeCmd)
+      if (!this.d.cfg.transcribeCmd) {
+        return await this.notice(topicId, 'voice', this.d.profile ? '🎙️ Voice notes are not transcribed on this install: type your question.' : `🎙️ Voice note not transcribed: ${NO_TRANSCRIBER}`, this.senderId(ctx))
+      }
+      // In team mode a fresh topic binds (and pays its opening) before any download: a refused
+      // opening costs no transcription. The member's own note then goes the way typed text does,
+      // once heard, into a topic already bound.
+      if (this.d.cfg.teamMode && !this.d.store.registry[topicId] && !(await this.bindFreshProfileTopic(ctx, topicId))) return
+      // A topic that refuses (closed, spent, full) is told so now, before a slot and a download are
+      // spent on words it would not take (twenty-fifth review).
+      if (await this.topics.refuseNow(topicId, this.senderId(ctx))) return
+      // The slot is checked and taken with nothing in between, just before the download, so notes
+      // arriving in other topics meanwhile cannot all pass the check and a slot is never held
+      // through the bind's Telegram calls (hook, twenty-third review); the download counts too,
+      // which bounds the disk as well as the processes.
+      if (this.transcribing >= MAX_TRANSCRIBING) return await this.notice(topicId, 'voice', `🎙️ ${MAX_TRANSCRIBING} voice notes are being transcribed already. Send it again in a moment.`, this.senderId(ctx))
+      this.transcribing++
+      let words: string
+      try {
+        if (topicId) await this.typing(topicId)
+        const path = this.d.files.saveInbox(media.file_name || `${media.file_unique_id}.ogg`, await this.download(media.file_id))
+        try {
+          words = await transcribe(path, this.d.cfg.transcribeCmd, undefined, this.d.envFileKeys)
+        } finally {
+          this.d.files.removeInbox(path)
+        }
+      } finally {
+        this.transcribing--
+      }
       this.d.metrics.inc('voice_notes')
       const turn = voiceTurn({ words, ...shared })
       if (!shared.forwarded && !shared.audioFile) {
@@ -468,10 +601,15 @@ export class TelegramBot {
         await this.say(topicId, `🎙️ ${words}`)
         return await this.handleText(ctx, turn)
       }
+      // "Passed on" is said only when the words can reach the session (twentieth review).
+      if (await this.topics.refuseNow(topicId, this.senderId(ctx))) return
       await this.say(topicId, `🎙️ ${shared.audioFile ? 'Audio file' : 'Forwarded voice note'}, passed on as content: ${words}`)
-      await this.topics.sendToTopic(topicId, turn)
+      if (!(await this.topics.sendToTopic(topicId, turn, { senderId: this.senderId(ctx) }))) await this.say(topicId, this.noSessionHint())
     } catch (e) {
-      await this.say(topicId, `🎙️ Voice note not transcribed: ${e instanceof Error ? e.message : String(e)}`)
+      const reason = e instanceof Error ? e.message : String(e)
+      if (!this.d.profile) return await this.notice(topicId, 'voice', `🎙️ Voice note not transcribed: ${reason}`, this.senderId(ctx))
+      this.d.log.warn('voice.failed', { topic: topicId, error: reason })
+      await this.notice(topicId, 'voice', '🎙️ Voice note not transcribed; the operator has the detail. Type your question instead.', this.senderId(ctx))
     }
   }
 
@@ -479,7 +617,8 @@ export class TelegramBot {
    *  Voice and audio go through handleVoice (transcription) instead. */
   private async handleIncomingMedia(ctx: Context, kind: InboundKind): Promise<void> {
     const topicId = this.topicIdOf(ctx)
-    if (!topicId) return void this.say(undefined, 'Send media inside a session topic.')
+    if (!topicId) return void this.generalOnly('Send media inside a session topic.')
+    if (await this.mediaRefusedUnderProfile(topicId, this.senderId(ctx))) return
     this.status.bump(topicId)
     const m = ctx.message
     const src = kind === 'video' ? m?.video : kind === 'animation' ? m?.animation : m?.video_note
@@ -504,6 +643,13 @@ export class TelegramBot {
     }
   }
 
+  /** One guard for every inbound media kind: a profile session has no file tool, and the host path stays out of the chat. */
+  private async mediaRefusedUnderProfile(topicId: string, senderId?: string): Promise<boolean> {
+    if (!this.d.profile) return false
+    await this.notice(topicId, 'media', this.d.cfg.transcribeCmd ? `${TEXT_ONLY} Voice notes are transcribed.` : TEXT_ONLY, senderId)
+    return true
+  }
+
   private async download(fileId: string): Promise<Uint8Array> {
     const file = await this.bot.api.getFile(fileId)
     const url = `https://api.telegram.org/file/bot${this.d.cfg.telegramToken}/${file.file_path}`
@@ -513,14 +659,29 @@ export class TelegramBot {
 
   // ── topics: create / bind / controls ─────────────────────────────────────
 
+  /**
+   * The forum topic an update is in; undefined in General. A reply in General carries a
+   * `message_thread_id` too (its reply chain), and `is_topic_message` is what tells a topic
+   * from one: without it a reply in General would bind and pay for a topic that is not there.
+   */
   private topicIdOf(ctx: Context): string | undefined {
-    const id = ctx.message?.message_thread_id ?? ctx.callbackQuery?.message?.message_thread_id
-    return id ? String(id) : undefined
+    const m = ctx.message ?? ctx.callbackQuery?.message
+    return m?.is_topic_message && m.message_thread_id ? String(m.message_thread_id) : undefined
   }
 
-  private async createTopic(name: string): Promise<string> {
-    const topic = await this.bot.api.createForumTopic(this.d.cfg.forumChatId, name.slice(0, 120) || 'session')
-    return String(topic.message_thread_id)
+  private senderId(ctx: Context): string | undefined {
+    return ctx.from ? String(ctx.from.id) : undefined
+  }
+
+  /** The new topic's id, or undefined after a failure, whose Telegram error is in the log; the caller says TOPIC_CREATE_FAILED its own way. */
+  private async createTopic(name: string): Promise<string | undefined> {
+    try {
+      const topic = await this.bot.api.createForumTopic(this.d.cfg.forumChatId, clipTitle(name) || 'session')
+      return String(topic.message_thread_id)
+    } catch (e) {
+      this.d.log.error('topic.create_failed', { error: e })
+      return undefined
+    }
   }
 
   private bind(topicId: string, b: Omit<Binding, 'lastActive'>): void {
@@ -536,36 +697,199 @@ export class TelegramBot {
       await this.bot.api.deleteMessage(this.d.cfg.forumChatId, b.controlMsgId).catch(() => {})
     }
     try {
-      const sent = await this.bot.api.sendMessage(this.d.cfg.forumChatId, topicControlsText(this.d.cfg.catalog, b), {
+      const panel = this.panel(b)
+      const sent = await this.bot.api.sendMessage(this.d.cfg.forumChatId, panel.text, {
         message_thread_id: Number(topicId),
-        reply_markup: topicControlsKb(this.d.cfg.catalog, b),
+        reply_markup: panel.kb,
       })
       b.controlMsgId = sent.message_id
       this.d.store.saveRegistry()
-      // Pin non-silently: the event is what makes mobile Telegram show the per-topic pin bar.
-      await this.bot.api.pinChatMessage(this.d.cfg.forumChatId, sent.message_id).catch(e => this.d.log.warn('pin.failed', { topic: topicId, error: e }))
+      // For one user, pinned non-silently: the event is what makes mobile Telegram show the
+      // per-topic pin bar. In a shared forum, silently: a member's twenty topics a day would
+      // otherwise be twenty pushes to every member (twenty-first review).
+      await this.bot.api.pinChatMessage(this.d.cfg.forumChatId, sent.message_id, { disable_notification: this.d.cfg.teamMode }).catch(e => this.d.log.warn('pin.failed', { topic: topicId, error: e }))
     } catch (e) {
       this.d.log.error('controls.post_failed', { topic: topicId, error: e })
     }
   }
 
   /** The wrap-up confirmation, with the queue count from the live session. */
-  private async offerWrapUp(topicId: string): Promise<void> {
+  private async offerWrapUp(topicId: string, senderId?: string): Promise<void> {
     const live = this.topics.live.get(topicId)
-    if (!live || !isBusy(live)) return this.send(topicId, 'Nothing is running in this topic right now, so there is nothing to wrap up.')
-    await this.send(topicId, wrapConfirmText(live.queued), wrapConfirmKb())
+    if (!live || !isBusy(live)) return this.notice(topicId, 'wrap', 'Nothing is running in this topic right now, so there is nothing to wrap up.', senderId)
+    // The confirmation too: a member tapping "Wrap up" thirty times is thirty posts otherwise.
+    if (this.muted(topicId, 'wrap', senderId)) return
+    // An admin's confirmation keeps "at the next step": the gate admits that tap for admins only, and a member's
+    // tap on an admin's button is refused there like any other admin action.
+    const admin = senderId !== undefined && !membershipRequired(this.access, senderId)
+    await this.send(topicId, wrapConfirmText(live.queued), wrapConfirmKb({ ...this.kbMode(), admin }))
   }
 
   private async repaintControls(topicId: string, b: Binding, note?: string): Promise<void> {
-    await this.paint(topicId, topicControlsText(this.d.cfg.catalog, b, note), topicControlsKb(this.d.cfg.catalog, b))
+    const panel = this.panel(b, note)
+    await this.paint(topicId, panel.text, panel.kb)
+  }
+
+  /** The topic's control panel, text and keyboard, from one place. */
+  private panel(b: Binding, note?: string): { text: string; kb: InlineKeyboard } {
+    return { text: topicControlsText(this.d.cfg.catalog, b, note, this.kbMode()), kb: topicControlsKb(this.d.cfg.catalog, b, this.kbMode()) }
+  }
+
+  /** An unpinned copy of the panel, where the pinned one could not be edited or shows nothing new. */
+  private sendPanel(topicId: string, b: Binding): Promise<void> {
+    const panel = this.panel(b)
+    return this.send(topicId, panel.text, panel.kb)
+  }
+
+  /**
+   * ⚙️ from a notice: refresh the pinned panel itself, never the notice the button sat
+   * on, and re-post only a panel that is gone (a re-post re-pins, and a pin notifies the
+   * whole forum, so a 429 or a network error on the edit is logged and left).
+   */
+  private async refreshPinnedControls(topicId: string, b: Binding): Promise<'edited' | 'unchanged' | 'posted'> {
+    if (b.controlMsgId) {
+      try {
+        const panel = this.panel(b)
+        await this.bot.api.editMessageText(this.d.cfg.forumChatId, b.controlMsgId, panel.text, { reply_markup: panel.kb })
+        return 'edited'
+      } catch (e) {
+        const outcome = this.editOutcome(e)
+        if (outcome === 'not_modified') return 'unchanged'
+        if (outcome !== 'gone') {
+          // A 429 or a network error: the pinned panel keeps its old state, so the current one
+          // (a closed topic's Reopen, say) goes out as an unpinned copy; no re-pin, no notification.
+          this.d.log.warn('controls.refresh_failed', { topic: topicId, error: this.describeError(e).text })
+          await this.sendPanel(topicId, b)
+          return 'posted'
+        }
+        // Deleted by hand: posting again is the only way to have a panel at all.
+      }
+    }
+    await this.postPinnedControls(topicId)
+    return 'posted'
+  }
+
+  private kbMode(): KbMode {
+    return { team: this.d.cfg.teamMode, profile: !!this.d.profile }
+  }
+
+  private memberOf(ctx: Context): Member {
+    return { firstName: ctx.from?.first_name, username: ctx.from?.username }
+  }
+
+  /** A topic opened without a title: the member and the time. */
+  private defaultTitle(ctx: Context): string {
+    return parseTeamNew('', this.memberOf(ctx), new Date()).title
+  }
+
+  /** The topic's own name, carried by messages that reply to its creation: a member's text, or the bot's message a tap sits on. */
+  private topicTitleOf(ctx: Context): string | undefined {
+    const m = ctx.message ?? ctx.callbackQuery?.message
+    return m?.reply_to_message?.forum_topic_created?.name
+  }
+
+  /**
+   * One opening, both allowances: the day's (`TEAM_TOPICS_PER_DAY`, taken synchronously so two
+   * in flight cannot both pass) and then the minute's (ten creations, since a creation
+   * Telegram refuses is given back from the day and the day alone would not bound the
+   * attempts; a topic made by hand in Telegram costs the same pin and counts the same). Says
+   * which was spent and returns nothing, or returns the refund for an opening that did not
+   * happen. Admins and single users are exempt by the one rule the membership gate uses.
+   */
+  private async reserveOpening(ctx: Context, where: string | undefined): Promise<(() => void) | undefined> {
+    const uid = this.senderId(ctx)
+    if (!membershipRequired(this.access, uid)) return () => {}
+    if (!uid) return undefined
+    if (!this.quota.take(uid)) {
+      this.d.metrics.inc('topic_quota_refused')
+      await this.notice(where, 'quota', `🧮 You have opened ${this.d.cfg.teamTopicsPerDay} topics today, the daily allowance. Keep asking in one of them, or come back tomorrow.`, uid)
+      return undefined
+    }
+    if (!this.creations.allow(uid)) {
+      this.quota.refund(uid)
+      await this.notice(where, 'create', '⏳ Too many new topics in a minute. Try again shortly.', uid)
+      return undefined
+    }
+    return () => this.quota.refund(uid)
+  }
+
+  /**
+   * A fresh topic a member typed or spoke into: bound to the profile, within the allowance.
+   * Every caller reads the registry just before, under the topic's own ordering (one update
+   * at a time, handlers queued per topic), so the topic is still unbound here.
+   */
+  private async bindFreshProfileTopic(ctx: Context, topicId: string, title?: string): Promise<boolean> {
+    if (this.removed.has(topicId)) {
+      // Deleted by an admin: gone, going, or left behind by a deletion Telegram refused. Said on the rule, not in silence.
+      await this.notice(topicId, 'closed', '🗑 An admin deleted this topic; it takes no new messages. Open a new one for your question.', this.senderId(ctx))
+      return false
+    }
+    if (!(await this.reserveOpening(ctx, topicId))) return false
+    this.bindProfileTopic(topicId, title ?? this.topicTitleOf(ctx) ?? this.defaultTitle(ctx))
+    await this.postPinnedControls(topicId)
+    return true
+  }
+
+  /**
+   * With a profile: a topic binds to it, never to a folder, model or approval choice. No
+   * session is opened here; the first message opens one, so a topic nobody writes in
+   * costs no process.
+   */
+  private bindProfileTopic(topicId: string, title: string): void {
+    const p = this.d.profile
+    const { prefs } = this.d.store
+    this.bind(topicId, { cwd: p?.cwd ?? this.d.store.defaultCwd(), model: p?.model ?? prefs.defaultModel, effort: p?.effort ?? prefs.defaultEffort, title, auto: false, profile: true, profileName: p?.name })
+    this.d.metrics.inc('topics_created')
+  }
+
+  /** ⚙️ and /menu: the pinned panel of a bound topic, refreshed in place, or the main menu. */
+  private async controlsOrMenu(topicId: string | undefined, fresh = false): Promise<'menu' | 'edited' | 'unchanged' | 'posted'> {
+    const b = topicId ? this.d.store.registry[topicId] : undefined
+    if (!topicId || !b) {
+      await this.showMainMenu(topicId, fresh)
+      return 'menu'
+    }
+    // In a shared forum the panel is refreshed where it is (a re-post re-pins, and a pin notifies
+    // the whole forum); for one user it is brought to the bottom, as before.
+    if (!this.d.cfg.teamMode) {
+      await this.postPinnedControls(topicId)
+      return 'posted'
+    }
+    const shown = await this.refreshPinnedControls(topicId, b)
+    // A typed /menu whose panel was already current would otherwise show nothing: an unpinned copy.
+    if (shown === 'unchanged' && fresh) await this.sendPanel(topicId, b)
+    return shown
+  }
+
+  /**
+   * /new, 🆕 and ⚡ with a profile: one path, within the allowance. A tap's outcome paints
+   * the tapped menu; typed or spoken text gets a fresh message, because the voice path
+   * runs outside the update loop and the shared menu context may be another member's.
+   */
+  private async createProfileTopic(ctx: Context, title: string, intoTopic: string | undefined, via: 'tap' | 'text'): Promise<void> {
+    // A tap's receipt edits the tapped menu for one user, as on main; in team mode that menu is a shared
+    // screen (General's, or a topic's), so the receipt goes out fresh and the menu stays (twenty-eighth review).
+    const tell = (text: string, kb?: InlineKeyboard): Promise<void> => (via === 'tap' && !this.d.cfg.teamMode ? this.paint(intoTopic, text, kb) : this.send(intoTopic, text, kb))
+    // A creation Telegram refuses is refunded, so the daily allowance does not bound the attempts
+    // while creation fails: a member's own creation allowance does (fourth security read), apart
+    // from the reply allowance so that ten replies do not cost a topic; admins are exempt, as from
+    // the daily allowance.
+    const refund = await this.reserveOpening(ctx, intoTopic)
+    if (!refund) return
+    const topicId = await this.createTopic(title)
+    if (!topicId) {
+      refund() // only an opening that happened counts
+      return tell(TOPIC_CREATE_FAILED, backKb())
+    }
+    this.bindProfileTopic(topicId, title)
+    await this.postPinnedControls(topicId)
+    await tell(`✅ Created "${title}".`, openLinkKb(this.d.cfg.forumChatId, topicId))
   }
 
   private async newSession(name: string, cwd: string, model: string, effort: Effort | undefined, auto: boolean, intoTopic?: string): Promise<string | undefined> {
-    let topicId: string
-    try {
-      topicId = await this.createTopic(name)
-    } catch (e) {
-      await this.paint(intoTopic, `Couldn't create topic (is the bot admin with Manage Topics?): ${e}`, backKb())
+    const topicId = await this.createTopic(name)
+    if (!topicId) {
+      await this.paint(intoTopic, TOPIC_CREATE_FAILED, backKb())
       return undefined
     }
     this.bind(topicId, { cwd, model, effort, title: name, auto })
@@ -596,11 +920,9 @@ export class TelegramBot {
     }
     const match = matches[0]
     const title = name || (match.summary || shortId).slice(0, 40)
-    let topicId: string
-    try {
-      topicId = await this.createTopic(title)
-    } catch (e) {
-      await this.say(fromTopic, `Couldn't create topic: ${e}`)
+    const topicId = await this.createTopic(title)
+    if (!topicId) {
+      await this.say(fromTopic, TOPIC_CREATE_FAILED)
       return
     }
     this.bind(topicId, { sessionId: match.sessionId, cwd: match.cwd || this.d.cfg.defaultCwd, model: this.d.store.prefs.defaultModel, effort: this.d.store.prefs.defaultEffort, title })
@@ -610,8 +932,15 @@ export class TelegramBot {
 
   // ── screens ──────────────────────────────────────────────────────────────
 
-  private async showMainMenu(topicId: string | undefined): Promise<void> {
-    await this.paint(topicId, '👋 What would you like to do?', mainMenuKb())
+  /**
+   * The main menu: painted over the tapped menu message, or, for a typed command, sent
+   * fresh. The tapped message is whoever's tapped last, which in a shared forum is another
+   * member's screen (fourteenth review).
+   */
+  private async showMainMenu(topicId: string | undefined, fresh = false): Promise<void> {
+    const text = '👋 What would you like to do?'
+    if (fresh) await this.send(topicId, text, mainMenuKb(this.kbMode()))
+    else await this.paint(topicId, text, mainMenuKb(this.kbMode()))
   }
 
   private async showSettings(topicId: string | undefined): Promise<void> {
@@ -645,7 +974,7 @@ export class TelegramBot {
 
   private async renderWizard(uid: string, topicId: string | undefined, page = 0): Promise<void> {
     const w = this.wizard.get(uid)
-    if (!w) return void this.paint(topicId, 'Expired — tap 🆕 again.', mainMenuKb())
+    if (!w) return void this.paint(topicId, 'Expired — tap 🆕 again.', mainMenuKb(this.kbMode()))
     switch (w.step) {
       case 'folder': {
         const buttons = w.folders.map((f, i) => ({ label: '📁 ' + basename(f), data: `m:nf:${i}` }))
@@ -667,10 +996,9 @@ export class TelegramBot {
     const effort = done.effort ?? this.d.store.prefs.defaultEffort
     let topicId = done.bindTopic
     if (!topicId) {
-      try {
-        topicId = await this.createTopic(name)
-      } catch (e) {
-        await this.send(undefined, `Couldn't create topic (is the bot admin with Manage Topics?): ${e}`)
+      topicId = await this.createTopic(name)
+      if (!topicId) {
+        await this.send(undefined, TOPIC_CREATE_FAILED)
         return
       }
     }
@@ -695,15 +1023,34 @@ export class TelegramBot {
     const { catalog } = this.d.cfg
     const store = this.d.store
 
-    if (data === 'm:menu') return void (await ack(), this.showMainMenu(topicId))
+    if (data === 'm:menu') {
+      // A muted tap is told so in its toast (no message is sent), or it looks dead (twenty-ninth review).
+      if (this.muted(topicId, 'menu', this.senderId(ctx))) return void ack('Try again in a moment')
+      await ack()
+      return this.showMainMenu(topicId)
+    }
     if (data === 'm:noop') return void ack()
     if (data === 'm:new' || data === 'm:newhere') {
+      if (this.d.profile) {
+        // No wizard: the profile decides everything but the title.
+        if (data === 'm:newhere' && topicId) {
+          if (store.registry[topicId]) return void ack('Already a conversation')
+          await ack('Starting…')
+          // Queued behind this topic's transcription, so a voice note and this tap bind it once.
+          return this.inOrder(ctx, async () => {
+            if (!store.registry[topicId]) await this.bindFreshProfileTopic(ctx, topicId)
+          })
+        }
+        await ack('Creating…')
+        return this.createProfileTopic(ctx, this.defaultTitle(ctx), topicId, 'tap')
+      }
       await ack()
       this.wizard.set(uid, startWizard(listRepoFolders(this.d.cfg.reposDir, store.defaultCwd()), data === 'm:newhere' ? topicId : undefined))
       return this.renderWizard(uid, topicId)
     }
     if (data === 'm:quick') {
       await ack('Creating…')
+      if (this.d.profile) return this.createProfileTopic(ctx, this.defaultTitle(ctx), topicId, 'tap')
       const cwd = store.defaultCwd()
       const tid = await this.newSession(basename(cwd), cwd, store.prefs.defaultModel, store.prefs.defaultEffort, false, topicId)
       if (tid) await this.paint(topicId, `✅ Created "${basename(cwd)}".`, openLinkKb(this.d.cfg.forumChatId, tid))
@@ -728,13 +1075,24 @@ export class TelegramBot {
     }
     if (data === 'm:settings') return void (await ack(), this.showSettings(topicId))
     if (data === 'm:status') return void (await ack(), this.paint(topicId, this.d.statusText(), backKb()))
-    if (data === 'm:help') return void (await ack(), this.send(topicId, help(this.d.cfg.reposDir), backKb()))
+    if (data === 'm:help') {
+      if (this.muted(topicId, 'help', this.senderId(ctx))) return void ack('Try again in a moment')
+      await ack()
+      return void this.send(topicId, this.helpText(), backKb())
+    }
     if (data === 'm:cancel') {
       this.wizard.delete(uid)
       await ack('Cancelled')
+      if (this.muted(topicId, 'menu', this.senderId(ctx))) return
       return this.showMainMenu(topicId)
     }
-    if (data === 'm:ctl') return void (await ack(), topicId && store.registry[topicId] ? this.postPinnedControls(topicId) : this.showMainMenu(topicId))
+    if (data === 'm:ctl') {
+      if (this.muted(topicId, 'menu', this.senderId(ctx))) return void ack('Try again in a moment')
+      const shown = await this.controlsOrMenu(topicId)
+      // A panel edited in place, or already current, changes nothing where the tap was: say where
+      // it is, or the tap looks dead (thirty-fifth review: the edited case toasted nothing).
+      return void ack(shown === 'unchanged' ? '⚙️ The controls are pinned at the top of this topic' : shown === 'edited' ? '⚙️ The controls are pinned at the top of this topic, refreshed' : undefined)
+    }
 
     // Settings
     const sdm = /^m:sdm:(\w+)$/.exec(data)
@@ -832,28 +1190,55 @@ export class TelegramBot {
     }
     if (data === 'm:twrap') {
       await ack()
-      return this.offerWrapUp(topicId)
+      return this.offerWrapUp(topicId, this.senderId(ctx))
     }
     const tw = /^m:tw:(now|turn)$/.exec(data)
     if (tw) {
       const ok = this.topics.wrapUp(topicId, { when: tw[1] === 'turn' ? 'after-turn' : 'now' })
       await ack(ok ? '⏹ Wrapping up…' : 'Nothing is running')
-      if (!ok) return this.send(topicId, 'Nothing is running in this topic right now, so there is nothing to wrap up.')
+      if (!ok) return this.notice(topicId, 'wrap', 'Nothing is running in this topic right now, so there is nothing to wrap up.', this.senderId(ctx))
       return this.paint(topicId, tw[1] === 'turn' ? '⏳ Wrapping up after this turn: the session finishes what it is doing, then writes a hand-off.' : '⏹ Wrapping up: the session finishes its current step, then writes a hand-off.')
     }
     if (data === 'm:tres') {
       const hb = this.d.store.registry[topicId]
+      // A binding from before the profile was adopted at boot, so no hand-off here is the operator's.
       const h = hb?.handoff ? parseHandoff(hb.handoff.text) : undefined
       if (!h) return void ack('No hand-off saved for this topic')
+      // The topic's refusal first, as a typed line asks it: a closed, spent or slot-starved topic must
+      // not hear "Resuming" and then a refusal, or nothing (thirtieth review).
+      if (await this.topics.refuseNow(topicId, this.senderId(ctx))) return void ack('Not now: see the notice in this topic')
       await ack('▶️ Resuming')
-      await this.topics.sendToTopic(topicId, resumePrompt(h))
-      return
+      // Queued behind a voice note still being heard in this topic, as typed text is, so the resume
+      // does not jump ahead of words already on their way (thirty-first review).
+      return this.inOrder(ctx, async () => {
+        this.status.bump(topicId)
+        await this.typing(topicId)
+        await this.topics.sendToTopic(topicId, resumePrompt(h), { senderId: this.senderId(ctx) })
+      })
     }
     if (data === 'm:tf') {
       if (!b) return void ack('No session here')
+      // Every flip writes the registry and edits the panel: in a shared forum, so many a minute.
+      if (this.muted(topicId, 'feed', this.senderId(ctx))) return void ack('Try again in a moment')
       b.feed = !feedOn(b)
       store.saveRegistry()
       await ack(b.feed ? '🔎 Feed ON' : '🔎 Feed OFF')
+      // In a shared forum the pinned panel is what everyone reads: refreshed on a state change,
+      // whichever copy carried the tap; for one user the tapped message, as on main.
+      if (this.d.cfg.teamMode) {
+        await this.refreshPinnedControls(topicId, b)
+        // A tap on an unpinned copy (posted when the pinned one could not be edited, or by /menu) edits
+        // that copy too, so its button does not read the old state and flip it back on the next tap
+        // (thirtieth review).
+        // Only when that copy's own keyboard holds the button: a forged tap names any message in the
+        // forum, and editing it would replace a colleague's answer with the panel (thirty-fifth review).
+        const tappedId = ctx.callbackQuery?.message?.message_id
+        if (tappedId !== undefined && tappedId !== b.controlMsgId && this.tappedHolds(ctx, 'm:tf')) {
+          const p = this.panel(b)
+          await ctx.editMessageText(p.text, { reply_markup: p.kb }).catch(() => {})
+        }
+        return
+      }
       return this.repaintControls(topicId, b)
     }
     if (data === 'm:ta') {
@@ -864,56 +1249,130 @@ export class TelegramBot {
       return this.repaintControls(topicId, b)
     }
     if (data === 'm:tclose') {
+      // A panel with no binding behind it (one left pinned by a deletion Telegram refused) has no
+      // session to close: said so, rather than "closed and saved, Reopen to resume" (thirty-second review).
+      if (!b) return void ack('No session here')
+      if (this.d.cfg.teamMode) {
+        // Closed for everyone until an admin reopens it: the flag first, before anything yields,
+        // so a queued note or line cannot open a fresh session in the gap (eighteenth review).
+        b.closed = true
+        store.saveRegistry()
+      }
       this.topics.userTookOver(topicId)
       this.topics.closeLive(topicId, 'closed & kept by user')
       void this.status.drop(topicId)
-      if (b?.controlMsgId) await this.bot.api.unpinChatMessage(this.d.cfg.forumChatId, b.controlMsgId).catch(() => {})
       await ack('💾 Closed')
-      await this.paint(topicId, '💾 Session closed and saved — your context is kept. Reopen to resume.', new InlineKeyboard().text('♻️ Reopen & resume', 'm:treopen'))
+      if (this.d.cfg.teamMode) {
+        // The pinned panel shows the closed state with ♻️ Reopen and stays pinned, so "reopen it
+        // from the pinned panel" is true, and a later refresh keeps the button (seventeenth review).
+        await this.refreshPinnedControls(topicId, b)
+      } else {
+        // One user's kept topic resumes on its next message; no flag is written.
+        if (b.controlMsgId) await this.bot.api.unpinChatMessage(this.d.cfg.forumChatId, b.controlMsgId).catch(() => {})
+        await this.paint(topicId, '💾 Session closed and saved — your context is kept. Reopen to resume.', new InlineKeyboard().text('♻️ Reopen & resume', 'm:treopen'))
+      }
       await this.bot.api.closeForumTopic(this.d.cfg.forumChatId, Number(topicId)).catch(e => this.d.log.warn('topic.close_failed', { topic: topicId, error: e }))
       return
     }
     if (data === 'm:treopen') {
+      // No binding behind the panel (a deletion Telegram refused left it pinned): nothing to reopen, and
+      // the pinned panel is not painted over (thirty-third review); for one user, as on main.
+      if (!b && this.d.cfg.teamMode) return void ack('No session here')
       await this.bot.api.reopenForumTopic(this.d.cfg.forumChatId, Number(topicId)).catch(e => this.d.log.warn('topic.reopen_failed', { topic: topicId, error: e }))
       if (!b) return void this.paint(topicId, 'That session no longer exists.', backKb())
-      this.topics.ensureLive(topicId)
-      await ack('♻️ Reopened')
+      if (b.closed) {
+        b.closed = false
+        store.saveRegistry()
+      }
+      if (this.d.cfg.teamMode) {
+        // Reopened, not resumed: like a fresh topic, it costs no process until someone writes in
+        // it. The panel stayed pinned through the close, so it is refreshed, never re-pinned.
+        await ack('♻️ Reopened')
+        await this.refreshPinnedControls(topicId, b)
+        return
+      }
+      const live = this.topics.ensureLive(topicId)
+      const why = live ? undefined : this.topics.openRefusal(topicId)
+      await ack(live ? '♻️ Reopened' : `♻️ Reopened, but no session could open${why ? ` (${why})` : ''}`)
       await this.repaintControls(topicId, b)
       if (b.controlMsgId) await this.bot.api.pinChatMessage(this.d.cfg.forumChatId, b.controlMsgId).catch(() => {})
       return
     }
     if (data === 'm:tdelete') {
       await ack()
-      return this.paint(
+      return this.confirm(
         topicId,
-        '🗑 Delete this topic and forget its session here?\nThe transcript stays on disk and can be reopened later from 📋 My sessions or /attach. To remove everything, use 🧹 instead.',
-        new InlineKeyboard().text('🗑 Yes, delete', 'm:tdelyes').text('↩️ Cancel', 'm:ctl'),
+        this.d.profile
+          ? '🗑 Delete this topic and forget its session here?\nThe transcript stays on disk. To remove everything, use 🧹 instead.'
+          : '🗑 Delete this topic and forget its session here?\nThe transcript stays on disk and can be reopened later from 📋 My sessions or /attach. To remove everything, use 🧹 instead.',
+        new InlineKeyboard().text('🗑 Yes, delete', 'm:tdelyes').text('↩️ Cancel', this.d.cfg.teamMode ? 'm:tdelno' : 'm:ctl'),
       )
+    }
+    if (data === 'm:tdelno') {
+      // The team-mode confirmation is its own message: cancelling removes it, so no live "Yes" stays behind.
+      await ack('Cancelled')
+      await ctx.deleteMessage().catch(() => {})
+      return
     }
     if (data === 'm:tdelyes') {
       this.removeTopic(topicId, false)
       await ack('🗑 Deleted')
-      await this.bot.api.deleteForumTopic(this.d.cfg.forumChatId, Number(topicId)).catch(e => this.d.log.warn('topic.delete_failed', { topic: topicId, error: e }))
+      await this.deleteForumTopic(topicId)
       return
     }
     if (data === 'm:twipe') {
       await ack()
-      return this.paint(
+      return this.confirm(
         topicId,
         '🧹 Remove EVERYTHING for this topic — the session, its transcript (no longer resumable), delivered files, and the topic itself?\nThis cannot be undone.',
-        new InlineKeyboard().text('🧹 Yes, wipe it all', 'm:twipeyes').text('↩️ Cancel', 'm:ctl'),
+        new InlineKeyboard().text('🧹 Yes, wipe it all', 'm:twipeyes').text('↩️ Cancel', this.d.cfg.teamMode ? 'm:tdelno' : 'm:ctl'),
       )
     }
     if (data === 'm:twipeyes') {
       this.removeTopic(topicId, true)
       await ack('🧹 Wiped')
-      await this.bot.api.deleteForumTopic(this.d.cfg.forumChatId, Number(topicId)).catch(e => this.d.log.warn('topic.wipe_failed', { topic: topicId, error: e }))
+      await this.deleteForumTopic(topicId)
       return
     }
     await ack()
   }
 
+  /**
+   * A delete or wipe confirmation: painted over the tapped panel for one user, as on main; in team
+   * mode the pinned panel is everyone's, so the confirmation is its own message and its Cancel
+   * removes it (twenty-ninth review: an abandoned one left every member a pinned "Yes, delete").
+   */
+  private async confirm(topicId: string | undefined, text: string, kb: InlineKeyboard): Promise<void> {
+    if (this.d.cfg.teamMode) {
+      await this.send(topicId, text, kb)
+      return
+    }
+    return this.paint(topicId, text, kb)
+  }
+
+  /** Topics deleted this process: a note still being heard there must not bind it again while Telegram removes it. */
+  private readonly removed = new Set<string>()
+
+  /**
+   * The Telegram side of a deletion, after the bot's own. A refusal keeps the tombstone: the
+   * binding, the session and (for a wipe) the transcript are already gone, so the topic is the
+   * admin's to delete by hand or retry, not a fresh topic for the next member line; the admin
+   * is told. A success lets the tombstone go once any note still queued there has had time to
+   * finish, so the set does not grow for the process's life (twenty-third review).
+   */
+  private async deleteForumTopic(topicId: string): Promise<void> {
+    try {
+      await this.bot.api.deleteForumTopic(this.d.cfg.forumChatId, Number(topicId))
+      setTimeout(() => this.removed.delete(topicId), 10 * 60_000).unref()
+    } catch (e) {
+      this.d.log.warn('topic.delete_failed', { topic: topicId, error: e })
+      await this.say(topicId, '🗑 The bot has let this topic go, but Telegram would not delete it (the log has the detail). Delete it by hand in Telegram; it takes no new messages.')
+    }
+  }
+
   private removeTopic(topicId: string, wipe: boolean): void {
+    this.removed.add(topicId)
+    this.anonymousNoticed.delete(topicId)
     const sid = this.d.store.registry[topicId]?.sessionId
     this.topics.userTookOver(topicId)
     this.topics.closeLive(topicId, wipe ? 'wiped by user' : 'deleted by user')
@@ -932,12 +1391,48 @@ export class TelegramBot {
 
   private async handleText(ctx: Context, raw: string): Promise<void> {
     const topicId = this.topicIdOf(ctx)
-    const typed = parseTyped(raw, this.d.cfg.catalog)
+    const parsed = parseTyped(raw, this.d.cfg.catalog, ctx.me?.username)
+    if (parsed.kind === 'foreign') return // another bot's command
+    // Under a profile, "use opus" or "effort high" configure nothing: they are what the user said.
+    const typed: Typed = this.d.profile && (parsed.kind === 'use' || parsed.kind === 'effort') ? { kind: 'chat', text: raw.trim() } : parsed
     this.d.log.debug('in.text', { topic: topicId ?? 'general', kind: typed.kind, len: raw.length })
 
+    const fromId = this.senderId(ctx)
+    const refuse = (): Promise<void> => {
+      this.d.metrics.inc('admin_only_refused')
+      return this.notice(topicId, 'admins', '🔒 Admins only.', fromId)
+    }
+
     if (typed.kind === 'slash') {
+      // An unknown command (/start, a typo) is nobody's to refuse: the menu, or silence in a team's General.
+      if (!KNOWN_COMMANDS.has(typed.cmd)) {
+        if (!topicId && this.d.cfg.teamMode) return
+        // In a shared forum a menu per unknown command is a flood a member can cause: once a minute per topic.
+        if (this.muted(topicId, 'menu', fromId)) return
+        return this.showMainMenu(topicId, true)
+      }
+      if (!allowedAction(this.access, fromId, `/${typed.cmd}`)) return refuse()
+      if (this.d.profile && profileLocked(`/${typed.cmd}`)) return void this.say(topicId, PROFILE_OWNS)
+      if (this.d.profile && profileFreshOnly(`/${typed.cmd}`)) return void this.say(topicId, PROFILE_FRESH)
       switch (typed.cmd) {
         case 'new': {
+          if (this.d.profile) {
+            const given = typed.args.trim() ? parseTeamNew(typed.args, this.memberOf(ctx), new Date()).title : undefined
+            // Typed into a fresh topic a member made by hand, /new binds that topic (a second one would
+            // cost a second opening and leave this one unbound): a bare /new keeps the topic's own
+            // name, a given title names the binding. Telegram's topic name is left alone: renaming it
+            // would let any member rename a colleague's topic (twenty-third and twenty-fourth
+            // reviews, eighth security read).
+            if (this.d.cfg.teamMode && topicId && !this.d.store.registry[topicId]) {
+              const name = given ?? this.topicTitleOf(ctx) ?? this.defaultTitle(ctx)
+              if (!(await this.bindFreshProfileTopic(ctx, topicId, name))) return
+              // Plain text: the name is the member's, and say() renders Markdown (thirty-third review: a title
+              // with a link in it posted that link under the bot's name).
+              await this.send(topicId, `✅ Bound as "${name}". Type your question below.`)
+              return
+            }
+            return this.createProfileTopic(ctx, given ?? this.defaultTitle(ctx), topicId, 'text')
+          }
           const { name, cwd, auto, notes } = parseNew(typed.args, this.d.store.defaultCwd())
           for (const n of notes) await this.say(topicId, n)
           await this.newSession(name, cwd, this.d.store.prefs.defaultModel, this.d.store.prefs.defaultEffort, auto, topicId)
@@ -963,22 +1458,38 @@ export class TelegramBot {
         case 'status':
           return void this.send(topicId, this.d.statusText())
         case 'menu':
-          return topicId && this.d.store.registry[topicId] ? this.postPinnedControls(topicId) : this.showMainMenu(topicId)
+          // A typed menu or help text is a reply a member can trigger at will: in a shared forum, so many a minute.
+          if (this.muted(topicId, 'menu', fromId)) return
+          await this.controlsOrMenu(topicId, true)
+          return
         case 'help':
-          return void this.say(topicId, help(this.d.cfg.reposDir))
+          if (this.muted(topicId, 'help', fromId)) return
+          return void this.say(topicId, this.helpText())
         default:
-          return this.showMainMenu(topicId)
+          return // every known command has a case above; KNOWN_COMMANDS gated the rest before the switch
       }
     }
 
-    if (!topicId) return this.showMainMenu(undefined) // plain text in General → the menu
+    if (!topicId) {
+      if (this.d.cfg.teamMode) return // General is the members' own; the bot answers commands there, not chatter
+      return this.showMainMenu(undefined, true) // plain text in General → the menu
+    }
 
-    // A pending clarifying question takes any typed reply as its free-text answer.
+    // A pending clarifying question takes any typed reply as its free-text answer, before
+    // the admin gate: the answer is the session's, whatever words it happens to be.
     const ft = this.askFreeText.get(topicId)
     if (ft) return void ft(raw)
 
-    const b = this.d.store.registry[topicId]
-    if (typed.kind === 'wrap') return this.offerWrapUp(topicId)
+    if (!allowedAction(this.access, fromId, typed.kind)) return refuse()
+
+    let b = this.d.store.registry[topicId]
+    if (!b && this.d.cfg.teamMode) {
+      // A fresh topic a member typed into is bound first, whatever the line says, so `feed on`
+      // or `wrap` as a first line meets the topic any other first line would have created.
+      if (!(await this.bindFreshProfileTopic(ctx, topicId))) return
+      b = this.d.store.registry[topicId]
+    }
+    if (typed.kind === 'wrap') return this.offerWrapUp(topicId, fromId)
     if (typed.kind === 'use' || typed.kind === 'effort' || typed.kind === 'feed') {
       if (!b) return void this.say(topicId, 'No session bound here.')
       if (typed.kind === 'use') {
@@ -1000,35 +1511,130 @@ export class TelegramBot {
         this.topics.closeLive(topicId, 'effort switch')
         return void this.say(topicId, `Effort set to ${typed.effort ?? 'default'}. (applies on next message)`)
       }
+      if (this.muted(topicId, 'feed', fromId)) return
       b.feed = typed.on
       this.d.store.saveRegistry()
       return void this.say(topicId, typed.on ? '🔎 Activity feed ON — one line per tool call.' : '🔎 Activity feed OFF.')
     }
 
     if (!b) return void this.send(topicId, 'This topic has no Claude session yet.', new InlineKeyboard().text('🆕 Start a session here', 'm:newhere'))
+    // A topic that refuses (closed, spent, full) is told so before the status moves and the typing
+    // indicator goes out: a flood into such a topic costs no sendChatAction per line.
+    if (await this.topics.refuseNow(topicId, fromId)) return
     this.status.bump(topicId) // the user's own message now sits below the status
     await this.typing(topicId)
-    if (!(await this.topics.sendToTopic(topicId, typed.text))) await this.say(topicId, 'No session bound to this topic. Use /new (or /attach) first.')
+    if (!(await this.topics.sendToTopic(topicId, typed.text, { senderId: fromId }))) await this.say(topicId, this.noSessionHint())
+  }
+
+  /** The one help text, for the tap and the typed command alike. */
+  private helpText(): string {
+    return this.d.cfg.teamMode ? teamHelp() : help(this.d.cfg.reposDir)
+  }
+
+  /** Under a profile every topic starts fresh, so /attach is not on offer. */
+  private noSessionHint(): string {
+    return this.d.profile ? 'No session bound to this topic. Use /new first.' : 'No session bound to this topic. Use /new (or /attach) first.'
   }
 
   // ── wiring ───────────────────────────────────────────────────────────────
 
   private allowed(ctx: Context): boolean {
-    return String(ctx.from?.id) === this.d.cfg.allowedUserId && String(ctx.chat?.id) === this.d.cfg.forumChatId
+    return admitted(this.access, { fromId: this.senderId(ctx), chatId: ctx.chat ? String(ctx.chat.id) : undefined, anonymous: !!ctx.message?.sender_chat })
+  }
+
+  /** Topics where a post made as the group has been answered with the reason once. */
+  private readonly anonymousNoticed = new Set<string>()
+
+  /** A reply of one kind at most once a minute per topic (General counted as one). */
+  private readonly refusals = new Throttle(60_000)
+  /** And at most ten replies a minute to one member, whatever the topics: the key space of topics is theirs to grow. */
+  private readonly senderReplies = new Throttle(60_000, () => Date.now(), 10)
+  /** A member's topic creations, ten a minute: a creation Telegram refuses is refunded, so the day's allowance alone does not bound the attempts. */
+  private readonly creations = new Throttle(60_000, () => Date.now(), 10)
+
+  /** Whether a reply a member can trigger at will is muted now; counted when it is. The manager's refusals ask this too. */
+  muted(topicId: string | undefined, kind: string, senderId?: string): boolean {
+    if (this.replyAllowed(topicId, kind, senderId)) return false
+    this.d.metrics.inc('refusals_muted')
+    return true
+  }
+
+  /**
+   * Whether a reply a member can trigger at will (a refusal, the help text, a menu) goes
+   * out now. Every refused message is counted; a member's flood of them is not the bot's
+   * flood (security read), which under Telegram's 429 retries on the bot's replies would
+   * stall the update loop for everyone.
+   */
+  replyAllowed(topicId: string | undefined, kind: string, senderId?: string): boolean {
+    if (!this.d.cfg.teamMode) return true // the throttles are a shared forum's: one user's notices are all answered
+    // An admin is configured, not throttled, as with the daily allowance: a member's slot must
+    // not mute the admin's own action a moment later (twenty-first review).
+    if (senderId !== undefined && !membershipRequired(this.access, senderId)) return true
+    // Both asked before either is charged: a member past their allowance must not use up the
+    // topic's one slot for that kind and silence a colleague's notice (sixteenth review), and a
+    // reply the topic's slot mutes must not cost the member an allowance they will need for the
+    // one notice that explains their refusal (twentieth review).
+    const key = `${topicId ?? 'general'}:${kind}`
+    if (senderId !== undefined && !this.senderReplies.peek(senderId)) return false
+    if (!this.refusals.peek(key)) return false
+    if (senderId !== undefined) this.senderReplies.allow(senderId)
+    this.refusals.allow(key)
+    return true
+  }
+
+  /** A refusal notice: "Admins only", the quota, the text-only and voice notices. */
+  private async notice(topicId: string | undefined, kind: string, text: string, senderId?: string): Promise<void> {
+    if (this.muted(topicId, kind, senderId)) return
+    await this.say(topicId, text)
+  }
+
+  /**
+   * A post made as the group (an admin with "Remain anonymous" on) carries no sender to
+   * verify, so it gets no answer, while the same admin's taps, which carry their account,
+   * work: said once per topic, so the admin learns why their typed lines go unanswered.
+   * Not in General, where a linked channel's posts land the same way, and only in the forum.
+   */
+  private async noticeAnonymous(ctx: Context): Promise<void> {
+    const topicId = this.topicIdOf(ctx)
+    if (!this.d.cfg.teamMode || !ctx.message?.sender_chat || !topicId || !ctx.chat || String(ctx.chat.id) !== this.access.forumChatId) return
+    if (this.anonymousNoticed.has(topicId)) return
+    this.anonymousNoticed.add(topicId)
+    await this.notice(topicId, 'anon', '🎭 Posts made as the group or as a channel get no answer: Telegram hides who wrote them. Post as yourself to chat here ("Remain anonymous" off, "Send as" yourself).')
+  }
+
+  /**
+   * The chat gate, then in team mode the forum's own member list for everyone but the
+   * configured admins. A lookup that failed is a no, said once per grace so a Telegram
+   * blip reads as a blip and not as a dead bot.
+   */
+  private async admit(ctx: Context): Promise<boolean> {
+    if (!this.allowed(ctx)) {
+      await this.noticeAnonymous(ctx)
+      return false
+    }
+    const uid = this.senderId(ctx)
+    if (!membershipRequired(this.access, uid)) return true
+    if (!uid) return false
+    const verdict = await this.membership.check(uid)
+    if (verdict === 'member') return true
+    this.d.metrics.inc(verdict === 'unknown' ? 'membership_unknown' : 'non_member_rejected')
+    if (verdict === 'unknown' && this.membership.noticeDue(uid)) await this.notice(this.topicIdOf(ctx), 'verify', '⚠️ Could not verify your membership just now. Try again in a moment.', uid)
+    return false
   }
 
   private wire(): void {
     const bot = this.bot
     bot.on('message:text', async ctx => {
-      if (!this.allowed(ctx)) return void this.d.metrics.inc('rejected_updates')
+      if (!(await this.admit(ctx))) return void this.d.metrics.inc('rejected_updates')
       await this.inOrder(ctx, () => this.handleText(ctx, ctx.message.text))
     })
 
     bot.on('message:photo', async ctx => {
-      if (!this.allowed(ctx)) return void this.d.metrics.inc('rejected_updates')
+      if (!(await this.admit(ctx))) return void this.d.metrics.inc('rejected_updates')
       await this.inOrder(ctx, async () => {
         const topicId = this.topicIdOf(ctx)
-        if (!topicId) return await this.say(undefined, 'Send images inside a session topic.')
+        if (!topicId) return await this.generalOnly('Send images inside a session topic.')
+        if (await this.mediaRefusedUnderProfile(topicId, this.senderId(ctx))) return
         this.status.bump(topicId)
         try {
           const best = ctx.message.photo[ctx.message.photo.length - 1]
@@ -1047,23 +1653,24 @@ export class TelegramBot {
     // document field, so the document handler would otherwise claim them first. Each waits behind a
     // transcribing voice note in its topic (inOrder), as the other media handlers do.
     bot.on('message:video', async ctx => {
-      if (!this.allowed(ctx)) return void this.d.metrics.inc('rejected_updates')
+      if (!(await this.admit(ctx))) return void this.d.metrics.inc('rejected_updates')
       await this.inOrder(ctx, () => this.handleIncomingMedia(ctx, 'video'))
     })
     bot.on('message:animation', async ctx => {
-      if (!this.allowed(ctx)) return void this.d.metrics.inc('rejected_updates')
+      if (!(await this.admit(ctx))) return void this.d.metrics.inc('rejected_updates')
       await this.inOrder(ctx, () => this.handleIncomingMedia(ctx, 'animation'))
     })
     bot.on('message:video_note', async ctx => {
-      if (!this.allowed(ctx)) return void this.d.metrics.inc('rejected_updates')
+      if (!(await this.admit(ctx))) return void this.d.metrics.inc('rejected_updates')
       await this.inOrder(ctx, () => this.handleIncomingMedia(ctx, 'video_note'))
     })
 
     bot.on('message:document', async ctx => {
-      if (!this.allowed(ctx)) return void this.d.metrics.inc('rejected_updates')
+      if (!(await this.admit(ctx))) return void this.d.metrics.inc('rejected_updates')
       await this.inOrder(ctx, async () => {
         const topicId = this.topicIdOf(ctx)
-        if (!topicId) return await this.say(undefined, 'Send files inside a session topic.')
+        if (!topicId) return await this.generalOnly('Send files inside a session topic.')
+        if (await this.mediaRefusedUnderProfile(topicId, this.senderId(ctx))) return
         this.status.bump(topicId)
         const doc = ctx.message.document
         try {
@@ -1085,28 +1692,37 @@ export class TelegramBot {
     // Transcription takes 20 s or more on a CPU, and updates are handled one at a time, so it runs
     // in the background: awaiting it here would hold up every other message in every topic.
     bot.on(['message:voice', 'message:audio'], async ctx => {
-      if (!this.allowed(ctx)) return void this.d.metrics.inc('rejected_updates')
+      if (!(await this.admit(ctx))) return void this.d.metrics.inc('rejected_updates')
       const media = ctx.message.voice ?? ctx.message.audio
       if (!media) return
       const topicId = this.topicIdOf(ctx)
-      if (!topicId) return await this.say(undefined, 'Send voice notes inside a session topic.')
+      if (!topicId) return await this.generalOnly('Send voice notes inside a session topic.')
       this.status.bump(topicId)
       const shared = {
         audioFile: !ctx.message.voice,
         forwarded: originName(ctx.message.forward_origin),
         caption: ctx.message.caption?.trim() || undefined,
       }
-      // queued per topic, so whatever is sent after the note is handled after it
-      this.order.queue(topicId, () => this.handleVoice(ctx, topicId, media, shared),
+      // queued per topic, so whatever is sent after the note is handled after it; in a shared
+      // forum one at a time per topic, or a run of notes holds the topic and both slots for hours
+      if (this.d.cfg.teamMode && this.pendingVoice.has(topicId)) return await this.notice(topicId, 'voice', '🎙️ A voice note is still being transcribed here. Send the next one when it is done.', this.senderId(ctx))
+      this.pendingVoice.add(topicId)
+      this.order.queue(topicId, () => this.handleVoice(ctx, topicId, media, shared).finally(() => this.pendingVoice.delete(topicId)),
         e => this.d.log.error('voice.failed', { topic: topicId, error: e }))
     })
 
     bot.on('callback_query:data', async ctx => {
       const data = ctx.callbackQuery.data || ''
-      if (!this.allowed(ctx)) {
+      if (!(await this.admit(ctx))) {
         this.d.metrics.inc('rejected_updates')
-        return void ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
+        return void ctx.answerCallbackQuery({ text: 'Not available: not a member here, or could not be verified just now.' }).catch(() => {})
       }
+      if (data.startsWith('m:') && !allowedAction(this.access, this.senderId(ctx), data)) {
+        this.d.metrics.inc('admin_only_refused')
+        return void ctx.answerCallbackQuery({ text: '🔒 Admins only.' }).catch(() => {})
+      }
+      if (data.startsWith('m:') && this.d.profile && profileLocked(data)) return void ctx.answerCallbackQuery({ text: 'Set in the profile.' }).catch(() => {})
+      if (data.startsWith('m:') && this.d.profile && profileFreshOnly(data)) return void ctx.answerCallbackQuery({ text: 'Not under a profile: every topic starts fresh.' }).catch(() => {})
       if (data.startsWith('m:')) {
         this.menuCtx = ctx
         try {
@@ -1120,6 +1736,9 @@ export class TelegramBot {
       if (qm) {
         const b = this.askBtns.get(qm[1])
         if (!b) return void ctx.answerCallbackQuery({ text: 'Expired.' }).catch(() => {})
+        if (!promptTapAllowed(this.access, { fromId: this.senderId(ctx), kind: 'question', sameTopic: this.topicIdOf(ctx) === b.topicId })) {
+          return void ctx.answerCallbackQuery({ text: 'Not yours to answer.' }).catch(() => {})
+        }
         if (qm[2] === 'done') {
           this.askBtns.delete(qm[1])
           b.resolve([...b.selected].sort((a, z) => a - z).map(i => b.options[i].label))
@@ -1144,6 +1763,9 @@ export class TelegramBot {
       if (!m) return void ctx.answerCallbackQuery().catch(() => {})
       const entry = this.pending.get(m[1])
       if (!entry) return void ctx.answerCallbackQuery({ text: 'Expired.' }).catch(() => {})
+      if (!promptTapAllowed(this.access, { fromId: this.senderId(ctx), kind: 'approval', sameTopic: this.topicIdOf(ctx) === entry.topicId })) {
+        return void ctx.answerCallbackQuery({ text: '🔒 Admins only.' }).catch(() => {})
+      }
       this.pending.delete(m[1])
       const allow = m[2] === 'a'
       this.d.metrics.inc(allow ? 'approvals_allowed' : 'approvals_denied')
@@ -1151,6 +1773,13 @@ export class TelegramBot {
       entry.resolve(allow ? { behavior: 'allow' } : { behavior: 'deny', message: 'denied by user' })
       await ctx.answerCallbackQuery({ text: allow ? '✅ Allowed' : '❌ Denied' }).catch(() => {})
       if (entry.messageId) await bot.api.editMessageReplyMarkup(this.d.cfg.forumChatId, entry.messageId, { reply_markup: undefined }).catch(() => {})
+    })
+
+    // The forum reports a membership change: that user's cached answer is dropped, so a
+    // member removed just now is refused on their next message rather than at the TTL.
+    bot.on('chat_member', ctx => {
+      if (String(ctx.chat.id) !== this.d.cfg.forumChatId) return
+      this.membership.forget(String(ctx.chatMember.new_chat_member.user.id))
     })
 
     bot.catch(err => {
@@ -1200,6 +1829,19 @@ export function parseNew(args: string, fallbackCwd: string): { name: string; cwd
     else kept.push(t)
   }
   return { name: kept.join(' ') || `session-${Date.now().toString(36)}`, cwd, auto, notes }
+}
+
+/** Team mode's help: what a member can do, and nothing about folders, models or approvals. */
+export function teamHelp(): string {
+  return `This group shares one assistant. Every topic is a conversation anyone here can read and join.
+
+• Open a new topic and ask your question there — or tap 🆕 New topic in General, or type /new <title>.
+• Keep asking in the same topic to continue; open another topic for another subject.
+• 🎙️ A voice note is transcribed and answered like typed text (where the install supports it).
+• ⏹ Wrap up on the status message lets a long answer finish this turn, then hand off; ▶️ Resume picks it up again. Stopping it at the next step is for the admins.
+• 🔎 Activity feed on the pinned panel shows which tools an answer used.
+
+Closing, deleting or wiping a topic, and changing the model, are for the admins.`
 }
 
 export function help(reposDir: string): string {

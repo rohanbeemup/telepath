@@ -50,3 +50,17 @@ describe('parseTyped', () => {
     expect(parseTyped('  hello ', catalog)).toEqual({ kind: 'chat', text: 'hello' })
   })
 })
+
+describe('a command from the group menu', () => {
+  test("a slash command keeps its name when Telegram appends the bot's handle", () => {
+    expect(parseTyped('/new@telepath_bot pricing question', catalog, 'telepath_bot')).toEqual({ kind: 'slash', cmd: 'new', args: 'pricing question' })
+    expect(parseTyped('/NEW@Telepath_Bot', catalog, 'telepath_bot')).toEqual({ kind: 'slash', cmd: 'new', args: '' })
+    expect(parseTyped('/status@telepath_bot', catalog, 'TELEPATH_BOT')).toEqual({ kind: 'slash', cmd: 'status', args: '' })
+    // only the command word loses a handle; an argument keeps its @
+    expect(parseTyped('/new ask @someone', catalog, 'telepath_bot')).toEqual({ kind: 'slash', cmd: 'new', args: 'ask @someone' })
+    // another bot's command is not a command here, nor is a suffixed one when our name is unknown
+    expect(parseTyped('/new@other_bot pricing', catalog, 'telepath_bot')).toEqual({ kind: 'foreign' })
+    expect(parseTyped('/new@telepath_bot pricing', catalog)).toEqual({ kind: 'foreign' })
+    expect(parseTyped('/new pricing', catalog)).toEqual({ kind: 'slash', cmd: 'new', args: 'pricing' })
+  })
+})

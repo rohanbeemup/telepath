@@ -3,6 +3,59 @@
 ## Unreleased
 
 ### Added
+- **Team mode and session profiles.** `TEAM_MODE=1` opens the forum to all its members, as
+  the forum itself reports them: every sender but the configured admins is checked with
+  `getChatMember` (a yes cached ten minutes, a no or a failed lookup thirty seconds; a muted
+  member is no member; a 400 "user not found" is a no, any other failure is said once as
+  "could not verify" rather than dropped in silence; the forum's `chat_member` updates clear
+  the cache), so a public forum that lets non-members post is no hole. A post made as the
+  group (an anonymous admin) or by a linked channel is dropped, and inside a topic the reason
+  is said once. Members chat and open topics (typing in a fresh topic, the 🆕 button, or
+  `/new <title>`, capped at 120 UTF-16 units, under Telegram's topic-name limit however it
+  counts, so emoji count double; `TEAM_TOPICS_PER_DAY` per member per
+  local day, default 20, admins exempt, a refused creation not counted; a topic costs no
+  process until someone writes in it). Closing, deleting and wiping a topic, model, effort,
+  approvals, settings, the session list, `/attach`, `/status` and wrapping up at the next step stay with `ALLOWED_USER_ID`
+  plus `ADMIN_USER_IDS` (numeric ids; an allowlist of member actions in `src/access.ts`, so
+  an action it has not heard of is an admin's); a closed topic opens no session for anyone
+  until an admin reopens it; the delete and wipe confirmations are their own message in team
+  mode, with a Cancel that removes it, so the pinned panel stays everyone's. General is the members' own: commands are answered there,
+  chatter and media are not. The published menu is `new`, `menu` and `help`; `/status` in team mode
+  is a reduced screen (counts, uptime, the profile's name) safe wherever it is shown.
+  Team mode requires the bot to be an admin of the forum with Manage Topics (the boot refuses
+  otherwise: topics are created with that right, and the forum's membership changes reach admin
+  bots only) and
+  `PROFILE_FILE`, a locked session profile (`src/profile.ts`,
+  `profile.example.json`): one set of MCP servers and nothing from the machine's own MCP
+  config, an explicit tool allowlist (exact names, no patterns) with everything else denied
+  and never prompted (`permissionMode: dontAsk` plus a PreToolUse hook of the profile's own,
+  since `dontAsk` alone leaves Claude Code's auto-approved built-ins reachable; the approval
+  gate hook stays out, as it would deny the allowed MCP tools), no built-in tools unless
+  named (none at all in team mode; a kept built-in must be allowed; `AskUserQuestion` is
+  refused, since no profile session can prompt), no settings files, a prompt of its own, a
+  fixed working directory, `maxTurns` and `maxBudgetUsd` (required in team mode). Every
+  server entry is read at boot and a profile with any problem stops the boot with all of
+  them listed (a stdio `command` is a bare name, an absolute path, or `./` or `../` against
+  the profile's directory, as are such `args`; `~/…` or `bin/x` is refused, since nothing
+  expands a `~` and the child's cwd is not the profile's). A profile also works without team mode, for a read-only single-user
+  assistant. Under a profile there is no wizard, the pinned panel loses its model, effort
+  and approvals buttons (`/auto` and those taps say so; typed `use` and `effort` go to the
+  session as text), old sessions are not attached or resumed (a binding made before the
+  profile, or under another profile by name, opens a fresh session with the install's or the
+  profile's model; its spend is the topic's and stays; a seed request from the todo queue is refused and set aside
+  under `seed-requests/refused/`, said in the log), an inbound photo, file or video is answered with a notice
+  rather than a host path, a turn or voice note that failed is said without the error
+  detail (the log has it), and the budget is enforced per topic across idle stretches: the
+  spend is accounted from the running total the SDK reports (increments over the last
+  reported total; a transcript that restarted counts whole), each stretch gets what is
+  left, a topic at its cap is told so, and a rate-limit or rotation continuation that
+  cannot run says why instead of "resuming". A session mid-turn is never paused to free a
+  slot for another topic; when every slot is running, the newcomer is asked to send again.
+  Voice notes need `TRANSCRIBE_CMD` (nothing is downloaded without it), two are transcribed
+  at a time, and the audio is removed once heard. Commands tapped from the group's menu
+  (`/new@bot_name`) are read when the handle is this bot's and ignored otherwise; a reply in
+  General is General, not a topic. An `ANTHROPIC_API_KEY` in `.env` reaches the Claude Code
+  child, for installs that bill a Console organization rather than a login.
 - **Video, GIFs and video notes, both ways.** Inbound: videos, GIFs/animations and round video
   notes are now downloaded (under Telegram's 20 MB bot-download cap) and handed to the session
   with the saved path and a frame-extraction hint, where before only photos and documents were
@@ -21,7 +74,8 @@
   the user's instructions; a voice note in General is refused like a photo. Transcription runs in
   the background with a 3-minute limit and a per-topic queue, so later messages in that topic wait
   for it while no other topic is held up; every failure, an unset `TRANSCRIBE_CMD` included, is
-  answered in the topic. The pre-0.2.0 fork had this; the rewrite dropped it and voice notes were
+  answered in the topic. The transcriber runs without anything `.env` holds (PATH, HOME, the
+  locale, temp and cache directories excepted; a key of its own goes on its command line). The pre-0.2.0 fork had this; the rewrite dropped it and voice notes were
   ignored without a trace.
 
 ## 0.2.0 — 2026-09-22

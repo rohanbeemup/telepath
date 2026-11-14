@@ -104,3 +104,38 @@ describe('telegram limits', () => {
     }
   })
 })
+
+describe('team mode', () => {
+  test('the team main menu offers only a new topic and help', () => {
+    expect(callbackData(mainMenuKb({ team: true }))).toEqual(['m:new', 'm:help'])
+    expect(labels(mainMenuKb({ team: true }))[0]).toBe('🆕 New topic')
+    expect(callbackData(mainMenuKb())).toEqual(['m:new', 'm:quick', 'm:list', 'm:resume', 'm:settings', 'm:status', 'm:help'])
+    // under a profile alone, the entries the gate would refuse (the old sessions, the resume) are not offered
+    expect(callbackData(mainMenuKb({ profile: true }))).toEqual(['m:new', 'm:quick', 'm:settings', 'm:status', 'm:help'])
+  })
+
+  test('the team topic panel has no model, effort or auto buttons', () => {
+    for (const mode of [{ team: true }, { profile: true }, { team: true, profile: true }]) {
+      const data = callbackData(topicControlsKb(catalog, binding({ effort: 'high' }), mode))
+      expect(data.some(d => /^m:(tm|te):/.test(d) || d === 'm:ta')).toBe(false)
+      expect(data).toEqual(['m:tf', 'm:tclose', 'm:tdelete', 'm:twipe'])
+      const text = topicControlsText(catalog, binding({ effort: 'high' }), undefined, mode)
+      expect(text).not.toContain('Model:')
+      expect(text).not.toContain('approvals on')
+    }
+    expect(callbackData(topicControlsKb(catalog, binding({ effort: 'high' })))).toContain('m:tm:opus')
+    expect(topicControlsText(catalog, binding({ effort: 'high' }))).toContain('Model:')
+    // a closed topic's panel in team mode: the closed state with ♻️ Reopen, no feed toggle, no second close
+    const closed = binding({ effort: 'high' })
+    closed.closed = true
+    expect(callbackData(topicControlsKb(catalog, closed, { team: true }))).toEqual(['m:treopen', 'm:tdelete', 'm:twipe'])
+    expect(topicControlsText(catalog, closed, undefined, { team: true })).toContain('Closed by an admin')
+    // outside team mode the flag changes nothing on the panel
+    expect(callbackData(topicControlsKb(catalog, closed))).not.toContain('m:treopen')
+    // the wrap-up confirmation in team mode offers a member no "at the next step": that interrupts a colleague's turn and is an admin's
+    expect(callbackData(wrapConfirmKb({ team: true }))).toEqual(['m:tw:turn', 'm:ctl'])
+    // an admin's confirmation keeps it: the gate reserves the tap for admins, so the button must reach them (twenty-seventh review)
+    expect(callbackData(wrapConfirmKb({ team: true, admin: true }))).toEqual(['m:tw:now', 'm:tw:turn', 'm:ctl'])
+    expect(callbackData(wrapConfirmKb())).toContain('m:tw:now')
+  })
+})

@@ -1,0 +1,76 @@
+/**
+ * Team mode's typed grammar: what a member may say to open a topic. Pure, so the
+ * refusal of `cwd=` and `auto` is tested without a bot.
+ */
+
+export type Member = { firstName?: string; username?: string }
+
+/**
+ * `/new <title…>`: the whole line is the title, whitespace collapsed; nothing in it
+ * configures the session (the profile does). An empty line names the topic after the
+ * member and the time, so a list of topics still reads.
+ */
+/** Telegram's topic-name limit; applied here, and by createTopic from the same constant. */
+export const TITLE_MAX = 120
+
+/**
+ * The first TITLE_MAX UTF-16 units, the unit Telegram's limits are counted in (a count of code
+ * points let 120 emoji through as 240 units; thirtieth review), with a trailing high surrogate
+ * dropped rather than handed over as the half of an emoji Telegram refuses.
+ */
+export function clipTitle(s: string): string {
+  const out = s.slice(0, TITLE_MAX)
+  return /[\uD800-\uDBFF]$/.test(out) ? out.slice(0, -1) : out
+}
+
+export function parseTeamNew(args: string, member: Member, now: Date): { title: string } {
+  const title = clipTitle(args.trim().replace(/\s+/g, ' '))
+  if (title) return { title }
+  const who = member.firstName?.trim() || member.username?.trim() || 'member'
+  const hh = String(now.getHours()).padStart(2, '0')
+  const mm = String(now.getMinutes()).padStart(2, '0')
+  return { title: `${who} · ${hh}:${mm}` }
+}
+
+/**
+ * How many topics one member may open per calendar day, on the box's local clock (the clock the
+ * default title shows, so "come back tomorrow" means the same midnight); in memory, so a restart
+ * starts the day over.
+ */
+export class TopicQuota {
+  private readonly counts = new Map<string, { day: string; n: number }>()
+
+  constructor(
+    private readonly limit: number,
+    private readonly now: () => number = () => Date.now(),
+  ) {}
+
+  private today(): string {
+    const d = new Date(this.now())
+    return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`
+  }
+
+  private opened(userId: string, day: string): number {
+    const c = this.counts.get(userId)
+    return c && c.day === day ? c.n : 0
+  }
+
+  /**
+   * Reserve one opening for this member; false when the day's allowance is used up.
+   * Synchronous, so two openings in flight cannot both pass the cap.
+   */
+  take(userId: string): boolean {
+    const day = this.today()
+    const n = this.opened(userId, day)
+    if (n >= this.limit) return false
+    this.counts.set(userId, { day, n: n + 1 })
+    return true
+  }
+
+  /** The opening did not happen (Telegram refused it): give the reservation back. */
+  refund(userId: string): void {
+    const day = this.today()
+    const n = this.opened(userId, day)
+    if (n > 0) this.counts.set(userId, { day, n: n - 1 })
+  }
+}

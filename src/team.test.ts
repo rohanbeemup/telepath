@@ -1,0 +1,60 @@
+import { test, expect } from 'bun:test'
+import { parseTeamNew, TopicQuota } from './team'
+
+test('/new in team mode takes the rest of the line as the title and ignores cwd= and auto', () => {
+  const at = new Date(2026, 10, 12, 9, 5)
+  expect(parseTeamNew('pricing question cwd=/etc auto', { firstName: 'Ann' }, at)).toEqual({ title: 'pricing question cwd=/etc auto' })
+  expect(parseTeamNew('  spaced   out  ', { firstName: 'Ann' }, at)).toEqual({ title: 'spaced out' })
+  // an empty title falls back to the member's name and the time
+  expect(parseTeamNew('   ', { firstName: 'Ann' }, at)).toEqual({ title: 'Ann · 09:05' })
+  expect(parseTeamNew('', { username: 'ann_x' }, at)).toEqual({ title: 'ann_x · 09:05' })
+  expect(parseTeamNew('', {}, at)).toEqual({ title: 'member · 09:05' })
+  // capped where it is parsed, at Telegram's topic-name limit, so every surface carries the same title
+  const long = parseTeamNew('x'.repeat(4000), { firstName: 'Ann' }, at).title
+  expect(long.length).toBe(120)
+  expect(parseTeamNew('y'.repeat(120), {}, at).title.length).toBe(120)
+  // counted in UTF-16 units, the unit Telegram's limits are counted in: a title of emoji cannot run to
+  // twice the limit (thirtieth review: a count of code points did), and a cut never leaves the half of
+  // an emoji, the lone surrogate Telegram refuses, at the end
+  const fiery = parseTeamNew('z'.repeat(119) + '🔥 and more', {}, at).title
+  expect(fiery).toBe('z'.repeat(119))
+  const emoji = parseTeamNew('🔥'.repeat(121), {}, at).title
+  expect(emoji.length).toBe(120)
+  expect(Array.from(emoji).length).toBe(60)
+  expect(() => encodeURIComponent(emoji)).not.toThrow() // no lone surrogate anywhere
+  expect(() => encodeURIComponent(fiery)).not.toThrow()
+})
+
+test('a member may open only so many topics a day', () => {
+  // A day ends at local midnight, on the clock the default title shows. Pinned to one zone off
+  // UTC, because bun test runs on UTC, where a UTC day and a local day cannot be told apart.
+  const zone = process.env.TZ
+  process.env.TZ = 'Europe/Amsterdam'
+  try {
+    let t = new Date(2026, 10, 13, 23, 30).getTime()
+    const q = new TopicQuota(2, () => t)
+    expect(q.take('a')).toBe(true)
+    expect(q.take('a')).toBe(true)
+    expect(q.take('a')).toBe(false) // the third of the day
+    expect(q.take('b')).toBe(true) // another member's own count
+    expect(q.take('b')).toBe(true)
+    expect(q.take('b')).toBe(false)
+    t = new Date(2026, 10, 14, 0, 1).getTime() // the next local day, half an hour later (still 13 Nov in UTC)
+    expect(q.take('a')).toBe(true)
+    expect(q.take('a')).toBe(true)
+    expect(q.take('a')).toBe(false)
+    // an opening is reserved first and given back when Telegram refuses it, so a failed creation is not charged
+    q.refund('a')
+    expect(q.take('a')).toBe(true)
+    expect(q.take('a')).toBe(false)
+    // a refund never goes below zero
+    q.refund('fresh')
+    q.refund('fresh')
+    expect(q.take('fresh')).toBe(true)
+    expect(q.take('fresh')).toBe(true)
+    expect(q.take('fresh')).toBe(false)
+  } finally {
+    if (zone === undefined) delete process.env.TZ
+    else process.env.TZ = zone
+  }
+})
